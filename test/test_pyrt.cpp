@@ -64,6 +64,18 @@ static void py_frame_dispatch(void* state, message_t* msg) {
   }
 }
 
+/* Creates the runtime WITHOUT executing a cell; used so a test can arm a
+   state (e.g. a pending interrupt request) before the first cell is queued. */
+static void py_frame_open(py_frame_t* self) {
+  if (self->pyrt == NULL) {
+    pyrt_config_t cfg;
+    cfg.backend = SA_PYRT_BACKEND_SUBINTERPRETER;
+    cfg.pool_cap = 0;
+    cfg.idle_evict_ms = 0;
+    self->pyrt = pyrt_create(&self->actor, &cfg);
+  }
+}
+
 static py_frame_t* py_frame_create(void) {
   py_frame_t* self = (py_frame_t*)get_clear_memory(sizeof(py_frame_t));
   actor_init(&self->actor, self, py_frame_dispatch, NULL); /* NULL pool: pumped by hand */
@@ -72,13 +84,7 @@ static py_frame_t* py_frame_create(void) {
 }
 
 static void py_frame_execute(py_frame_t* self, const char* code) {
-  if (self->pyrt == NULL) {
-    pyrt_config_t cfg;
-    cfg.backend = SA_PYRT_BACKEND_SUBINTERPRETER;
-    cfg.pool_cap = 0;
-    cfg.idle_evict_ms = 0;
-    self->pyrt = pyrt_create(&self->actor, &cfg);
-  }
+  py_frame_open(self);
   pyrt_execute(self->pyrt, strdup(code));
 }
 
@@ -163,10 +169,24 @@ TEST(TestPyrt, TestLogStreamsBeforeResult) {
      dispatched: a single-message run stops the drain dead, so the result
      cannot piggyback on the same actor_run and got_result must still be
      0 at the check below. */
-  int waited = 0;
-  while (ATOMIC_LOAD(&self->got_result) == 0 && waited < 5000000) {
+  /* Time-bound instead of a pure spin budget: iteration counts have no
+     wall-clock meaning (a fast host burns millions of spins; a slow host
+     burns few while pyrt boot alone can cost tens of ms). Cap the stream
+     window at 60 s of elapsed monotonic time — enough headroom for a slow
+     harness (valgrind boots a subinterpreter in seconds). Keep the hot spin
+     and the one-message-per-run drain: the FIFO order plus the one-message
+     batch guarantee the result cannot piggyback on the same actor_run that
+     first sees a log, whatever the polling rhythm. The only concession is a
+     rare yield (every 1000 consecutive empty polls) so an emulated-slow
+     worker (valgrind) is not CPU-starved by the spin. */
+  uint64_t stream_started_ns = platform_monotonic_ns();
+  int spins = 0;
+  while (ATOMIC_LOAD(&self->got_result) == 0 &&
+         (platform_monotonic_ns() - stream_started_ns) < 60000000000ULL) {
     if (message_queue_isempty(&self->actor.queue)) {
-      waited++;
+      if (++spins % 1000 == 0) {
+        platform_sleep_ms(1);   /* rare yield, not a poll rhythm */
+      }
       continue;   /* hot spin: no mail yet */
     }
     actor_run(&self->actor, 1);
@@ -209,6 +229,94 @@ TEST(TestPyrt, TestFailingCellReturnsTracebackNotCrash) {
   EXPECT_STREQ(self->results[1]->text, "42");
 
   py_frame_free(self);
+}
+
+/* Interrupt contract, COOPERATIVE-only (verified against the pinned
+   CPython 3.12.13 — see the comment on pyrt_interrupt): delivery happens at
+   cell boundaries only. Exactly one truth is asserted: a long cell already
+   running is NOT preemptible and completes with its normal corr-matched
+   result, while a cell that has not started when interrupt() fires is cut
+   at its start boundary with a corr-matched status-1 RESULT; the runtime
+   then keeps serving cells normally. */
+TEST(TestPyrt, TestInterruptHonoredAtBoundary) {
+  py_frame_t* self = py_frame_create();
+
+  /* Phase 1: the request arrives while a long cell is mid-flight. Wait for
+     the cell's own log so the interrupt is guaranteed to land AFTER the
+     dispatch decision (interpreter booted, cell started) — otherwise a slow
+     boot would turn this into the start-boundary cut of phase 2. */
+  py_frame_execute(self, "import actor\nactor.log('start')\nsum(range(5000000))");
+  {
+    /* 60 s: this wait exists only to land the interrupt after dispatch; it
+       must survive slow harnesses (valgrind boots a subinterpreter in
+       seconds) without changing behavior on fast ones. Sleep-poll, NOT a hot
+       spin: unlike the stream-window test this is a pure state-arrival wait,
+       and the hot variant starves the valgrind-emulated worker thread. */
+    uint64_t started_ns = platform_monotonic_ns();
+    while (self->logs.empty() &&
+           (platform_monotonic_ns() - started_ns) < 60000000000ULL) {
+      actor_run(&self->actor, 1);
+      if (!self->logs.empty()) {
+        break;
+      }
+      platform_sleep_ms(1);
+    }
+  }
+  ASSERT_EQ(self->logs.size(), 1u);   /* cell is provably mid-flight */
+  ATOMIC_STORE(&self->got_result, 0);
+  pyrt_interrupt(self->pyrt);
+  py_frame_pump(self, 100000);
+  ASSERT_LT(self->results.size(), 2u);
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);   /* completed, not cut */
+  EXPECT_STREQ(self->results[0]->text, ""); /* exec-style cell, no output */
+  EXPECT_EQ(self->results[0]->corr, 1u);
+
+  /* Phase 2: the request arms BEFORE any cell runs, so the first queued
+     cell is cut at its start boundary and posts a corr-matched result. */
+  py_frame_t* b = py_frame_create();
+  py_frame_open(b);
+  pyrt_interrupt(b->pyrt);
+  py_frame_execute(b, "2 + 2");
+  py_frame_pump(b, 10000);
+  ASSERT_LT(b->results.size(), 2u);
+  ASSERT_EQ(b->results.size(), 1u);
+  EXPECT_EQ(b->results[0]->status, 1);
+  EXPECT_EQ(b->results[0]->corr, 1u);
+  EXPECT_STREQ(b->results[0]->text, "pyrt: interrupted at boundary");
+
+  /* The runtime keeps serving cells normally after the interrupt. */
+  ATOMIC_STORE(&b->got_result, 0);
+  py_frame_execute(b, "3 * 4");
+  py_frame_pump(b, 10000);
+  ASSERT_LT(b->results.size(), 3u);
+  ASSERT_EQ(b->results.size(), 2u);
+  EXPECT_EQ(b->results[1]->status, 0);
+  EXPECT_STREQ(b->results[1]->text, "12");
+
+  py_frame_free(b);
+  py_frame_free(self);
+}
+
+/* Multi-phase actor module regression: a single-phase (m_size < 0) def is
+   cached process-wide by CPython and the SECOND subinterpreter raises
+   "module actor does not support loading in subinterpreters". The exec
+   slot form (m_size >= 0) re-initializes per interpreter. */
+TEST(TestPyrt, TestActorModuleLoadsInMultipleInterpreters) {
+  py_frame_t* a = py_frame_create();
+  py_frame_t* b = py_frame_create();
+  py_frame_execute(a, "import actor\nactor.log('a')\n3 + 3");
+  py_frame_pump(a, 10000);
+  ASSERT_EQ(a->results.size(), 1u);
+  EXPECT_EQ(a->results[0]->status, 0);
+  ATOMIC_STORE(&a->got_result, 0);
+  py_frame_execute(b, "import actor\nactor.log('b')\n4 + 4");
+  py_frame_pump(b, 10000);
+  ASSERT_LT(b->results.size(), 2u);
+  ASSERT_EQ(b->results.size(), 1u);
+  EXPECT_EQ(b->results[0]->status, 0);
+  py_frame_free(a);
+  py_frame_free(b);
 }
 
 #endif /* SA_HAS_PYTHON */

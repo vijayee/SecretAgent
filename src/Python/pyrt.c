@@ -36,10 +36,12 @@ struct pyrt_t {
   pyrt_work_node_t* head;
   pyrt_work_node_t* tail;
   uint8_t shutdown;
+  /* Externally visible view of the thread-local interp_live. */
   ATOMIC(uint8_t) active;
   ATOMIC(uint8_t) interrupt_req;
   ATOMIC(uint64_t) corr_counter;
   platform_thread_t* thread;
+  /* Consumed by the interrupt delivery path (Task 6). */
   unsigned long thread_id;
   PyThreadState* tstate;
   PyObject* main_dict;
@@ -52,7 +54,10 @@ struct pyrt_t {
 static void _pyrt_slot_release(void);
 
 /* Outbound channel: read by the injected actor module's callbacks on the
-   pyrt thread (the only thread that re-enters Python here). */
+   pyrt thread (the only thread that re-enters Python here). Known milestone
+   limitation: stdlib `threading` threads spawned by a cell do NOT inherit
+   this TLS, so log/status/emit posts made from them are silently dropped
+   (no routing, no error). */
 static _Thread_local pyrt_t* _tls_pyrt = NULL;
 
 /* Process-wide runtime state. _pyrt_global_guard is installed with the
@@ -181,11 +186,37 @@ static PyMethodDef _py_actor_methods[] = {
     {"emit", _py_actor_emit, METH_VARARGS, "Post a durable-payload candidate to the owning actor."},
     {NULL, NULL, 0, NULL}};
 
-static struct PyModuleDef _py_actor_moduledef = {
-    PyModuleDef_HEAD_INIT, "actor", NULL, -1, _py_actor_methods, NULL, NULL, NULL, NULL};
+/* Multi-phase init is REQUIRED, not optional: the pinned 3.12.13 caches a
+   single-phase (m_size < 0) built-in def in the process-wide extension table
+   and then raises "module actor does not support loading in subinterpreters"
+   on the second subinterpreter (import.c create_builtin/fix_up_extension).
+   The exec slot runs per interpreter; m_size 0 means per-interpreter module
+   state (the def carries no static mutable state — its callbacks route
+   through _tls_pyrt only). Py_mod_multiple_interpreters is declared
+   consistent with that: the module is trivially per-interpreter-GIL safe. */
+static int _py_actor_exec(PyObject* module) {
+  (void)module;
+  return 0;
+}
 
+static struct PyModuleDef_Slot _py_actor_slots[] = {
+    {Py_mod_exec, _py_actor_exec},
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+    {0, NULL}};
+
+/* Field order matches struct PyModuleDef: m_base, m_name, m_doc, m_size,
+   m_methods, m_slots, m_traverse, m_clear, m_free. m_size >= 0 selects
+   multi-phase. */
+static struct PyModuleDef _py_actor_moduledef = {
+    PyModuleDef_HEAD_INIT, "actor", NULL, 0, _py_actor_methods,
+    _py_actor_slots, NULL, NULL, NULL};
+
+/* Inittab entry point: returning the def (PyModuleDef_Type) makes
+   import.c create_builtin take the PyModule_FromDefAndSpec path, which
+   re-initializes the module (exec slot) for every interpreter that imports
+   it — exactly what multi-phase init provides. */
 static PyObject* _py_actor_create(void) {
-  return PyModule_Create(&_py_actor_moduledef);
+  return PyModuleDef_Init(&_py_actor_moduledef);
 }
 
 /* ------------------------------------------------------------------ */
@@ -327,6 +358,10 @@ static uint8_t _pyrt_global_init(void) {
         }
         return 0;
       }
+    } else {
+      /* Continue unpinned: surface the failure now instead of masking it
+         until a later, symptom-level boot error. */
+      log_error("pyrt: SA_PYTHON_EXECUTABLE decode failed");
     }
 #endif
     PyStatus st = Py_InitializeFromConfig(&config);
@@ -431,6 +466,11 @@ static void* _pyrt_thread(void* arg) {
       platform_condvar_wait(py->condition, py->lock);
     }
     if (py->shutdown && py->head == NULL) {
+      /* Shutdown does not abandon queued cells: anything queued before
+         pyrt_destroy() must still get a corr-matched RESULT. The queue was
+         just observed empty, so nothing is owed and the thread may exit;
+         if a non-empty queue is seen below, the drain block after the cell
+         re-checks and only exits once the queue is fully drained. */
       platform_mutex_unlock(py->lock);
       break;
     }
@@ -461,9 +501,19 @@ static void* _pyrt_thread(void* arg) {
       continue;
     }
 
-    /* Stale interrupt: the flagged cell already finished. */
+    /* Interrupt-touched dispatch (Task 6; cooperative-only, see
+       pyrt_interrupt): a flagged request with NO interpreter live can only
+       refer to a cell that already crossed a boundary (finished and took
+       the flag with it via the per-cell clear below) or one that never
+       reached a boot — the pending cell is cut at its start boundary. The
+       ABA-trap fold: the dropped cell always posts its corr-matched status
+       1 RESULT here, so the owner is never left hanging to timeout. */
     if (ATOMIC_LOAD(&py->interrupt_req) == 1 && !interp_live) {
       ATOMIC_STORE(&py->interrupt_req, 0);
+      /* _pyrt_post_result takes ownership of the text, so the literal must
+         be copied out before it can be routed (freed at payload destroy). */
+      _pyrt_post_result(py, exec->corr, 1,
+                        strdup("pyrt: interrupted at boundary"));
       pyrt_execute_payload_destroy(exec);
       continue;
     }
@@ -471,7 +521,11 @@ static void* _pyrt_thread(void* arg) {
     if (!interp_live) {
       _pyrt_slot_acquire(); /* may block; nothing else is held */
       if (!_pyrt_interp_boot(py)) {
-        _pyrt_post_result(py, exec->corr, 1, "pyrt: subinterpreter boot failed");
+        /* Same ownership rule: the result text must be heap-owned. This
+           call site predates the interrupt refusal above and had the same
+           latent free-a-literal corruption; fixed alongside it. */
+        _pyrt_post_result(py, exec->corr, 1,
+                          strdup("pyrt: subinterpreter boot failed"));
         pyrt_execute_payload_destroy(exec);
         /* No interpreter is live after a failed boot: return the slot so
            the pool does not leak it across retries. */
@@ -483,10 +537,22 @@ static void* _pyrt_thread(void* arg) {
 
     char* text = NULL;
     uint8_t status = _pyrt_run_cell_sub(py, exec->code, &text);
+    /* Flag-vs-cell semantics (Task 6): the interrupt flag is per-runtime,
+       never per-corr — it is consumed exactly at each boundary the thread
+       crosses. A request that arrives while a cell is already running is
+       too late to act on that cell (cooperative delivery cannot preempt
+       it), so the finishing cell takes the flag with it and posts its
+       NORMAL corr-matched result; clearing here keeps that late request
+       from leaking onto the next queued cell (the stale-dispatch refusal
+       above only fires when no interpreter is live). */
     ATOMIC_STORE(&py->interrupt_req, 0);
     _pyrt_post_result(py, exec->corr, status, text);
     pyrt_execute_payload_destroy(exec);
     if (had_shutdown) {
+      /* Drain rule (see the shutdown-break comment in the wait loop): a
+         cell queued before shutdown still owed a RESULT, which was just
+         posted — break only once the queue has been verified empty, so
+         every pre-shutdown cell is dispatched and answered. */
       platform_mutex_lock(py->lock);
       uint8_t drained = (py->head == NULL);
       platform_mutex_unlock(py->lock);
@@ -531,6 +597,12 @@ uint64_t pyrt_execute(pyrt_t* pyrt, char* code) {
   exec->corr = ATOMIC_FETCH_ADD(&pyrt->corr_counter, 1) + 1;
 
   platform_mutex_lock(pyrt->lock);
+  /* Late EXECUTEs during teardown are rejected, never queued. */
+  if (pyrt->shutdown) {
+    platform_mutex_unlock(pyrt->lock);
+    pyrt_execute_payload_destroy(exec);
+    return 0;
+  }
   /* Lazy boot on the first EXECUTE. Under the lock: a racing second
      execute cannot double-create the thread, and the freshly started
      thread cannot observe a queue state other than the one we install
@@ -559,7 +631,22 @@ uint64_t pyrt_execute(pyrt_t* pyrt, char* code) {
 
 void pyrt_interrupt(pyrt_t* pyrt) {
   if (pyrt == NULL) return;
-  /* This task: flag only. Task 6 implements the verified mechanism. */
+  /* Interrupt delivery is COOPERATIVE by verification, pinning 3.12.13:
+     the FORCED paths cannot reach a PEP-684 subinterpreter from this thread.
+     (1) PyThreadState_SetAsyncExc (pystate.c:1808) must be called with the
+     GIL held and scans interp->threads.head of the CALLING thread's current
+     interpreter (_PyInterpreterState_GET()); the embedder thread can only
+     obtain the MAIN interpreter's GIL (PyGILState_Ensure makes a main-interp
+     tstate), so the worker's thread_id is not in the scanned list and the
+     call returns 0 — probed empirically: rc=0 while a busy subinterpreter
+     cell completed normally, status 0, no KeyboardInterrupt. (2)
+     PyErr_SetInterruptEx (Modules/signalmodule.c:1886) drives process-global
+     signal machinery: with install_signal_handlers=0 no handler is
+     installed, so get_handler returns the default handler and the call is a
+     no-op (probe: rc=0, cell unaffected) — and even tripped, it raises only
+     on threads that run PyErr_CheckSignals under the main GIL. Shipped
+     cooperative-only: the flag is honored at cell boundaries by the thread
+     loop (see the _pyrt_thread interrupt handling). */
   ATOMIC_STORE(&pyrt->interrupt_req, 1);
 }
 
