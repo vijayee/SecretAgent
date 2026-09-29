@@ -42,6 +42,23 @@ if (BUILD_TESTING)
 
     if(SA_HAS_PYTHON)
       target_sources(testsecretagent PRIVATE test_pyrt.cpp)
+
+      # Order-isolated pyrt pool-cap unit: the global interpreter pool cap is
+      # fixed by the FIRST pyrt created in the process, so the cap=1 test must
+      # run in a binary where it is the only runtime creator. Same link shape
+      # as testsecretagent; gtest_main supplies the runner (no test_main.cpp).
+      add_executable(testpyrtpoolcap test_pyrt_poolcap.cpp)
+      target_link_libraries(testpyrtpoolcap PRIVATE secretagent)
+      if(NOT WIN32)
+        target_link_libraries(testpyrtpoolcap PRIVATE pthread)
+      endif()
+      target_link_libraries(testpyrtpoolcap PRIVATE GTest::gtest_main)
+      target_include_directories(testpyrtpoolcap PRIVATE ${C_INC})
+      target_include_directories(testpyrtpoolcap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+      include(GoogleTest)
+      gtest_add_tests(TARGET testpyrtpoolcap TEST_LIST test_list_poolcap)
+      set_tests_properties(${test_list_poolcap} PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
     endif()
 
     # Match the SA_ENABLE_ASAN gate from the parent CMakeLists.txt: when on,

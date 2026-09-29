@@ -319,6 +319,72 @@ TEST(TestPyrt, TestActorModuleLoadsInMultipleInterpreters) {
   py_frame_free(b);
 }
 
+/* Lazy boot contract: pyrt_create() starts NOTHING (no thread, no
+   interpreter — pyrt_isactive stays 0) and the interpreter is only booted by
+   the pyrt thread on the first EXECUTE. The isactive probe is inside the
+   wait loop on purpose: before the first cell there is provably nothing on
+   the runtime, and the probe fires only once the harness has already been
+   waiting long enough (>200 ms) for a boot to have started. */
+TEST(TestPyrt, TestLazyBootNoInterpreterBeforeFirstExecute) {
+  py_frame_t* self = py_frame_create();
+  pyrt_config_t cfg;
+  cfg.backend = SA_PYRT_BACKEND_SUBINTERPRETER;
+  cfg.pool_cap = 0;
+  cfg.idle_evict_ms = 0;
+  self->pyrt = pyrt_create(&self->actor, &cfg);
+  EXPECT_EQ(pyrt_isactive(self->pyrt), 0);   /* nothing booted yet */
+
+  py_frame_execute(self, "1 + 1");
+  int waited = 0;
+  while (ATOMIC_LOAD(&self->got_result) == 0 && waited < 10000) {
+    actor_run(&self->actor, ACTOR_BATCH_SIZE);
+    platform_sleep_ms(1);
+    waited++;
+    if (waited > 200) {
+      EXPECT_EQ(pyrt_isactive(self->pyrt), 1);   /* live well before result */
+    }
+  }
+  EXPECT_EQ(pyrt_isactive(self->pyrt), 1);   /* stays live after the cell */
+  py_frame_free(self);
+}
+
+/* Idle eviction contract: with idle_evict_ms armed and the interpreter live,
+   the worker's timed wait fires after the idle window and tears the
+   interpreter down (pyrt_isactive returns to 0); the slot returns to the
+   pool; the runtime re-boots cleanly on the next cell. */
+TEST(TestPyrt, TestIdleEvictionTearsInterpreterDownAndDiscontinuesNamespace) {
+  py_frame_t* self = py_frame_create();
+  pyrt_config_t cfg;
+  cfg.backend = SA_PYRT_BACKEND_SUBINTERPRETER;
+  cfg.pool_cap = 0;
+  cfg.idle_evict_ms = 80;
+  self->pyrt = pyrt_create(&self->actor, &cfg);
+  pyrt_execute(self->pyrt, strdup("a1 = 7"));
+  py_frame_pump(self, 10000);
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  ATOMIC_STORE(&self->got_result, 0);
+
+  int waited = 0;
+  while (pyrt_isactive(self->pyrt) != 0 && waited < 3000) {
+    actor_run(&self->actor, ACTOR_BATCH_SIZE);
+    platform_sleep_ms(5);
+    waited++;
+  }
+  EXPECT_EQ(pyrt_isactive(self->pyrt), 0);   /* evicted after the idle timeout */
+
+  /* Eviction drops the namespace BY DESIGN (opt-in memory reclamation; frames
+     needing continuity must not arm idle_evict_ms — spec §Capacity). */
+  pyrt_execute(self->pyrt, strdup("a1 == 7"));
+  py_frame_pump(self, 10000);
+  ASSERT_LT(self->results.size(), 3u);
+  ASSERT_EQ(self->results.size(), 2u);
+  EXPECT_EQ(self->results[1]->status, 1);   /* NameError: namespace was evicted */
+  EXPECT_NE(strstr(self->results[1]->text, "NameError"), nullptr);
+
+  py_frame_free(self);
+}
+
 #endif /* SA_HAS_PYTHON */
 
 #ifndef SA_HAS_PYTHON
