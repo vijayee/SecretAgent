@@ -31,12 +31,12 @@
       "kind": "leaf",
       "intent": "delivery",
       "status": "in-progress",
-      "description": "An actor frame can execute Python in a live CPython subinterpreter while the actor keeps processing messages: EXECUTE is enqueued to the interpreter thread, log/status messages stream out to the parent live, and a RESULT returns corr-matched when the cell finishes. The interpreter is a bound tool, never the substrate; a swappable backend keeps C extensions that cannot live in a subinterpreter usable via a subprocess path. This is L4's execution verb on the L3 runtime spine. If cut, the runtime routes and persists but never computes — agents cannot close the loop on their own output. MILESTONE (pyrt layer delivered): non-blocking subinterpreter EXECUTE with live\n log/status streaming, corr-matched RESULT, lazy boot, pool cap, idle eviction,\n cooperative interrupt (forced paths inert per pinned 3.12.13 verification),\n subprocess fallback with fd discipline. Remaining for slice completion:\n Windows build (PCBuild ExternalProject branch), review records per lifecycle.",
+      "description": "An actor frame can execute Python in a live CPython subinterpreter while the actor keeps processing messages: EXECUTE is enqueued to the interpreter thread, log/status messages stream out to the parent live, and a RESULT returns corr-matched when the cell finishes. The interpreter is a bound tool, never the substrate; a swappable backend keeps C extensions that cannot live in a subinterpreter usable via a subprocess path. This is L4's execution verb on the L3 runtime spine. If cut, the runtime routes and persists but never computes — agents cannot close the loop on their own output. MILESTONE (pyrt layer delivered): non-blocking subinterpreter EXECUTE with live\n log/status streaming, corr-matched RESULT, lazy boot, pool cap, idle eviction,\n cooperative interrupt (forced paths inert per pinned 3.12.13 verification),\n subprocess fallback with fd discipline. Remaining for slice completion:\n Windows build (PCBuild ExternalProject branch), streaming-per-cell attribution (LOG/STATus payloads carry no corr today), review records per lifecycle.",
       "contains": [],
       "requires": [],
       "route": {
         "completionEvidence": [
-          "A running actor answers interrupt/control messages while a slow Python cell executes on its subinterpreter thread",
+          "A running actor answers interrupt/control messages while a slow Python cell executes on its subinterpreter thread (cooperative: honored at cell boundaries only; a running cell is not preemptible on the pinned 3.12 chain)",
           "Python code posts log/status messages whose bytes are attributed per cell and appear live before completion",
           "A RESULT message returns with a correlation id matching the EXECUTE request",
           "Execution backend is swappable (subinterpreter primary, subprocess fallback)",
