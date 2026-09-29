@@ -40,6 +40,10 @@ if (BUILD_TESTING)
             test_refcounter.cpp
             )
 
+    if(SA_HAS_PYTHON)
+      target_sources(testsecretagent PRIVATE test_pyrt.cpp)
+    endif()
+
     # Match the SA_ENABLE_ASAN gate from the parent CMakeLists.txt: when on,
     # instrument the test exe and pull in the ASan runtime.
     if(SA_ENABLE_ASAN)

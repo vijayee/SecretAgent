@@ -59,6 +59,9 @@ add_library(secretagent STATIC ${C_SRC})
 target_include_directories(secretagent PRIVATE ${C_INC})
 
 if(SA_ENABLE_PYTHON)
+  # CMake-level mirror of the PUBLIC compile definition below; the test
+  # subdirectory adds pyrt test sources with a plain if(SA_HAS_PYTHON) gate.
+  set(SA_HAS_PYTHON ON)
   target_compile_definitions(secretagent PUBLIC SA_HAS_PYTHON=1)
   target_include_directories(secretagent PRIVATE ${CPYTHON_ROOT}/Include ${CPYTHON_BUILD})
   # PUBLIC: any host embedding the static library carries the CPython runtime
