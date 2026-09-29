@@ -1,0 +1,31 @@
+# Symlinked reference codebases (read-only, never tracked)
+claude-code-source-code
+deepseek-harness
+onyx
+prime-agent
+liboffs
+WaveDB
+
+# IDE
+/.idea
+
+# CMake build trees
+/cmake-build-*
+/build*
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+DartConfiguration.tcl
+Makefile
+_deps/
+cmake_install.cmake
+
+# Compiled test binaries
+test/testsecretagent
+Testing/
+
+# Crash artifacts
+core.*
+vgcore.*
