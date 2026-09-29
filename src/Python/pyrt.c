@@ -455,8 +455,9 @@ static void* _pyrt_thread(void* arg) {
     free(node);
 
     if (py->backend == SA_PYRT_BACKEND_SUBPROCESS) {
-      /* Task 9 lands the subprocess path here: it frees `exec` itself. */
-      free(exec);
+      /* Task 9 replaces this with the real spawn path; queued subprocess
+         cells are freed, never leaked. */
+      pyrt_execute_payload_destroy(exec);
       continue;
     }
 
@@ -486,7 +487,12 @@ static void* _pyrt_thread(void* arg) {
     _pyrt_post_result(py, exec->corr, status, text);
     pyrt_execute_payload_destroy(exec);
     if (had_shutdown) {
-      break;
+      platform_mutex_lock(py->lock);
+      uint8_t drained = (py->head == NULL);
+      platform_mutex_unlock(py->lock);
+      if (drained) {
+        break;
+      }
     }
   }
 
@@ -573,8 +579,8 @@ void pyrt_destroy(pyrt_t* pyrt) {
   }
   platform_mutex_destroy(pyrt->lock);
   platform_condvar_destroy(pyrt->condition);
-  /* The thread owns and frees every queued payload; a node left queued is
-     only possible if the thread never ran, which cannot happen after join. */
+  /* Shutdown drains the queue before the thread exits; nodes abandoned
+     mid-pop are freed on their own dispatch. */
   free(pyrt);
 }
 
