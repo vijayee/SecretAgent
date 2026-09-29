@@ -3,6 +3,10 @@ project(secretagent LANGUAGES C CXX VERSION 0.1.0)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+# Export compile_commands.json by default so clangd/IDE tooling works out of
+# the box (no-op with the Visual Studio generator).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Optional build surface. Embedding projects set this to OFF to skip every
 # test executable.
 option(SA_BUILD_TESTS "Build SecretAgent test binaries" ON)
