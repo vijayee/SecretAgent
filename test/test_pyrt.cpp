@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 #include <atomic>
+#include <cstring>
 #include <string>
 #include <vector>
 extern "C" {
@@ -126,6 +127,86 @@ TEST(TestPyrt, TestExecuteReturnsCorrMatchedResult) {
   EXPECT_EQ(r->status, 0);
   EXPECT_EQ(r->corr, 1u);
   EXPECT_STREQ(r->text, "42");
+
+  py_frame_free(self);
+}
+
+TEST(TestPyrt, TestNamespacePersistsAcrossCells) {
+  py_frame_t* self = py_frame_create();
+  py_frame_execute(self, "x = 41");
+  py_frame_pump(self, 10000);
+  ATOMIC_STORE(&self->got_result, 0);
+  py_frame_execute(self, "x + 1");
+  py_frame_pump(self, 10000);
+
+  ASSERT_LT(self->results.size(), 3u);
+  ASSERT_EQ(self->results.size(), 2u);
+  EXPECT_EQ(self->results[1]->status, 0);
+  EXPECT_STREQ(self->results[1]->text, "42");
+
+  py_frame_free(self);
+}
+
+TEST(TestPyrt, TestLogStreamsBeforeResult) {
+  py_frame_t* self = py_frame_create();
+  py_frame_execute(self, "for i in range(3):\n    import actor\n    actor.log('tick %d' % i)\n1 + 1");
+
+  /* Stream check: narration visible while the cell is still running.
+     Observed reality: the harness's own dispatch timestamps show the
+     worker posts the three logs microseconds apart inside the still-
+     running cell and the result right after (~7 us total) — while each
+     dispatch costs ~1-5 us at -O0. So a 1 ms sleep-poll strides over the
+     whole stream window, and ANY batch >=2 drain keeps swallowing
+     messages the worker posts mid-drain until the result lands inside
+     the same actor_run that first sees a log. Poll hot (no sleep) and
+     drain exactly ONE message per call, breaking the instant a log is
+     dispatched: a single-message run stops the drain dead, so the result
+     cannot piggyback on the same actor_run and got_result must still be
+     0 at the check below. */
+  int waited = 0;
+  while (ATOMIC_LOAD(&self->got_result) == 0 && waited < 5000000) {
+    if (message_queue_isempty(&self->actor.queue)) {
+      waited++;
+      continue;   /* hot spin: no mail yet */
+    }
+    actor_run(&self->actor, 1);
+    if (self->logs.size() > 0) {
+      break;
+    }
+  }
+  EXPECT_GT(self->logs.size(), 0u);
+  EXPECT_EQ(ATOMIC_LOAD(&self->got_result), 0);   /* streaming, not buffered */
+
+  py_frame_pump(self, 10000);
+  ASSERT_LT(self->results.size(), 2u);
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  EXPECT_EQ(self->logs.size(), 3u);
+  EXPECT_STREQ(self->logs[0].c_str(), "tick 0");
+
+  py_frame_free(self);
+}
+
+TEST(TestPyrt, TestFailingCellReturnsTracebackNotCrash) {
+  py_frame_t* self = py_frame_create();
+  py_frame_execute(self, "1 / 0");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 1);
+  EXPECT_NE(strstr(self->results[0]->text, "ZeroDivisionError"), nullptr);
+
+  /* Plan-contract correction: the harness pump idles on got_result, which
+     cell 1 left set — reset it so the second pump actually waits for the
+     next corr-matched result (same pattern as
+     TestNamespacePersistsAcrossCells). */
+  ATOMIC_STORE(&self->got_result, 0);
+  py_frame_execute(self, "40 + 2");   /* interpreter survived the exception */
+  py_frame_pump(self, 10000);
+  ASSERT_LT(self->results.size(), 3u);
+  ASSERT_EQ(self->results.size(), 2u);
+  EXPECT_EQ(self->results[1]->status, 0);
+  EXPECT_STREQ(self->results[1]->text, "42");
 
   py_frame_free(self);
 }
