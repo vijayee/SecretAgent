@@ -85,7 +85,7 @@ static void py_frame_free(py_frame_t* self) {
   for (auto* r : self->results) {
     pyrt_result_payload_destroy(r);
   }
-  /* The frame is plain-get_memory'd, so the C++ vector/string members are
+  /* The frame is clear-allocated, so the C++ vector/string members are
      never destructed by free(): drain their buffers here or valgrind reports
      the harness vectors themselves as definitely-lost. */
   /* Assignment from the default-constructed empties frees the buffers
