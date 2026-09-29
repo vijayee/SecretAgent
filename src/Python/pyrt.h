@@ -34,8 +34,10 @@ pyrt_t* pyrt_create(actor_t* owner, const pyrt_config_t* cfg);
    thread lazily on the first call. */
 uint64_t pyrt_execute(pyrt_t* pyrt, char* code);
 
-/* Request the running cell to stop (the mechanism is decided by Task 1
-   Step 3's header verification; Task 6 implements what it permits). */
+/* Request the running cell to stop. COOPERATIVE-only on the pinned 3.12.13
+   chain: the request is honored at cell boundaries by the pyrt thread loop;
+   a running cell is not preemptible (forced paths verified inert — the
+   evidence comment lives on pyrt_interrupt). */
 void pyrt_interrupt(pyrt_t* pyrt);
 
 /* 1 while the backend is live (interpreter booted, or subprocess thread up). */

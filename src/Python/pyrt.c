@@ -42,8 +42,6 @@ struct pyrt_t {
   ATOMIC(uint8_t) interrupt_req;
   ATOMIC(uint64_t) corr_counter;
   platform_thread_t* thread;
-  /* Consumed by the interrupt delivery path (Task 6). */
-  unsigned long thread_id;
   PyThreadState* tstate;
   PyObject* main_dict;
   unsigned idle_evict_ms;
@@ -306,13 +304,18 @@ static uint8_t _pyrt_run_cell_sub(pyrt_t* py, const char* code, char** out_text)
   const char* text = NULL;
   if (!PyArg_ParseTuple(result, "is", &status, &text)) {
     PyErr_Clear();
-    Py_DECREF(result);
+    /* Parsing failed, so no borrowed `text` pointer survived to escape: the
+       replacement literal is strdup'd OUT of Python's heap. */
     *out_text = strdup("pyrt: bad cell result");
+    Py_DECREF(result);
     return 1;
   }
-  Py_DECREF(result);
+  /* The tuple owns the string; strdup must precede any DECREF (otherwise a
+     failing cell's traceback text loses its last owner at the DECREF and
+     the copy below reads freed memory). */
   *out_text = strdup(text != NULL ? text : "");
-  return status != 0;
+  Py_DECREF(result);
+  return (uint8_t)(status != 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -450,7 +453,6 @@ static void _pyrt_slot_release(void) {
 static void* _pyrt_thread(void* arg) {
   pyrt_t* py = (pyrt_t*)arg;
   _tls_pyrt = py;
-  py->thread_id = (unsigned long)platform_thread_self();
 
   uint8_t interp_live = 0;
   if (!_pyrt_global_init()) {
@@ -546,6 +548,10 @@ static void* _pyrt_thread(void* arg) {
        reached a boot — the pending cell is cut at its start boundary. The
        ABA-trap fold: the dropped cell always posts its corr-matched status
        1 RESULT here, so the owner is never left hanging to timeout. */
+    /* Idle-state asymmetry (shipped, documented): the cut fires only while
+       NO interpreter is live; a request armed in the idle gap with the
+       interpreter live is not honored for the next queued cell — the cell
+       runs and the per-cell clear below consumes the flag. */
     if (ATOMIC_LOAD(&py->interrupt_req) == 1 && !interp_live) {
       ATOMIC_STORE(&py->interrupt_req, 0);
       /* _pyrt_post_result takes ownership of the text, so the literal must
@@ -682,7 +688,7 @@ void pyrt_interrupt(pyrt_t* pyrt) {
      GIL held and scans interp->threads.head of the CALLING thread's current
      interpreter (_PyInterpreterState_GET()); the embedder thread can only
      obtain the MAIN interpreter's GIL (PyGILState_Ensure makes a main-interp
-     tstate), so the worker's thread_id is not in the scanned list and the
+     tstate), so the worker thread is not in the scanned list and the
      call returns 0 — probed empirically: rc=0 while a busy subinterpreter
      cell completed normally, status 0, no KeyboardInterrupt. (2)
      PyErr_SetInterruptEx (Modules/signalmodule.c:1886) drives process-global

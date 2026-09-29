@@ -16,7 +16,7 @@ typedef enum pyrt_message_type_e {
   PYRT_LOG,           /* python -> owning actor: live narration */
   PYRT_STATUS,        /* python -> owning actor: current status */
   PYRT_EMIT,          /* python -> owning actor: durable-payload candidate */
-  PYRT_INTERRUPT      /* actor -> pyrt backend: stop the running cell */
+  PYRT_INTERRUPT      /* reserved interrupt envelope; delivery is via pyrt_interrupt (cooperative) */
 } pyrt_message_type_e;
 
 /* EXECUTE. Ownership of `code` transfers with the message. `corr` is the
