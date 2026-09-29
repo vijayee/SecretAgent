@@ -114,6 +114,22 @@ TEST(TestPyrt, TestFrozenApiSymbolsResolve) {
   EXPECT_NE((void*)pyrt_destroy, (void*)NULL);
 }
 
+TEST(TestPyrt, TestExecuteReturnsCorrMatchedResult) {
+  py_frame_t* self = py_frame_create();
+
+  py_frame_execute(self, "21 * 2");
+  py_frame_pump(self, 10000);
+
+  ASSERT_LT(self->results.size(), 2u);
+  ASSERT_EQ(self->results.size(), 1u);
+  pyrt_result_payload_t* r = self->results[0];
+  EXPECT_EQ(r->status, 0);
+  EXPECT_EQ(r->corr, 1u);
+  EXPECT_STREQ(r->text, "42");
+
+  py_frame_free(self);
+}
+
 #endif /* SA_HAS_PYTHON */
 
 #ifndef SA_HAS_PYTHON

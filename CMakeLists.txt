@@ -64,6 +64,15 @@ if(SA_ENABLE_PYTHON)
   set(SA_HAS_PYTHON ON)
   target_compile_definitions(secretagent PUBLIC SA_HAS_PYTHON=1)
   target_include_directories(secretagent PRIVATE ${CPYTHON_ROOT}/Include ${CPYTHON_BUILD})
+  # Root cause of embedded stdlib discovery: a statically linked libpython has
+  # no executable of its own, so CPython's getpath has no anchor for its
+  # build-directory landmark (pybuilddir.txt) and would fall back to whatever
+  # a PATH search happens to find on the host. Pointing config.executable at
+  # the build-tree `python` pins the paths to this build's source Lib dir and
+  # compiled-modules dir deterministically. The path is absolute per build, so
+  # PRIVATE scope is sufficient.
+  target_compile_definitions(secretagent PRIVATE
+    "SA_PYTHON_EXECUTABLE=\"${CPYTHON_BUILD}/python\"")
   # PUBLIC: any host embedding the static library carries the CPython runtime
   # (pyrt is part of the library ABI while SA_HAS_PYTHON is defined).
   target_link_libraries(secretagent PUBLIC ${CPYTHON_BUILD}/libpython3.12.a)
