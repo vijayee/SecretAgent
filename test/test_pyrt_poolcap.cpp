@@ -89,10 +89,17 @@ static void py_frame_free(py_frame_t* self) {
 }
 
 /* Pool-cap contract, in a binary where this is the first (and only) runtime:
-   with the process-fixed pool at 1, the runtime that owns the only slot
-   holds it until its interpreter is torn down; the second runtime's cell
+   with the process-fixed pool at 1, the runtime that wins the only slot
+   holds it until its interpreter is torn down; the other runtime's cell
    therefore QUEUES (backpressure, never an error) and drains with its own
-   corr-matched result once the slot is released. */
+   corr-matched result once the slot is released.
+
+   Winner-agnostic BY DESIGN: whichever worker reaches the slot acquire first
+   wins (their threads race after the same process-wide init — observed to
+   invert under valgrind's scheduling). The test determines the winner from
+   the first corr-matched RESULT that lands, then destroys the holder FIRST:
+   a queued runtime's worker blocks inside _pyrt_slot_acquire, so destroying
+   the waiter before the holder would deadlock pyrt_destroy's join. */
 TEST(TestPyrtPoolCap, TestPoolCapQueuesExecutesAndDrains) {
   py_frame_t* a = py_frame_create();
   py_frame_t* b = py_frame_create();
@@ -104,37 +111,68 @@ TEST(TestPyrtPoolCap, TestPoolCapQueuesExecutesAndDrains) {
   a->pyrt = pyrt_create(&a->actor, &cfg);
   b->pyrt = pyrt_create(&b->actor, &cfg);
 
-  /* The slot holder must be a DETERMINISTIC hold, not a compute cell: the
-     planned sum(range(10**7)) finishes in ~300-450 ms on this host, INSIDE
-     the polling window, so the backpressure assert raced the cell's own
-     completion and cannot be run at all. time.sleep(3) guarantees the slot
-     is held for >= 3 s (even a slow/loaded harness only lengthens the hold),
-     while the backpressure window below polls for ~1 s. Also verifies
-     `import time` boots in the PEP-684 subinterpreter (status-1 would mean
-     the hold failed and the test cannot mean what it says). */
-  pyrt_execute(a->pyrt, strdup("import time\ntime.sleep(3)"));  /* holds the only slot */
-  pyrt_execute(b->pyrt, strdup("7 * 6"));               /* queues, never fails */
-  int waited = 0;
-  while (ATOMIC_LOAD(&b->got_result) == 0 && waited < 1000) {
+  /* The slot holder's cell must be a DETERMINISTIC hold, not a compute cell:
+     the planned sum(range(10**7)) finishes in ~300-450 ms on this host,
+     INSIDE any polling window, so the backpressure assert would race the
+     cell's own completion. time.sleep(3) guarantees the slot is held until
+     the cell completes (a slow/loaded harness only lengthens the hold). */
+  pyrt_execute(a->pyrt, strdup("import time\ntime.sleep(3)"));
+  pyrt_execute(b->pyrt, strdup("7 * 6"));
+
+  /* Wait for the WINNER of the single slot to post its corr-matched result.
+     180 s wall bound: under valgrind the process-wide CPython init plus the
+     booting subinterpreter costs tens of seconds; under load the hold only
+     grows. */
+  uint64_t started_ns = platform_monotonic_ns();
+  py_frame_t* w = NULL;
+  py_frame_t* l = NULL;
+  while (w == NULL && (platform_monotonic_ns() - started_ns) < 180000000000ULL) {
     actor_run(&a->actor, ACTOR_BATCH_SIZE);
     actor_run(&b->actor, ACTOR_BATCH_SIZE);
-    platform_sleep_ms(1);
-    waited++;
+    if (ATOMIC_LOAD(&a->got_result) != 0) {
+      w = a;
+      l = b;
+    } else if (ATOMIC_LOAD(&b->got_result) != 0) {
+      w = b;
+      l = a;
+    } else {
+      platform_sleep_ms(5);
+    }
   }
-  EXPECT_EQ(ATOMIC_LOAD(&b->got_result), 0);   /* backpressure: b still queued */
-  EXPECT_EQ(a->results.size(), 0u);            /* a still running its long cell */
+  ASSERT_NE(w, (py_frame_t*)nullptr);   /* a result DID land within the bound */
 
-  /* a finishes and its runtime is destroyed, releasing the slot for b. */
-  py_frame_free(a);
-  while (ATOMIC_LOAD(&b->got_result) == 0 && waited < 60000) {
-    actor_run(&b->actor, ACTOR_BATCH_SIZE);
+  /* Backpressure, asserted over the holder's ENTIRE hold (not a fixed
+     window): the loser is provably still queued — the winner retains the
+     slot until its runtime is destroyed (results always post before
+     teardown), so the loser cannot even boot while the winner lives. */
+  EXPECT_EQ(ATOMIC_LOAD(&l->got_result), 0);
+  EXPECT_EQ(l->results.size(), 0u);
+
+  /* The winner's cell completed with its normal corr-matched result; a
+     status-1 here would also surface a subinterpreter boot failure, which
+     must not masquerade as passing backpressure. */
+  ASSERT_EQ(w->results.size(), 1u);
+  EXPECT_EQ(w->results[0]->status, 0);
+  if (w == a) {
+    EXPECT_STREQ(w->results[0]->text, "");   /* exec-style hold, no output */
+  } else {
+    EXPECT_STREQ(w->results[0]->text, "42");
+  }
+
+  /* Destroying the holder tears its interpreter down and releases the slot. */
+  py_frame_free(w);
+  while (ATOMIC_LOAD(&l->got_result) == 0 &&
+         (platform_monotonic_ns() - started_ns) < 360000000000ULL) {
+    actor_run(&l->actor, ACTOR_BATCH_SIZE);
     platform_sleep_ms(5);
-    waited++;
   }
-  ASSERT_LT(b->results.size(), 2u);
-  ASSERT_EQ(b->results.size(), 1u);
-  EXPECT_EQ(b->results[0]->status, 0);
-  EXPECT_STREQ(b->results[0]->text, "42");
+  ASSERT_EQ(l->results.size(), 1u);
+  EXPECT_EQ(l->results[0]->status, 0);
+  if (l == a) {
+    EXPECT_STREQ(l->results[0]->text, "");
+  } else {
+    EXPECT_STREQ(l->results[0]->text, "42");
+  }
 
-  py_frame_free(b);
+  py_frame_free(l);
 }
