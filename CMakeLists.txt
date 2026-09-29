@@ -42,11 +42,14 @@ if(SA_ENABLE_PYTHON)
   ExternalProject_Add(cpython-ext
     SOURCE_DIR ${CPYTHON_ROOT}
     CONFIGURE_COMMAND ${CPYTHON_CONFIGURE}
-    BUILD_COMMAND make -j$(nproc)
+    BUILD_COMMAND make -j
     INSTALL_COMMAND ${CPYTHON_INSTALL}
     BUILD_BYPRODUCTS ${CPYTHON_BUILD}/libpython3.12.a
     BINARY_DIR ${CPYTHON_BUILD}
   )
+  # NOTE: bumping the deps/cpython pin does not touch these ExternalProject
+  # stamps — after a re-pin, remove the old build stamps or the whole
+  # ${CMAKE_BINARY_DIR}/deps/cpython tree to force a fresh configure+build.
 endif()
 if(NOT SA_ENABLE_PYTHON)
   list(FILTER C_SRC EXCLUDE REGEX "src/Python/")
