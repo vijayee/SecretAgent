@@ -72,6 +72,11 @@ static platform_mutex_t* _pyrt_slots_lock = NULL;
 static platform_condvar_t* _pyrt_slots_cond = NULL;
 static size_t _pyrt_live = 0;
 
+/* Slot-wait granularity: the queued-worker wait is a timed wait so it can
+   re-observe the runtime's shutdown flag between passes (the queued-destroy
+   fix; see _pyrt_slot_acquire). */
+#define _PYRT_SLOT_WAIT_MS 100
+
 /* Runs once per subinterpreter; defines the cell executor the thread calls. */
 static const char _PYRT_HELPERS[] =
     "def __sa_exec_cell(code):\n"
@@ -405,15 +410,27 @@ static void _pyrt_pool_init(size_t cap) {
   }
 }
 
-/* Never called while holding another lock. */
-static void _pyrt_slot_acquire(void) {
+/* Never called while holding another lock. Returns 1 with a slot held; 0 when
+   the runtime shut down while queued for a slot (nothing acquired — the caller
+   must NOT release and must settle its cell via the drain rule). Shutdown
+   awareness is REQUIRED, not stylistic: a worker queued behind a full pool
+   used to block on the global condvar with no wake on pyrt_destroy, so
+   destroying the queued runtime would hang pyrt_destroy's join for the whole
+   remaining hold of every slot. Each pass is a timed wait, so the shutdown
+   flag is re-observed within _PYRT_SLOT_WAIT_MS and the join is bounded. */
+static uint8_t _pyrt_slot_acquire(pyrt_t* py) {
   platform_mutex_lock(_pyrt_slots_lock);
-  while (_pyrt_live >= _pyrt_cap) {
-    platform_condvar_wait(_pyrt_slots_cond, _pyrt_slots_lock);
+  while (py->shutdown == 0 && _pyrt_live >= _pyrt_cap) {
+    platform_condvar_timed_wait(_pyrt_slots_cond, _pyrt_slots_lock,
+                                _PYRT_SLOT_WAIT_MS);
   }
-  _pyrt_live += 1;
-  platform_condvar_broadcast(_pyrt_slots_cond);
+  uint8_t acquired = (uint8_t)(py->shutdown == 0 ? 1 : 0);
+  if (acquired) {
+    _pyrt_live += 1;
+    platform_condvar_broadcast(_pyrt_slots_cond);
+  }
   platform_mutex_unlock(_pyrt_slots_lock);
+  return acquired;
 }
 
 static void _pyrt_slot_release(void) {
@@ -519,7 +536,14 @@ static void* _pyrt_thread(void* arg) {
     }
 
     if (!interp_live) {
-      _pyrt_slot_acquire(); /* may block; nothing else is held */
+      if (!_pyrt_slot_acquire(py)) { /* may block on a full pool; nothing else is held */
+        /* Same drain rule as the subprocess branch: shutdown observed while
+           queued for a slot — corr-matched refusal, no slot to release. */
+        _pyrt_post_result(py, exec->corr, 1,
+                          strdup("pyrt: destroyed while queued"));
+        pyrt_execute_payload_destroy(exec);
+        continue;
+      }
       if (!_pyrt_interp_boot(py)) {
         /* Same ownership rule: the result text must be heap-owned. This
            call site predates the interrupt refusal above and had the same
@@ -661,6 +685,15 @@ void pyrt_destroy(pyrt_t* pyrt) {
   pyrt->shutdown = 1;
   platform_condvar_broadcast(pyrt->condition);
   platform_mutex_unlock(pyrt->lock);
+  /* Queued-destroy fix: a worker holding NO slot can be parked on the GLOBAL
+     pool condvar inside _pyrt_slot_acquire; only py->condition's broadcast
+     never reaches it and the join below would hang for the whole remaining
+     hold of every pool slot. Shutdown is observable for that waiter too, so
+     it must also see a wake. Liboffs condvar discipline: broadcast while
+     holding the condvar's paired lock. */
+  platform_mutex_lock(_pyrt_slots_lock);
+  platform_condvar_broadcast(_pyrt_slots_cond);
+  platform_mutex_unlock(_pyrt_slots_lock);
   if (pyrt->thread != NULL) {
     platform_thread_join(pyrt->thread); /* the thread tears down its backend */
   }
