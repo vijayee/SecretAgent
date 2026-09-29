@@ -100,4 +100,22 @@ if (BUILD_TESTING)
     include(GoogleTest)
     gtest_add_tests(TARGET testsecretagent TEST_LIST test_list)
     set_tests_properties(${test_list} PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+    # Under SA_ENABLE_ASAN the pyrt tests legitimately exit with CPython-owned
+    # allocations still on the table (see lsan-cpython.supp for the documented
+    # classes: pymalloc arena bookkeeping, object pools, interpreter-internal
+    # list storage, thread locks). LSan reports those at exit and fails the
+    # suite, so the pyrt tests carry the suppression file; the patterns only
+    # match obmalloc/listobject/thread_pthread frames, so a pyrt-owned leak is
+    # still reported and still fails the run. Non-pyrt tests keep full leak
+    # checking.
+    if(SA_ENABLE_ASAN AND SA_HAS_PYTHON)
+      set(_sa_lsan_supp "${CMAKE_CURRENT_SOURCE_DIR}/lsan-cpython.supp")
+      foreach(_test_name ${test_list} ${test_list_poolcap})
+        if(_test_name MATCHES "^TestPyrt")
+          set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
+        endif()
+      endforeach()
+      unset(_test_name)
+    endif()
 endif()

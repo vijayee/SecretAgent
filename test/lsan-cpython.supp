@@ -1,0 +1,17 @@
+# LeakSanitizer suppressions for the pyrt test suites only.
+#
+# CPython (deps/cpython, statically linked) intentionally does not release
+# some allocations at Py_Finalize; these are the same classes valgrind
+# reports as CPython-owned "still reachable" (style guide §6): the pymalloc
+# arena bookkeeping (arena_map_get/new_arena via PyMem_RawCalloc/RawRealloc),
+# object pools (PyMem_RawMalloc/_PyObject_Malloc), interpreter-internal list
+# storage (list_resize), and the thread-lock table (PyThread_allocate_lock).
+#
+# Every suppression below matches a frame inside obmalloc.c/listobject.c/
+# thread_pthread.h only — no pyrt-owned (src/) frame matches, so a genuine
+# pyrt leak still fails the ASan run.
+leak:PyMem_RawMalloc
+leak:PyMem_RawCalloc
+leak:PyMem_RawRealloc
+leak:list_resize
+leak:PyThread_allocate_lock

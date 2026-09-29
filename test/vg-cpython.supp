@@ -1,0 +1,30 @@
+# Valgrind suppressions for the pyrt test suites.
+#
+# CPython (deps/cpython, statically linked) retains its pymalloc arena
+# bookkeeping (obmalloc.c new_arena / arena_map_get) across interpreter
+# finalization; after Py_EndInterpreter the arena descriptors no longer have a
+# retained pointer, so valgrind classifies the arena memory as definitely or
+# possibly lost. This is the documented CPython-owned class (style guide §6):
+# no pyrt-owned (src/) frame is in these stacks — the only pyrt frame in any
+# of them is the Py_NewInterpreterFromConfig call site inside interp boot.
+#
+# The two entries cover the allocator pairs valgrind observes at the top of
+# those stacks: malloc→new_arena (small-object pools) and calloc→new_arena
+# (arena region + arena_map). Everything below new_arena is CPython's
+# interpreter initialization path (_PyGC_Init / pycore_interp_init).
+{
+   cpython-pymalloc-arena-malloc
+   Memcheck:Leak
+   match-leak-kinds: possible,definite,indirect
+   fun:malloc
+   fun:new_arena
+   ...
+}
+{
+   cpython-pymalloc-arena-calloc
+   Memcheck:Leak
+   match-leak-kinds: possible,definite,indirect
+   fun:calloc
+   fun:new_arena
+   ...
+}
