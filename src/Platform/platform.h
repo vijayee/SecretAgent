@@ -9,5 +9,6 @@
 #include "platform_posix_compat.h"
 #include "platform_time.h"
 #include "platform_thread.h"
+#include "platform_process.h"
 
 #endif // SA_PLATFORM_H

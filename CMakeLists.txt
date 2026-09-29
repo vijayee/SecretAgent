@@ -25,8 +25,46 @@ file(GLOB_RECURSE C_INC "src/*/*.h")
 include(CTest)
 add_subdirectory(deps)
 
+# Optional Python execution layer: CPython 3.12 built from the pinned
+# deps/cpython submodule via ExternalProject (the liboffs external-dep
+# pattern). OFF keeps the library libpython-free for embedders that do
+# not host Python.
+option(SA_ENABLE_PYTHON "Build the Python execution layer (requires deps/cpython)" ON)
+if(SA_ENABLE_PYTHON)
+  if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/cpython/Include/Python.h)
+    message(FATAL_ERROR "deps/cpython submodule missing. Run: git submodule update --init --recursive")
+  endif()
+  include(ExternalProject)
+  set(CPYTHON_ROOT    ${CMAKE_CURRENT_SOURCE_DIR}/deps/cpython)
+  set(CPYTHON_BUILD   ${CMAKE_BINARY_DIR}/deps/cpython)
+  set(CPYTHON_CONFIGURE ${CMAKE_COMMAND} -E chdir ${CPYTHON_BUILD} bash ${CPYTHON_ROOT}/configure --without-ensurepip --disable-test-modules)
+  set(CPYTHON_INSTALL ${CMAKE_COMMAND} -E echo "Skipping install; consuming build-dir artifacts directly")
+  ExternalProject_Add(cpython-ext
+    SOURCE_DIR ${CPYTHON_ROOT}
+    CONFIGURE_COMMAND ${CPYTHON_CONFIGURE}
+    BUILD_COMMAND make -j$(nproc)
+    INSTALL_COMMAND ${CPYTHON_INSTALL}
+    BUILD_BYPRODUCTS ${CPYTHON_BUILD}/libpython3.12.a
+    BINARY_DIR ${CPYTHON_BUILD}
+  )
+endif()
+if(NOT SA_ENABLE_PYTHON)
+  list(FILTER C_SRC EXCLUDE REGEX "src/Python/")
+endif()
+
 add_library(secretagent STATIC ${C_SRC})
 target_include_directories(secretagent PRIVATE ${C_INC})
+
+if(SA_ENABLE_PYTHON)
+  target_compile_definitions(secretagent PUBLIC SA_HAS_PYTHON=1)
+  target_include_directories(secretagent PRIVATE ${CPYTHON_ROOT}/Include ${CPYTHON_BUILD})
+  # PUBLIC: any host embedding the static library carries the CPython runtime
+  # (pyrt is part of the library ABI while SA_HAS_PYTHON is defined).
+  target_link_libraries(secretagent PUBLIC ${CPYTHON_BUILD}/libpython3.12.a)
+  target_link_libraries(secretagent PUBLIC crypt dl m)
+  target_link_libraries(secretagent PUBLIC pthread)
+  add_dependencies(secretagent cpython-ext)
+endif()
 
 # Opt-in AddressSanitizer instrumentation of the secretagent library only (not
 # external deps). /Z7 embeds debug info so ASan stack traces symbolicate.
