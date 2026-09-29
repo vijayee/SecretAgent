@@ -126,10 +126,38 @@ static void* _scheduler_worker_loop(void* arg) {
         continue;
       }
       if (flags & ACTOR_FLAG_MUTED) {
-        /* Actor is muted due to backpressure — re-queue it for later */
-        self->current = NULL;
-        deque_push(&self->local_queue, (void*)actor);
-        continue;
+        /* Actor is muted due to backpressure — park it instead of re-queueing.
+           Re-pushing it here busy-spins the worker: pop takes from the LIFO
+           bottom, so the just-pushed muted actor is returned on the very next
+           pop and the loop burns CPU in deque_push/deque_pop while starving
+           every older actor in this deque. Parking is the state backpressure
+           already models: muting pauses the sender, and backpressure_release()
+           re-injects it into a worker deque the moment its pressured target's
+           mailbox drains (actor_destroy drains the list too, so a parked actor
+           is never orphaned by teardown). Clear SCHEDULED before parking so
+           the release re-inject is never skipped for a parked actor.
+
+           Lost-wakeup race: the target may release us between our flags read
+           above and the park — backpressure_release then sees SCHEDULED still
+           set (we have not cleared it yet) and skips its re-inject, while we
+           park an actor that is no longer muted and it is never scheduled
+           again. Close it by re-checking MUTED after clearing SCHEDULED: if
+           the release already ran, fall through and run the actor ourselves
+           (it is not in any deque — we just popped it); if the release runs
+           after our clear, its SCHEDULED check sees the flag clear and the
+           re-inject fires. Both orders reschedule exactly once (a simultaneous
+           release + fall-through double-inject is absorbed by the RUNNING-flag
+           guard below). Order matters: the queue_state must go IDLE last —
+           after it, a concurrent destroyer may free the actor, so nothing may
+           touch it afterwards. */
+        atomic_fetch_and(&actor->flags, ~ACTOR_FLAG_SCHEDULED);
+        uint8_t recheck = atomic_load(&actor->flags);
+        if (recheck & (ACTOR_FLAG_MUTED | ACTOR_FLAG_DESTROY)) {
+          atomic_store(&actor->queue_state, ACTOR_QUEUE_IDLE);
+          self->current = NULL;
+          continue;
+        }
+        /* Released while we were parking — run it this iteration. */
       }
       if (flags & ACTOR_FLAG_RUNNING) {
         /* Another worker is already running this actor; re-queue it */
@@ -349,9 +377,17 @@ void scheduler_pool_drain_pending_derefs(scheduler_pool_t* pool) {
    the inject queue and that worker would not be idle. Re-injecting cannot
    double-run it: no worker holds it when all are idle.
 
-   Only DESTROY-flagged actors are skipped: their owner is tearing them down
-   and will drain the mailbox itself via message_queue_destroy (which decrements
-   pending_messages), so re-injecting would race with that teardown.
+   Only DESTROY-flagged and MUTED actors are skipped: DESTROY actors are being
+   torn down (their owner drains the mailbox itself via message_queue_destroy,
+   which decrements pending_messages, so re-injecting would race with that
+   teardown), and MUTED actors are parked by the backpressure protocol, not
+   stranded — they are in no deque precisely because their pressured target has
+   not released them, and re-injecting one would have the worker immediately
+   re-park it (an idle↔re-inject loop that would exhaust the recovery limit
+   below). A muted actor is resumed by backpressure_release() when its target's
+   mailbox drains, or by actor_destroy's drain at teardown. Consequence: two
+   MUTED actors parked on each other's full mailboxes would never revive — the
+   mutual-mute cycle caveat in docs/backpressure-and-timer-stall.md §4.1.
 
    registry_lock is held throughout, including across scheduler_inject. No
    other path acquires registry_lock while holding inject.lock (actor_send and
@@ -370,7 +406,8 @@ static bool _scheduler_pool_reinject_stranded(scheduler_pool_t* pool) {
   actor_t* actor = pool->registry_head;
   while (actor != NULL) {
     uint8_t flags = atomic_load(&actor->flags);
-    if (!(flags & ACTOR_FLAG_DESTROY) && !message_queue_isempty(&actor->queue)) {
+    if (!(flags & (ACTOR_FLAG_DESTROY | ACTOR_FLAG_MUTED)) &&
+        !message_queue_isempty(&actor->queue)) {
       atomic_fetch_or(&actor->flags, ACTOR_FLAG_SCHEDULED);
       /* Re-injection puts the actor into a worker deque: transition to
          QUEUED so a concurrent actor_destroy cannot free it while it is
@@ -409,7 +446,9 @@ int scheduler_pool_wait_for_idle(scheduler_pool_t* pool) {
          re-injectable, the remaining pending messages live only in
          DESTROY-flagged actors whose owner will drain them after we return
          (the established http/transport teardown pattern: set ACTOR_FLAG_DESTROY,
-         wait_for_idle, then message_queue_destroy + free), so it is correct to
+         wait_for_idle, then message_queue_destroy + free), or in MUTED actors
+         parked by the backpressure protocol (their target will release them,
+         or teardown's destroy-drain handles them), so it is correct to
          return here — no dispatchable work is stranded. */
       platform_mutex_unlock(pool->idle_lock);
       bool reinjected = _scheduler_pool_reinject_stranded(pool);
