@@ -85,6 +85,14 @@ static void py_frame_free(py_frame_t* self) {
   for (auto* r : self->results) {
     pyrt_result_payload_destroy(r);
   }
+  /* The frame is plain-get_memory'd, so the C++ vector/string members are
+     never destructed by free(): drain their buffers here or valgrind reports
+     the harness vectors themselves as definitely-lost. */
+  /* Assignment from the default-constructed empties frees the buffers
+     (clear() alone would keep the allocator capacity alive). */
+  self->results = std::vector<pyrt_result_payload_t*>();
+  self->logs = std::vector<std::string>();
+  self->statuses = std::vector<std::string>();
   free(self);
 }
 
@@ -175,4 +183,78 @@ TEST(TestPyrtPoolCap, TestPoolCapQueuesExecutesAndDrains) {
   }
 
   py_frame_free(l);
+}
+
+/* Queued-destroy contract (reviewer-mandated regression): with the process
+   pool at 1 and the holder keeping the only slot for its whole lifetime, the
+   second runtime's cell is QUEUED — its worker is parked inside
+   _pyrt_slot_acquire on the GLOBAL pool condvar, which pyrt_destroy used to
+   never wake, so destroying the queued runtime hung at the join for as long
+   as every slot stayed held. Now the worker's slot wait is shutdown-aware
+   (timed, re-observes shutdown) and the stranded cell exits with a
+   corr-matched status-1 refusal, so the destroy's join is bounded. */
+TEST(TestPyrtPoolCap, TestDestroyOfQueuedRuntimeReturnsPromptlyWithCorrMatchedRefusal) {
+  py_frame_t* a = py_frame_create();
+  py_frame_t* b = py_frame_create();
+
+  pyrt_config_t cfg;
+  cfg.backend = SA_PYRT_BACKEND_SUBINTERPRETER;
+  cfg.pool_cap = 1;               /* the FIRST create fixes it */
+  cfg.idle_evict_ms = 0;
+  a->pyrt = pyrt_create(&a->actor, &cfg);
+  b->pyrt = pyrt_create(&b->actor, &cfg);
+
+  /* Holder: deterministic whole-lifetime slot hold (time.sleep(3) outlasts
+     every bounded wait below; see the pool-cap test above). Queue the holder
+     FIRST and let its cell start so the slot race is settled before b queues:
+     a retains the slot until ITS destroy. The 3 s wall-clock hold outlives
+     every bounded wait below even under valgrind's scheduling. */
+  pyrt_execute(a->pyrt, strdup("import time\ntime.sleep(3)"));
+  {
+    uint64_t holder_ns = platform_monotonic_ns();
+    while (ATOMIC_LOAD(&a->got_result) == 0 &&
+           (platform_monotonic_ns() - holder_ns) < 180000000000ULL) {
+      actor_run(&a->actor, ACTOR_BATCH_SIZE);
+      platform_sleep_ms(5);
+    }
+    ASSERT_EQ(a->results.size(), 1u);   /* slot provably acquired + held */
+  }
+  uint64_t corr_b = pyrt_execute(b->pyrt, strdup("7 * 6"));
+
+  /* The queued runtime must be provably queued: nothing at all lands in its
+     mailbox during the observation window (the holder retains the slot until
+     ITS destroy, so b cannot even boot). */
+  int waited = 0;
+  while (ATOMIC_LOAD(&b->got_result) == 0 && waited < 400) {
+    actor_run(&b->actor, ACTOR_BATCH_SIZE);
+    platform_sleep_ms(5);
+    waited++;
+  }
+  EXPECT_EQ(ATOMIC_LOAD(&b->got_result), 0);   /* still queued */
+  EXPECT_EQ(b->results.size(), 0u);
+
+  /* Destroy the QUEUED runtime: must NOT hang on the full pool. */
+  uint64_t start_ns = platform_monotonic_ns();
+  pyrt_destroy(b->pyrt);
+  b->pyrt = NULL;
+  uint64_t elapsed_ms = (platform_monotonic_ns() - start_ns) / 1000000;
+  EXPECT_LT(elapsed_ms, 3000);                 /* prompt, bounded join */
+
+  /* The stranded cell's refusal RESULT must arrive in the mailbox the
+     destroy was racing: pump the still-alive actor so it is dispatched
+     (b->pyrt is NULL now; py_frame_free's guard owns no runtime). */
+  int pumped = 0;
+  while (b->results.empty() && pumped < 2000) {
+    actor_run(&b->actor, ACTOR_BATCH_SIZE);
+    platform_sleep_ms(1);
+    pumped++;
+  }
+  ASSERT_EQ(b->results.size(), 1u);
+  EXPECT_EQ(b->results[0]->status, 1);          /* refusal */
+  EXPECT_EQ(b->results[0]->corr, corr_b);       /* corr-matched */
+  EXPECT_NE(strstr(b->results[0]->text, "destroyed while queued"), nullptr);
+
+  /* The holder's hold cell already settled (asserted above); free cleanly. */
+  py_frame_free(a);
+  py_frame_free(b);
 }

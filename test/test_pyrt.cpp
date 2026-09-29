@@ -108,6 +108,14 @@ static void py_frame_free(py_frame_t* self) {
   for (auto* r : self->results) {
     pyrt_result_payload_destroy(r);
   }
+  /* The frame is plain-get_memory'd, so the C++ vector/string members are
+     never destructed by free(): drain their buffers here or valgrind reports
+     the harness vectors themselves as definitely-lost. */
+  /* Assignment from the default-constructed empties frees the buffers
+     (clear() alone would keep the allocator capacity alive). */
+  self->results = std::vector<pyrt_result_payload_t*>();
+  self->logs = std::vector<std::string>();
+  self->statuses = std::vector<std::string>();
   free(self);
 }
 
@@ -381,6 +389,63 @@ TEST(TestPyrt, TestIdleEvictionTearsInterpreterDownAndDiscontinuesNamespace) {
   ASSERT_EQ(self->results.size(), 2u);
   EXPECT_EQ(self->results[1]->status, 1);   /* NameError: namespace was evicted */
   EXPECT_NE(strstr(self->results[1]->text, "NameError"), nullptr);
+
+  py_frame_free(self);
+}
+
+/* Subprocess backend (Task 9): same EXECUTE/RESULT envelope contract as the
+   subinterpreter backend, stateless per cell. The pool cap applies to the
+   spawn exactly like to an interpreter; stdout IS the result text. */
+TEST(TestPyrt, TestSubprocessBackendSameContract) {
+  py_frame_t* self = py_frame_create();
+  pyrt_config_t cfg;
+  cfg.backend = SA_PYRT_BACKEND_SUBPROCESS;
+  cfg.pool_cap = 0;
+  cfg.idle_evict_ms = 0;
+  self->pyrt = pyrt_create(&self->actor, &cfg);
+  pyrt_execute(self->pyrt, strdup("print('hello subprocess')"));
+  py_frame_pump(self, 20000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  EXPECT_EQ(self->results[0]->corr, 1u);
+  EXPECT_NE(strstr(self->results[0]->text, "hello subprocess"), nullptr);
+
+  /* Stateless by design: the next cell must not see the previous namespace. */
+  ATOMIC_STORE(&self->got_result, 0);
+  pyrt_execute(self->pyrt, strdup("print('%s' % ('boom' if 'x' in globals() else 'clean'))"));
+  py_frame_pump(self, 20000);
+  ASSERT_EQ(self->results.size(), 2u);
+  EXPECT_EQ(self->results[1]->status, 0);
+  EXPECT_EQ(self->results[1]->corr, 2u);
+  EXPECT_STREQ(self->results[1]->text, "clean\n");
+
+  py_frame_free(self);
+}
+
+/* Failing subprocess cell: exactly ONE corr-matched status-1 result whose
+   text is the traceback (stderr), never a crash and never silence. */
+TEST(TestPyrt, TestSubprocessFailingCellReturnsTracebackOnOneResult) {
+  py_frame_t* self = py_frame_create();
+  pyrt_config_t cfg;
+  cfg.backend = SA_PYRT_BACKEND_SUBPROCESS;
+  cfg.pool_cap = 0;
+  cfg.idle_evict_ms = 0;
+  self->pyrt = pyrt_create(&self->actor, &cfg);
+  pyrt_execute(self->pyrt, strdup("1 / 0"));
+  py_frame_pump(self, 20000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 1);
+  EXPECT_EQ(self->results[0]->corr, 1u);
+  EXPECT_NE(strstr(self->results[0]->text, "ZeroDivisionError"), nullptr);
+  /* The runtime survives the failure and serves the next cell normally. */
+  ATOMIC_STORE(&self->got_result, 0);
+  pyrt_execute(self->pyrt, strdup("print(40 + 2)"));
+  py_frame_pump(self, 20000);
+  ASSERT_EQ(self->results.size(), 2u);
+  EXPECT_EQ(self->results[1]->status, 0);
+  EXPECT_STREQ(self->results[1]->text, "42\n");
 
   py_frame_free(self);
 }

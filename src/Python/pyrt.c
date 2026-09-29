@@ -3,6 +3,7 @@
 //
 
 #include "pyrt.h"
+#include "py_subprocess.h"
 
 #ifdef SA_HAS_PYTHON
 
@@ -512,8 +513,27 @@ static void* _pyrt_thread(void* arg) {
     free(node);
 
     if (py->backend == SA_PYRT_BACKEND_SUBPROCESS) {
-      /* Task 9 replaces this with the real spawn path; queued subprocess
-         cells are freed, never leaked. */
+      /* Stateless per cell: the slot is acquired for the spawn only, so the
+         pool cap bounds concurrent subprocesses exactly like interpreters.
+         We are already outside py->lock here (unlocked before dispatch). */
+      if (!_pyrt_slot_acquire(py)) {
+        /* Drain rule (queued-destroy fix): shutdown observed while queued for
+           a slot — the stranded cell gets its corr-matched status-1 refusal
+           and no slot is released (none was held). */
+        _pyrt_post_result(py, exec->corr, 1,
+                          strdup("pyrt: destroyed while queued"));
+        pyrt_execute_payload_destroy(exec);
+        continue;
+      }
+      char* proc_text = NULL;
+      char* proc_err = NULL;
+      uint8_t status = pyrt_run_cell_subprocess(exec->code, &proc_text, &proc_err);
+      if (proc_err != NULL) {
+        _pyrt_post_text(py, PYRT_STATUS, proc_err);
+        free(proc_err);
+      }
+      _pyrt_post_result(py, exec->corr, status, proc_text);
+      _pyrt_slot_release();
       pyrt_execute_payload_destroy(exec);
       continue;
     }
