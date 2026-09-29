@@ -108,7 +108,7 @@ static void py_frame_free(py_frame_t* self) {
   for (auto* r : self->results) {
     pyrt_result_payload_destroy(r);
   }
-  /* The frame is plain-get_memory'd, so the C++ vector/string members are
+  /* The frame is clear-allocated, so the C++ vector/string members are
      never destructed by free(): drain their buffers here or valgrind reports
      the harness vectors themselves as definitely-lost. */
   /* Assignment from the default-constructed empties frees the buffers
@@ -439,6 +439,9 @@ TEST(TestPyrt, TestSubprocessFailingCellReturnsTracebackOnOneResult) {
   EXPECT_EQ(self->results[0]->status, 1);
   EXPECT_EQ(self->results[0]->corr, 1u);
   EXPECT_NE(strstr(self->results[0]->text, "ZeroDivisionError"), nullptr);
+  /* Subprocess stderr must also surface as a streamed STATUS post. */
+  EXPECT_EQ(self->statuses.size(), 1u);
+  EXPECT_NE(strstr(self->statuses[0].c_str(), "ZeroDivisionError"), nullptr);
   /* The runtime survives the failure and serves the next cell normally. */
   ATOMIC_STORE(&self->got_result, 0);
   pyrt_execute(self->pyrt, strdup("print(40 + 2)"));
@@ -447,6 +450,28 @@ TEST(TestPyrt, TestSubprocessFailingCellReturnsTracebackOnOneResult) {
   EXPECT_EQ(self->results[1]->status, 0);
   EXPECT_STREQ(self->results[1]->text, "42\n");
 
+  py_frame_free(self);
+}
+
+/* Subprocess truncation contract: per-stream output is capped at 1 MiB and
+   bytes past the cap are discarded, but the drain still reaches EOF so
+   waitpid cannot hang and the spawn completes cleanly. The ONLY truth this
+   asserts is bounded: the pump returns, the cell exit status is 0, and the
+   captured text stays inside the cap with the first MiB intact. */
+TEST(TestPyrt, TestSubprocessTruncatesAndNeverHangs) {
+  py_frame_t* self = py_frame_create();
+  pyrt_config_t cfg;
+  cfg.backend = SA_PYRT_BACKEND_SUBPROCESS;
+  cfg.pool_cap = 0;
+  cfg.idle_evict_ms = 0;
+  self->pyrt = pyrt_create(&self->actor, &cfg);
+  pyrt_execute(self->pyrt, strdup("print('x' * 3000000)"));
+  py_frame_pump(self, 30000);   /* must return although stdout exceeds 1 MiB */
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  EXPECT_LE(strlen(self->results[0]->text), (size_t)(1u << 20) + 1u);
+  EXPECT_GT(strlen(self->results[0]->text), 0u);   /* first MiB arrived */
   py_frame_free(self);
 }
 

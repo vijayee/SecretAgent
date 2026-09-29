@@ -49,6 +49,7 @@ uint8_t pyrt_run_cell_subprocess(const char* code, char** out_text, char** out_e
   char* out_buf = (char*)get_memory(_PYSUB_STREAM_CAP + 1);
   char* err_buf = (char*)get_memory(_PYSUB_STREAM_CAP + 1);
   char discard[_PYSUB_DISCARD_CHUNK];
+  /* Defensive; get_memory aborts on OOM. */
   if (out_buf == NULL || err_buf == NULL) {
     free(out_buf);
     free(err_buf);

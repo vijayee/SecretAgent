@@ -36,7 +36,7 @@ struct pyrt_t {
   platform_condvar_t* condition;
   pyrt_work_node_t* head;
   pyrt_work_node_t* tail;
-  uint8_t shutdown;
+  ATOMIC(uint8_t) shutdown;
   /* Externally visible view of the thread-local interp_live. */
   ATOMIC(uint8_t) active;
   ATOMIC(uint8_t) interrupt_req;
@@ -421,11 +421,11 @@ static void _pyrt_pool_init(size_t cap) {
    flag is re-observed within _PYRT_SLOT_WAIT_MS and the join is bounded. */
 static uint8_t _pyrt_slot_acquire(pyrt_t* py) {
   platform_mutex_lock(_pyrt_slots_lock);
-  while (py->shutdown == 0 && _pyrt_live >= _pyrt_cap) {
+  while (ATOMIC_LOAD(&py->shutdown) == 0 && _pyrt_live >= _pyrt_cap) {
     platform_condvar_timed_wait(_pyrt_slots_cond, _pyrt_slots_lock,
                                 _PYRT_SLOT_WAIT_MS);
   }
-  uint8_t acquired = (uint8_t)(py->shutdown == 0 ? 1 : 0);
+  uint8_t acquired = (uint8_t)(ATOMIC_LOAD(&py->shutdown) == 0 ? 1 : 0);
   if (acquired) {
     _pyrt_live += 1;
     platform_condvar_broadcast(_pyrt_slots_cond);
@@ -469,10 +469,10 @@ static void* _pyrt_thread(void* arg) {
     platform_mutex_lock(py->lock);
     /* Wait for work, honing the idle-eviction window while an interpreter
        is live (eviction only makes sense with something to evict). */
-    while (py->head == NULL && !py->shutdown) {
+    while (py->head == NULL && ATOMIC_LOAD(&py->shutdown) == 0) {
       if (py->idle_evict_ms != 0 && interp_live) {
         int timedout = platform_condvar_timed_wait(py->condition, py->lock, py->idle_evict_ms);
-        if (timedout == -1 && py->head == NULL && !py->shutdown) {
+        if (timedout == -1 && py->head == NULL && ATOMIC_LOAD(&py->shutdown) == 0) {
           platform_mutex_unlock(py->lock);
           _pyrt_interp_teardown(py);
           interp_live = 0;
@@ -483,7 +483,7 @@ static void* _pyrt_thread(void* arg) {
       }
       platform_condvar_wait(py->condition, py->lock);
     }
-    if (py->shutdown && py->head == NULL) {
+    if (ATOMIC_LOAD(&py->shutdown) && py->head == NULL) {
       /* Shutdown does not abandon queued cells: anything queued before
          pyrt_destroy() must still get a corr-matched RESULT. The queue was
          just observed empty, so nothing is owed and the thread may exit;
@@ -499,7 +499,7 @@ static void* _pyrt_thread(void* arg) {
         py->tail = NULL;
       }
     }
-    uint8_t had_shutdown = py->shutdown;
+    uint8_t had_shutdown = ATOMIC_LOAD(&py->shutdown);
     /* Unlock before ANY dispatch work (slot acquire, GIL use, subprocess
        spawn): interrupt() and destroy() take this lock. */
     platform_mutex_unlock(py->lock);
@@ -513,8 +513,9 @@ static void* _pyrt_thread(void* arg) {
     free(node);
 
     if (py->backend == SA_PYRT_BACKEND_SUBPROCESS) {
-      /* Stateless per cell: the slot is acquired for the spawn only, so the
-         pool cap bounds concurrent subprocesses exactly like interpreters.
+      /* Stateless per cell: the slot is held for the duration of this cell's
+         run (spawn through waitpid), so the pool cap bounds concurrent
+         subprocesses exactly like interpreters.
          We are already outside py->lock here (unlocked before dispatch). */
       if (!_pyrt_slot_acquire(py)) {
         /* Drain rule (queued-destroy fix): shutdown observed while queued for
@@ -642,7 +643,7 @@ uint64_t pyrt_execute(pyrt_t* pyrt, char* code) {
 
   platform_mutex_lock(pyrt->lock);
   /* Late EXECUTEs during teardown are rejected, never queued. */
-  if (pyrt->shutdown) {
+  if (ATOMIC_LOAD(&pyrt->shutdown)) {
     platform_mutex_unlock(pyrt->lock);
     pyrt_execute_payload_destroy(exec);
     return 0;
@@ -702,7 +703,7 @@ uint8_t pyrt_isactive(const pyrt_t* pyrt) {
 void pyrt_destroy(pyrt_t* pyrt) {
   if (pyrt == NULL) return;
   platform_mutex_lock(pyrt->lock);
-  pyrt->shutdown = 1;
+  ATOMIC_STORE(&pyrt->shutdown, 1);
   platform_condvar_broadcast(pyrt->condition);
   platform_mutex_unlock(pyrt->lock);
   /* Queued-destroy fix: a worker holding NO slot can be parked on the GLOBAL

@@ -10,7 +10,11 @@
 #ifdef SA_HAS_PYTHON
 /* Runs one stateless cell in a `python3 -I -c` subprocess. Returns exit
    status (0 ok) and fills *out_text (stdout) and *out_err (stderr or
-   runtime error text); both strings are strdup'd and free()d by the caller.
+   runtime error text); both returned strings are heap-allocated and free()d
+   by the caller.
+   Per-stream output is capped at 1 MiB; bytes past the cap are discarded
+   (the pipe is still drained to EOF so waitpid cannot hang), so a successful
+   cell's *out_text may be truncated at the cap.
    Documented limitation: no live namespace across subprocess cells;
    POSIX-only in this milestone (Windows spawn ships with the PCBuild
    completion task for the slice). */
