@@ -93,8 +93,11 @@ static void py_frame_pump(py_frame_t* self, int timeout_ms) {
 
 static void py_frame_free(py_frame_t* self) {
   if (self->pyrt != NULL) {
-    pyrt_destroy(self->pyrt);
+    pyrt_destroy(self->pyrt); /* join first: the mailbox must stop accepting sends */
   }
+  /* Drain the mailbox: actor_destroy runs message_queue_destroy, which frees */
+  /* any queued-but-undispatched payloads plus the queue's sentinel. */
+  actor_destroy(&self->actor);
   for (auto* r : self->results) {
     pyrt_result_payload_destroy(r);
   }
