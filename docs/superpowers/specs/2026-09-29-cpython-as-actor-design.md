@@ -110,6 +110,42 @@ stateless per call (no live namespace) — that is its documented limitation, no
 a regression: the primary backend owns the "load once, slice across turns"
 property.
 
+## Capacity and lifecycle (scaling to subagent trees)
+
+Actors are multiplexed — the scheduler pool's few worker threads never wait on
+Python (EXECUTE is a handoff), so subagent trees cost nothing scheduler-side.
+Python's cost is OS-level and lands exactly at first EXECUTE:
+
+| Resource | Cost per live Python frame | Practical bound |
+|---|---|---|
+| Parked pyrt thread | ~8-16 KB kernel state, lazy stack | thousands |
+| Subinterpreter after imports | ~1-5 MB+ (per-interpreter module state; non-multiphase C extensions are duplicated) | ~10^3-10^4 live frames ≈ memory |
+| Concurrently executing cells | one core each (per-interpreter GIL) | more than cores → kernel timesharing |
+
+Contained by lifecycle design:
+1. **Lazy boot** — frames that never run code never thread up; a tree of
+   routing/read-only subagents pays nothing.
+2. **Interpreter pool cap** — a semaphore at boot holds only K interpreters
+   live at once (K configurable, default ~2× cores). An actor whose boot would
+   exceed K has its EXECUTE queued, not dropped: the actor stays hot and the
+   work drains as interpreters free up. This is backpressure, the same
+   discipline as the mailbox mute threshold, and it turns the fan-out storm
+   into throttling instead of exhaustion.
+3. **Eviction (opt-in knob, default generous)** — an interpreter idle beyond a
+   timeout is torn down and re-booted lazily on next use. Same semantics as
+   lazy boot; it is the memory GC knob for long-lived frames, off by default.
+4. **Explicit teardown** — subinterpreter + thread die with the frame
+   (`pyrt_destroy`), so trees that complete do not accumulate interpreters.
+
+The subprocess backend's equivalent cap is the number of concurrent spawned
+processes, bounded by the same semaphore. Per-interpreter module duplication
+for non-multiphase C extensions remains a documented cost; the fallback path
+covers the heavy ones.
+
+An implementation test exercises the cap: fan out more executing frames than K
+and assert queue-then-drain behavior (no loss, no deadlock, actor responsive
+throughout).
+
 ## Interrupts
 
 `PYRT_INTERRUPT` is handled on the pyrt thread at the top of its loop and via
