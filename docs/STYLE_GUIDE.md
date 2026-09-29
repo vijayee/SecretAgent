@@ -162,6 +162,14 @@ extern "C" {
 
 Local/private headers use quotes `""`. System headers use angle brackets `<>`.
 
+**One known cross-module edge:** `src/Scheduler/scheduler.h` includes `../Actor/actor.h`
+(it needs the full `actor_t`), while `src/Actor/actor.c` includes
+`../Scheduler/scheduler.h`. The reverse edge is broken with a forward declaration
+(`typedef struct scheduler_pool_t scheduler_pool_t;` in actor.h) and the pool
+registers itself into actors via the pool pointer set at `actor_init`. When adding a
+new module, break cycles with forward declarations the same way — never with a new
+cyclic include pair.
+
 ## 3. File Conventions
 
 ### 3.1 Header Files
@@ -297,6 +305,16 @@ actor_t *actor;        // ❌
 
 ### 5.1 Reference Counting
 
+> **Reality check:** this guide is shared with the liboffs codebase family, and the
+> examples below use liboffs-style types (`job_t`, `fetch_request_t`, `cache_node_t`)
+> that have not been ported yet — they illustrate the convention, not current files.
+> Today in SecretAgent: no struct embeds `refcounter_t` yet, and the core runtime
+> types (`actor_t`, `scheduler_pool_t`, `message_queue_t`, `deque_t`) are lifetime-
+> managed, not refcounted — they use `actor_destroy` / `scheduler_pool_defer_cleanup`
+> instead of refcount teardown. The refcounting pattern below is what any NEW
+> shared, refcounted object must follow (it is already used by `scheduler_pool_defer_cleanup`
+> to hold references across deferrals).
+
 Every heap-allocated shared object embeds `refcounter_t` as its first member. The refcounter is always initialized via `refcounter_init()` which sets the initial count to 1. It must be the last statement of a creation function.
 
 The refcount state is a single atomic 32-bit word (count:16, yield:8, pending_deref:8) manipulated by CAS, so the escrow transfer (yield / pending_deref / count) is one atomic transaction — see `src/RefCounter/refcounter.h`.
@@ -351,6 +369,9 @@ POOL_FREE(message_node_t, node);
 pool_thread_cleanup();  // per thread, before the pool is torn down
 ```
 
+(The extracted runtime currently allocates `message_node_t` via `get_clear_memory`
+in `message_queue.c`; the pool is available for size-classed hot objects.)
+
 ### 5.3 Platform Abstraction
 
 Cross-platform code goes through the opaque wrappers in `src/Platform/`. Threading primitives are heap-allocated opaque structs created and destroyed through the API — never raw `pthread_*` calls in library code:
@@ -375,6 +396,10 @@ atomic_fetch_or(&actor->flags, ACTOR_FLAG_DESTROY);
 Library code may use C11 `atomic_*` functions directly (as `actor.c` does); the `ATOMIC(T)` typedef macro is what keeps struct fields portable when the header is also included from C++ tests.
 
 ### 5.4 Actor & Async Result Message Pattern
+
+The exemplified types (`worker_t`, `fetch_request_t`, `cache_node_t`) are liboffs-style
+illustrations; in SecretAgent the pattern is new-module-facing, and a plain `actor_t`
+pumped by hand (as the tests do) is also valid.
 
 Asynchronous work is expressed with actors, not contexts + promises. An actor is a message-driven object with an embedded mailbox; a scheduler pool runs queued actors on worker threads, and inline actors (`pool = NULL`) are pumped manually with `actor_run`.
 
@@ -541,12 +566,15 @@ extern "C" {
 }
 ```
 
-Test naming follows the `TestModule` fixture and `TestFunction_Scenario` test name:
+Test naming uses a `TestModule` fixture with a `TestPascalCase` test name that
+describes the behavior under test (e.g. `TEST(TestActor, TestRunDispatchesMessages)`,
+`TEST(TestActor, TestPayloadDestroy)`), not a strict `TestFunction_Scenario` template.
+Some suites use grouped behavior fixtures, e.g. `TEST(MessageQueueTeardown, ...)`:
 
 ```cpp
-TEST(TestActor, TestInitDestroy) { ... }
-TEST(TestActor, TestPayloadDestroyedAfterRun) { ... }
-TEST(TestDeque, TestPushPopSteal) { ... }
+TEST(TestActor, TestRunDispatchesMessages) { ... }
+TEST(TestActor, TestPayloadDestroy) { ... }
+TEST(MessageQueueTeardown, PushAfterDestroyFreesMessageAndReturnsFalse) { ... }
 ```
 
 Use `ASSERT_*` for fatal assertions (test stops) and `EXPECT_*` for non-fatal checks:
@@ -592,6 +620,15 @@ This machine's kernel ASLR entropy randomly aborts ASan-instrumented binaries at
 
 Dependencies are **git submodules** under `deps/` (currently just googletest), added with `add_subdirectory` and linked `PRIVATE`. They are never fetched at configure time and never vendored outside `deps/`.
 
+- A fresh clone must populate submodules before anything builds:
+
+  ```bash
+  git submodule update --init --recursive
+  ```
+
+  Without this, configure fails in `add_subdirectory(deps)` with a clear
+  missing-googletest error. Submodules are never fetched at configure time.
+
 ## 8. Summary of Patterns
 
 | Concern | Convention |
@@ -615,6 +652,10 @@ Dependencies are **git submodules** under `deps/` (currently just googletest), a
 | Error handling | Checked returns + `log_error("context", ...)`; `abort()` on OOM |
 | Platform abstraction | `platform_*` opaque wrappers from `platform_thread.h` / `platform_time.h` + `ATOMIC()` from `atomic_compat.h` |
 | Test framework | GoogleTest, C++17, `extern "C"` wrappers |
-| Test naming | `TEST(TestModule, TestFunction_Scenario)` |
+| Test naming | `TEST(TestModule, TestPascalCase)` (behavior-describing name; some suites use grouped fixtures like `MessageQueueTeardown`) |
 | Test run | `ctest --test-dir cmake-build-debug --output-on-failure` (+ valgrind; `setarch -R` for ASan builds) |
 | Sanitizers | `-DSA_ENABLE_ASAN=` / `_UBSAN=` / `_TSAN=ON` (ASan and TSan mutually exclusive) |
+
+(Note: the scheduler deque intentionally retains old `_deque_array_t` allocation
+arrays for in-flight thieves — valgrind "still reachable" blocks of that class are
+known-acceptable, not leaks to "fix".)
