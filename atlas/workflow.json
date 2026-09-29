@@ -1,0 +1,196 @@
+{
+  "schema": "rp036-atlas-v1",
+  "revision": 2,
+  "lastUpdated": "2026-09-29T12:10:00.000Z",
+  "project": {
+    "id": "SECRETAGENT",
+    "label": "SecretAgent — embeddable agent runtime and its desktop agent",
+    "purpose": "Extract the best part of four agent harnesses (DeepSeek Harness, Prime Agent, Claude Code, Onyx) into a portable C library for an embeddable agent, and the desktop agent that runs it.",
+    "status": "in-progress-design"
+  },
+  "nodes": {
+    "atlas-root": {
+      "id": "atlas-root",
+      "label": "Embeddable agent runtime and its desktop agent",
+      "kind": "prototype-container",
+      "intent": "delivery",
+      "status": "in-progress-design",
+      "description": "A synthesis of the best parts of four symlink'd agent harnesses, rebuilt as a portable C library (embeddable in any host language/environment) plus the desktop agent that runs it, with WaveDB as the durable floor. What each donor contributes (design rationale in docs/chat.json): DeepSeek Harness (./deepseek-harness) — the spine: log-is-source-of-truth, the loop, the guarded tool pipeline; Prime Agent (./prime-agent) — the shape: scoped frames, encapsulation, memory hierarchy, /refine; Claude Code (./claude-code-source-code) — the escalation pattern (plan → ask → act); Onyx (./onyx) — the persona: its response instructions distilled into the loadable persona text (the 'hammer' spec, chat.json message 4148) — and WaveDB (pre-existing, done) as the substrate. All work must stay cross-platform (Linux and Windows green) and embeddable; portability is an invariant of every record, not a separate slice. Layer traceability: L0 WaveDB substrate (done), L1 unified log/tree, L2 frame/scope + surface API, L3 the loop, L4 tool pipeline + interpreter-as-a-tool, L5 persona + escalation as loadable text. The extracted liboffs actor runtime (actor, mailbox, scheduler, refcounter, platform shims) and its 58 passing tests are the existing foundation.",
+      "contains": [
+        "execute-agent-code-without-blocking",
+        "remember-session-across-restarts",
+        "subdivide-session-into-accountable-agents",
+        "run-agent-as-desktop"
+      ],
+      "requires": [],
+      "completionRoute": "Four delivered slices with independent review per record: the runtime executes agent code without blocking, sessions survive restarts replayably, sessions subdivide into an accountable agent tree, and the desktop agent drives real work on top of the library. Cross-platform builds and the full gtest suite stay green at every completion."
+    },
+    "execute-agent-code-without-blocking": {
+      "id": "execute-agent-code-without-blocking",
+      "label": "Execute agent code without blocking the runtime",
+      "kind": "leaf",
+      "intent": "delivery",
+      "status": "in-progress",
+      "description": "An actor frame can execute Python in a live CPython subinterpreter while the actor keeps processing messages: EXECUTE is enqueued to the interpreter thread, log/status messages stream out to the parent live, and a RESULT returns corr-matched when the cell finishes. The interpreter is a bound tool, never the substrate; a swappable backend keeps C extensions that cannot live in a subinterpreter usable via a subprocess path. This is L4's execution verb on the L3 runtime spine. If cut, the runtime routes and persists but never computes — agents cannot close the loop on their own output. MILESTONE (pyrt layer delivered): non-blocking subinterpreter EXECUTE with live\n log/status streaming, corr-matched RESULT, lazy boot, pool cap, idle eviction,\n cooperative interrupt (forced paths inert per pinned 3.12.13 verification),\n subprocess fallback with fd discipline. Remaining for slice completion:\n Windows build (PCBuild ExternalProject branch), review records per lifecycle.",
+      "contains": [],
+      "requires": [],
+      "route": {
+        "completionEvidence": [
+          "A running actor answers interrupt/control messages while a slow Python cell executes on its subinterpreter thread",
+          "Python code posts log/status messages whose bytes are attributed per cell and appear live before completion",
+          "A RESULT message returns with a correlation id matching the EXECUTE request",
+          "Execution backend is swappable (subinterpreter primary, subprocess fallback)",
+          "Cross-platform: Linux and Windows builds of the full gtest suite pass"
+        ],
+        "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
+        "next": [
+          "remember-session-across-restarts"
+        ],
+        "onRejection": "Keep planned and correct only within this slice's boundary (GIL handling, API churn, module injection)."
+      }
+    },
+    "remember-session-across-restarts": {
+      "id": "remember-session-across-restarts",
+      "label": "Survive restarts with a replayable session log",
+      "kind": "leaf",
+      "intent": "delivery",
+      "status": "planned",
+      "description": "Sessions live as WaveDB subtrees: events at sessions/<sid>/events/<seq>, lineage at meta/parent, depth at meta/depth. Every state mutation is both a store write and a logged event (one atomic batch), so the log is the single source of truth and views (message history, tree) are projections. If cut, agent runs die with the process — no audit trail, no continuity across desktop sessions, and the log-as-safety doctrine never holds.",
+      "contains": [],
+      "requires": [],
+      "route": {
+        "completionEvidence": [
+          "A session persists to WaveDB and reconstructs fully (events, lineage, tree projection) after a mid-run process restart",
+          "A state mutation and its event land in one atomic transaction (no window where state moved but the log did not)",
+          "Kill-and-resume test drives the same session forward post-restart under the full ctest suite",
+          "Cross-platform: Linux and Windows builds and test runs pass"
+        ],
+        "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
+        "next": [
+          "subdivide-session-into-accountable-agents"
+        ],
+        "onRejection": "Keep planned and correct only within this slice's boundary (key layout, batch semantics, WAL ordering)."
+      }
+    },
+    "subdivide-session-into-accountable-agents": {
+      "id": "subdivide-session-into-accountable-agents",
+      "label": "Subdivide sessions into an accountable agent tree",
+      "kind": "leaf",
+      "intent": "delivery",
+      "status": "planned",
+      "description": "Spawning a subagent opens a child subtree scoped to its own work; the parent exposes state only through a surface API (projections, not raw key access), and children return reports, not transcripts — a parent's view grows by one report per child. The whole tree derives from the event log (lineage pointers), so what every subagent did is reconstructable. This is L2. If cut, jobs stay single-frame: no delegation or parallelism, and any large job floods a single context.",
+      "contains": [],
+      "requires": [
+        "remember-session-across-restarts"
+      ],
+      "route": {
+        "completionEvidence": [
+          "A spawned subagent runs in its own subtree and its report (not its transcript) lands in the parent's log",
+          "A parent's context grows by exactly one report per child, independent of child work volume",
+          "The frame tree derives reconstructably from lineage pointers in the event log",
+          "State not exposed by the parent's surface API is unaddressable from the child (the #819 scoping blind spot demonstrably absent)",
+          "Cross-platform: Linux and Windows builds and test runs pass"
+        ],
+        "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
+        "next": [
+          "run-agent-as-desktop"
+        ],
+        "onRejection": "Keep planned and correct only within this slice's boundary (scoping, report semantics, per-frame compaction)."
+      }
+    },
+    "run-agent-as-desktop": {
+      "id": "run-agent-as-desktop",
+      "label": "Run the agent from the desktop",
+      "kind": "leaf",
+      "intent": "delivery",
+      "status": "planned",
+      "description": "A desktop/CLI client embeds the C library and drives real agent sessions end to end: frames run, code executes, sessions persist and subdivide, and results come back. Persona and escalation load as text modules (plan → ask → act) shaping the loop — the assistant's behavior is text, versionable and checkable, not compiled in. Provenance: the persona text is distilled from the Onyx harness's response instructions (./onyx; the 'hammer' persona spec in docs/chat.json message 4148), and the escalation gate design is lifted from the Claude Code source (./claude-code-source-code). This is L3+L5 and the moment the runtime becomes a product anyone can drive. If cut, the library exists but nothing runs it: there is no desktop agent.",
+      "contains": [],
+      "requires": [
+        "execute-agent-code-without-blocking",
+        "remember-session-across-restarts",
+        "subdivide-session-into-accountable-agents"
+      ],
+      "route": {
+        "completionEvidence": [
+          "A desktop/CLI client built on the library spawns a frame, executes code, persists the session, and returns a report in one live session",
+          "Persona and escalation load as text modules and demonstrably change a real session's behavior (plan → ask → act gate observable in the log)",
+          "A second, non-C host (or the interpreter tool path) can embed the same library through the ABI and drive a session — evidence of portability, not a second implementation",
+          "Cross-platform: one client codebase builds and runs on Linux and Windows"
+        ],
+        "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
+        "next": [],
+        "onRejection": "Keep planned and correct only within this slice's boundary (client scope, persona module format, escalation gate)."
+      }
+    }
+  },
+  "edges": {
+    "contains": [
+      {
+        "from": "atlas-root",
+        "to": "execute-agent-code-without-blocking"
+      },
+      {
+        "from": "atlas-root",
+        "to": "remember-session-across-restarts"
+      },
+      {
+        "from": "atlas-root",
+        "to": "subdivide-session-into-accountable-agents"
+      },
+      {
+        "from": "atlas-root",
+        "to": "run-agent-as-desktop"
+      }
+    ],
+    "requires": [
+      {
+        "from": "subdivide-session-into-accountable-agents",
+        "to": "remember-session-across-restarts"
+      },
+      {
+        "from": "run-agent-as-desktop",
+        "to": "execute-agent-code-without-blocking"
+      },
+      {
+        "from": "run-agent-as-desktop",
+        "to": "remember-session-across-restarts"
+      },
+      {
+        "from": "run-agent-as-desktop",
+        "to": "subdivide-session-into-accountable-agents"
+      }
+    ]
+  },
+  "references": {
+    "next": 6,
+    "byId": {
+      "atlas-root": "S001",
+      "execute-agent-code-without-blocking": "S002",
+      "remember-session-across-restarts": "S003",
+      "subdivide-session-into-accountable-agents": "S004",
+      "run-agent-as-desktop": "S005"
+    }
+  },
+  "lifecycle": {
+    "phases": [
+      "plan",
+      "deliver",
+      "verify",
+      "review"
+    ],
+    "approvalPolicy": "Owner authorization is separate from reviewer evidence.",
+    "completionAcceptance": {
+      "schema": "atlas-completion-acceptance-v1",
+      "policy": "fresh-review-required",
+      "legacy": {
+        "cutoffRevision": 0,
+        "nodeIds": [],
+        "baseline": {},
+        "reason": "No legacy records in a new project."
+      }
+    }
+  },
+  "reviews": [],
+  "unresolvedHistory": []
+}

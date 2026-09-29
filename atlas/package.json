@@ -1,0 +1,12 @@
+{
+  "name": "project-atlas-kit",
+  "private": true,
+  "description": "Project Atlas portable offline workflow kit — capability authoring and slice planning",
+  "type": "commonjs",
+  "scripts": {
+    "build": "node build.js",
+    "check": "node kit/init.cjs --check && node build.js --check && node validate.js --project .",
+    "validate": "node validate.js --project .",
+    "init": "node kit/init.cjs"
+  }
+}

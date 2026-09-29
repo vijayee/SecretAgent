@@ -1,0 +1,22 @@
+{
+  "version": "1.2.2",
+  "source": "local Atlas kit",
+  "assets": {
+    "build.js": "a4f32876383897cebfa491c495ac1aa796e84e66c275e30f1ce973dcdd0a3703",
+    "validate.js": "b2033a2ee8b1c1de8af51756d17b9aa2e456aa21d111b7f8ddf8aa2841f1d546",
+    "references.cjs": "372d69eafda11b14085241d2f50e353a3fbb596a5b1dc1c7e296fea943da9c6d",
+    "src/atlas-render.js": "ed9517b7228dd77ec6b25b9d18ff0e2ebba0dea701dbdf20a301697e658ee00a",
+    "src/atlas.css": "dffabc7e6d78c1e94282db47e9f400f26b8364236f7e6eeea2104994be134779",
+    "vendor/d3.v7.9.0.min.js": "f2094bbf6141b359722c4fe454eb6c4b0f0e42cc10cc7af921fc158fceb86539",
+    "vendor/LICENSE-d3-ISC.txt": "3e6849627f74ff73c257a3ae1efb574015d94fc1035c05ec3c15805165efcbc4",
+    "vendor/PROVENANCE.md": "a0797ffbf998dd1cf6f770fb84d70336d2f7d778058423e29c920f110e2ccbf0",
+    "vendor/d3-registry-meta.json": "d6515ea4c29fd50a8e0c4afd93fe1c42ee052f25f4d8b70a1eaae1573b4163da",
+    "kit/README.md": "b65dcabd5355dc22c505d6527da967bfdb703e77da23a84024ce0faf597ec0f5",
+    "kit/freeze-manifest.cjs": "c497addf05ca88b6184cc94dfacd1c985979796c649e54105e649d43a13bc6a4",
+    "kit/review-protection.cjs": "8cdbf651df65ce78ae41f112aca9657b7211ee65ed20d502df19be72bb6471b8",
+    "kit/review-protection-profile.md": "237502bc1cc1f0c582d5504bff3d43c9a3d73067b4cd7e705a0aa1640609135a",
+    "kit/lifecycle.cjs": "8f265e234930c0ce7d11ade6c1b44d70cd45c87dd87903323bebf00272cd0894",
+    "kit/init.cjs": "81a567318fca0836b0648f6a74fae1a3ec97e787c993829a546e134de5b35290",
+    "package.json": "2da36d0d5561bd104cb05a3abd2222c23c00173057a5e6f8d67a03d664e06e5c"
+  }
+}
