@@ -4,6 +4,7 @@
 
 #include "frame.h"
 #include "frame_messages.h"
+#include "frame_bridge.h"
 #include "../Util/allocator.h"
 #include "../Util/json.h"
 #include "../Util/log.h"
@@ -28,7 +29,6 @@ void frm_reply_payload_destroy(void* p) {
 
 #ifdef SA_HAS_WDB
 
-#include "../Util/atomic_compat.h"
 #include <Database/database.h>
 #include <Database/database_subtree.h>
 #include <Database/database_iterator.h>
@@ -92,6 +92,53 @@ struct frame_t {
   uint64_t seq;               /* last allocated event seq (0 = none yet) */
   uint32_t depth;
 };
+
+/* --- bridge reply hook (frame_bridge.h contract) ---------------------------
+   The dispatch-side half: behaviors hand corr-matched answers to the installed
+   sink; the python side (py_agent.c, Task 7) registers
+   py_agent_note_reply(...) as that sink at runtime init. Until then the
+   default sink DROPS replies loudly. */
+static ATOMIC(frame_bridge_reply_fn_t) _frame_bridge_sink;
+/* Debug shadow of the last reply handed to ANY sink incl. the dropper: a
+   test/debug record, not synchronization state. */
+static ATOMIC(uint8_t) _frame_bridge_last_seen;
+static ATOMIC(uint64_t) _frame_bridge_last_corr;
+static ATOMIC(uint8_t) _frame_bridge_last_status;
+
+void frame_bridge_register_reply_sink(frame_bridge_reply_fn_t sink) {
+  ATOMIC_STORE(&_frame_bridge_sink, sink);
+}
+
+/* The default sink until Task 7 installs py_agent_note_reply: DROPS the
+   reply, loud — a dropped reply leaves a python `agent.*` caller blocked
+   until its (bounded) timeout, which must never happen silently. */
+static void _frame_bridge_drop(uint64_t corr, uint8_t status, const char* text) {
+  log_error("frame_bridge: no bridge registered — DROPPING reply corr %llu "
+            "status %u '%s' (a registered sink would unblock a python wait; "
+            "dropped replies time out instead)",
+            (unsigned long long)corr, (unsigned)status, text ? text : "(no text)");
+}
+
+/* The single reply path of the frame behaviors: record the debug shadow, then
+   deliver through the installed sink (or the loud dropper). Called on the
+   frame's dispatch thread; `text` is borrowed for the call only. */
+static void _frame_bridge_reply(uint64_t corr, uint8_t status, const char* text) {
+  ATOMIC_STORE(&_frame_bridge_last_corr, corr);
+  ATOMIC_STORE(&_frame_bridge_last_status, status);
+  ATOMIC_STORE(&_frame_bridge_last_seen, 1);
+  frame_bridge_reply_fn_t sink = ATOMIC_LOAD(&_frame_bridge_sink);
+  if (sink != NULL) {
+    sink(corr, status, text);
+    return;
+  }
+  _frame_bridge_drop(corr, status, text);
+}
+
+uint8_t frame_bridge_debug_last(uint64_t* corr_out, uint8_t* status_out) {
+  if (corr_out != NULL) *corr_out = ATOMIC_LOAD(&_frame_bridge_last_corr);
+  if (status_out != NULL) *status_out = ATOMIC_LOAD(&_frame_bridge_last_status);
+  return ATOMIC_LOAD(&_frame_bridge_last_seen);
+}
 
 /* --- small helpers ------------------------------------------------------ */
 
@@ -393,24 +440,107 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
   return 0;
 }
 
-/* Dispatch a queued FRM_* message. Bridge behaviors claim payloads in Task 6
-   (remember/recall corr-matched replies) and the loop claims FRM_CELL_EXECUTE
-   / FRM_STOP in Task 10; until those land the frame ignores messages and
-   payload cleanup stays with the mailbox per the style guide. Unknown types
-   are ignored likewise. */
-static void frame_dispatch(void* state, message_t* msg) {
+/* Dispatch a queued FRM_* message. The behaviors run the SAME synchronous
+   store functions every caller uses (one batch per effect) and answer
+   corr-matched THROUGH the bridge hook (frame_bridge.h), never by queueing at
+   an actor: the awaiting python cell blocks on its own completion record,
+   woken synchronously from this dispatch. The frame never blocks beyond a µs
+   batch.
+
+   Payload ownership: FRM_REMEMBER / FRM_RECALL payloads are CONSUMED here
+   (msg->payload = NULL; the behavior destroys the payload itself), which
+   makes both delivery paths (queue + actor_run, and the tests' direct
+   frame_dispatch) work without claiming it twice. FRM_REPLY is the OUTGOING
+   answer shape, so one arriving at a frame is a routing bug. The loop's
+   verbs (FRM_CELL_EXECUTE / FRM_STOP) stay mailbox-cleaned until Task 10
+   claims them. Unknown types are ignored likewise. */
+static void _frame_behavior(void* state, message_t* msg) {
   frame_t* f = (frame_t*)state;
-  (void)f;
+  if (msg == NULL) return;
   switch (msg->type) {
-    case FRM_REMEMBER:
-    case FRM_RECALL:
+    case FRM_REMEMBER: {
+      frm_remember_payload_t* rp = (frm_remember_payload_t*)msg->payload;
+      msg->payload = NULL;
+      uint64_t corr = 0;
+      uint8_t status;
+      if (rp == NULL) {
+        status = 1;
+        log_error("frame: FRM_REMEMBER with no payload at '%s'", f->sid_path);
+      } else if ((corr = rp->corr) == 0) {
+        status = 1;
+        log_error("frame: FRM_REMEMBER with corr 0 at '%s' — nothing to match",
+                  f->sid_path);
+      } else if (frame_remember_ctx(f, rp->key, rp->json_value) != 0) {
+        /* The store already validated key + JSON + batch cap ("the same
+           validation as every remember") and failed LOUDLY before writing. */
+        status = 1;
+        log_error("frame: FRM_REMEMBER '%s' refused at '%s' (corr %llu)",
+                  rp->key ? rp->key : "(null)", f->sid_path,
+                  (unsigned long long)corr);
+      } else {
+        status = 0;
+      }
+      /* Bridge verbs write the INHERITABLE layer: a cell's remember() is a
+         durable, shared-by-default write (the frame_remember_ctx call above);
+         cells use the ctx/local split only through the store API directly. */
+      _frame_bridge_reply(corr, status, NULL);
+      frm_remember_payload_destroy(rp);
+      break;
+    }
+    case FRM_RECALL: {
+      frm_remember_payload_t* rp = (frm_remember_payload_t*)msg->payload;
+      msg->payload = NULL;
+      uint64_t corr = 0;
+      uint8_t status;
+      char* text = NULL;
+      if (rp == NULL) {
+        status = 1;
+        log_error("frame: FRM_RECALL with no payload at '%s'", f->sid_path);
+      } else {
+        corr = rp->corr;
+        if (corr != 0 && (text = frame_recall(f, rp->key)) != NULL) {
+          status = 0;
+        } else if (corr != 0) {
+          status = 1;
+          log_error("frame: FRM_RECALL '%s' unresolvable from '%s' (corr %llu)",
+                    rp->key ? rp->key : "(null)", f->sid_path,
+                    (unsigned long long)corr);
+        } else {
+          status = 1;
+          log_error("frame: FRM_RECALL with corr 0 at '%s' — nothing to match",
+                    f->sid_path);
+        }
+      }
+      _frame_bridge_reply(corr, status, text);
+      free(text);
+      frm_remember_payload_destroy(rp);
+      break;
+    }
     case FRM_REPLY:
+      /* Replies LEAVE frames through the bridge hook; a frame cannot wait on
+         one. This only happens from a routing bug: loud, dropped. */
+      log_error("frame: FRM_REPLY received at '%s' — replies are bridge-hook "
+                "side effects, not queued messages; dropping", f->sid_path);
+      break;
     case FRM_CELL_EXECUTE:
     case FRM_STOP:
+      /* The turn loop claims FRM_CELL_EXECUTE / FRM_STOP in Task 10. Until
+         then the frame ignores them and payload cleanup stays with the
+         mailbox per the style guide. */
       break;
     default:
       break;
   }
+}
+
+/* Test/synchronous entry point (frame.h): route a message through the SAME
+   behavior path the scheduler drives via the embedded actor's mailbox. */
+void frame_dispatch(frame_t* f, message_t* msg) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame_dispatch: dead frame");
+    return;
+  }
+  _frame_behavior(f, msg);
 }
 
 /* Compose the frame's events-range bounds as ABSOLUTE root-database paths for
@@ -656,7 +786,7 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
   f->seq = _frame_restore_seq(f);
 
   /* Inline actor (pool NULL): tests/loop pump the mailbox by hand. */
-  actor_init(&f->actor, f, frame_dispatch, NULL);
+  actor_init(&f->actor, f, _frame_behavior, NULL);
   return f;
 
 fail:

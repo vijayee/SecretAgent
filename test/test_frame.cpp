@@ -5,9 +5,13 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <string>
+#include <vector>
 extern "C" {
 #include "../src/Frame/frame.h"
+#include "../src/Frame/frame_messages.h"
+#include "../src/Frame/frame_bridge.h"
 #include "../src/Util/json.h"
+#include "../src/Util/allocator.h"
 }
 
 #ifdef SA_HAS_WDB
@@ -173,6 +177,203 @@ TEST(TestFrame, TestReportBindsOneEventIntoParent) {
   EXPECT_EQ(frame_join(child), 0);
   frame_destroy(child);
   frame_destroy(root);
+  wave_db_close(db);
+}
+
+/* --- Task 6: bridge behaviors ---------------------------------------------- */
+
+/* Completion record (the py_frame pattern from test_pyrt.cpp): the test's own
+   dispatch shape — here the frame's reply leaves via the bridge hook, so the
+   completion record is a recording sink passed to frame_bridge_register_...
+   (frame_dispatch delivers replies to it synchronously on this same thread,
+   so plain members are fine). */
+typedef struct bridge_completion_t {
+  std::vector<uint64_t> corrs;
+  std::vector<uint8_t> statuses;
+  std::vector<std::string> texts;
+} bridge_completion_t;
+
+static bridge_completion_t* g_completion = NULL;
+
+static void bridge_completion_sink(uint64_t corr, uint8_t status, const char* text) {
+  if (g_completion == NULL) return;   /* not mounted (another test's stale sink) */
+  g_completion->corrs.push_back(corr);
+  g_completion->statuses.push_back(status);
+  g_completion->texts.emplace_back(text != NULL ? text : "");
+}
+
+/* Mount the recording sink; pass NULL to demount (sink resets to the built-in
+   dropper). */
+static void bridge_completion_mount(bridge_completion_t* rec) {
+  g_completion = rec;
+  frame_bridge_register_reply_sink(rec != NULL ? bridge_completion_sink : NULL);
+}
+
+/* Build a bridge request whose payload ownership transfers with the message;
+   the behavior consumes it (msg->payload is NULL on return), so the caller
+   never frees. */
+static message_t bridge_request(frame_message_type_e type, uint64_t corr,
+                                const char* key, const char* json_value) {
+  frm_remember_payload_t* rp =
+      (frm_remember_payload_t*)get_clear_memory(sizeof(frm_remember_payload_t));
+  rp->corr = corr;
+  rp->key = key != NULL ? strdup(key) : NULL;
+  rp->json_value = json_value != NULL ? strdup(json_value) : NULL;
+  message_t msg;
+  msg.type = (uint32_t)type;
+  msg.payload = rp;
+  msg.payload_destroy = frm_remember_payload_destroy;
+  return msg;
+}
+
+/* Load the frame's debug events and locate the FIRST state.remember payload.
+   Fatal-fails the test when the event list isn't exactly `expect_total`
+   records (the "only this one effect happened" assertion) or — when
+   `expect_total` > 0 — when no remember event is present. `*events_out` owns
+   the parsed DOM; the caller destroys it with json_value_destroy AFTER it is
+   done with the returned payload borrow. */
+static void find_remember_event(frame_t* f, size_t expect_total,
+                                json_value_t** events_out, json_value_t** payload_out) {
+  ASSERT_NE(events_out, nullptr);
+  ASSERT_NE(payload_out, nullptr);
+  *events_out = NULL;
+  *payload_out = NULL;
+  char* json = frame_debug_events(f);
+  ASSERT_NE(json, nullptr);
+  char* err = NULL;
+  json_value_t* arr = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  ASSERT_NE(arr, nullptr) << "raw: " << json;
+  free(json);
+  ASSERT_EQ(json_type(arr), JSON_ARRAY);
+  ASSERT_EQ(json_size(arr), expect_total) << "exactly the tested effects happened";
+  for (size_t i = 0; i < json_size(arr); i++) {
+    json_value_t* rec = json_at(arr, i);
+    ASSERT_NE(rec, nullptr);
+    json_value_t* type_v = json_get(rec, "type");
+    ASSERT_NE(type_v, nullptr);
+    if (strncmp(json_as_string(type_v), "state.remember", 14) == 0) {
+      json_value_t* payload = json_get(rec, "payload");
+      ASSERT_NE(payload, nullptr);
+      *payload_out = payload;
+      break;
+    }
+  }
+  if (expect_total > 0) {
+    ASSERT_NE(*payload_out, nullptr) << "expected a state.remember event";
+  }
+  *events_out = arr;
+}
+
+TEST(TestFrame, TestBridgeRememberRecallCorrMatched) {
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+
+  bridge_completion_t completion;
+  bridge_completion_mount(&completion);
+
+  /* FRM_REMEMBER{corr=77} → the behavior applies frame_remember_ctx (the
+     INHERITABLE layer: a cell's remember() is a durable shared-by-default
+     write) and answers FRM_REPLY corr-matched. */
+  message_t req = bridge_request(FRM_REMEMBER, 77, "mode", "\"fast\"");
+  frame_dispatch(f, &req);
+  EXPECT_EQ(req.payload, nullptr) << "behavior consumed the payload";
+
+  ASSERT_EQ(completion.corrs.size(), 1u);
+  EXPECT_EQ(completion.corrs[0], 77u) << "corr-matched to the request";
+  EXPECT_EQ(completion.statuses[0], 0u);
+  EXPECT_EQ(completion.texts[0], "");
+
+  /* The durable half happened: exactly one state.remember event with
+     {key:"mode", value:"fast"}, and the store resolves "mode". */
+  json_value_t* events = NULL;
+  json_value_t* payload = NULL;
+  find_remember_event(f, 1, &events, &payload);
+  ASSERT_NE(payload, nullptr);
+  json_value_t* key_v = json_get(payload, "key");
+  ASSERT_NE(key_v, nullptr);
+  EXPECT_STREQ(json_as_string(key_v), "mode");
+  json_value_t* val_v = json_get(payload, "value");
+  ASSERT_NE(val_v, nullptr);
+  EXPECT_EQ(json_type(val_v), JSON_STRING);
+  EXPECT_STREQ(json_as_string(val_v), "fast");
+  json_value_destroy(events);
+
+  char* v = frame_recall(f, "mode");
+  ASSERT_NE(v, nullptr);
+  EXPECT_STREQ(v, "\"fast\"") << "raw JSON text, stored verbatim";
+  free(v);
+
+  /* FRM_RECALL{corr=78} → replies with the resolved JSON text. */
+  completion.corrs.clear();
+  completion.statuses.clear();
+  completion.texts.clear();
+  message_t req2 = bridge_request(FRM_RECALL, 78, "mode", NULL);
+  frame_dispatch(f, &req2);
+  ASSERT_EQ(completion.corrs.size(), 1u);
+  EXPECT_EQ(completion.corrs[0], 78u);
+  EXPECT_EQ(completion.statuses[0], 0u);
+  EXPECT_STREQ(completion.texts[0].c_str(), "\"fast\"");
+
+  /* A recall of a key nobody remembers answers status 1 corr-matched — the
+     python waiter is never stranded silently. */
+  message_t req3 = bridge_request(FRM_RECALL, 79, "absent", NULL);
+  frame_dispatch(f, &req3);
+  ASSERT_EQ(completion.corrs.size(), 2u);
+  EXPECT_EQ(completion.corrs[1], 79u);
+  EXPECT_EQ(completion.statuses[1], 1u);
+  EXPECT_EQ(completion.texts[1], "");
+
+  /* And the failed recalls wrote nothing: still the one event. */
+  find_remember_event(f, 1, &events, &payload);
+  json_value_destroy(events);
+
+  bridge_completion_mount(NULL);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestBridgeInvalidPayloadAnswersFailure) {
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+
+  bridge_completion_t completion;
+  bridge_completion_mount(&completion);
+
+  /* An EMPTY key is an invalid remember: the store refuses, no event is
+     written, and the request is STILL answered corr-matched as a failure —
+     a python wait must end through a delivered timeout-bearing reply, never
+     because a reply was silently eaten. */
+  message_t req = bridge_request(FRM_REMEMBER, 90, "", "\"fast\"");
+  frame_dispatch(f, &req);
+  ASSERT_EQ(completion.corrs.size(), 1u);
+  EXPECT_EQ(completion.corrs[0], 90u);
+  EXPECT_EQ(completion.statuses[0], 1u);
+
+  /* No state event was written for the refused remember. */
+  json_value_t* events = NULL;
+  json_value_t* payload = NULL;
+  find_remember_event(f, 0, &events, &payload);
+  EXPECT_EQ(payload, nullptr);
+  json_value_destroy(events);
+
+  /* A recall whose key never resolves is a corr-matched failure too (NULL
+     text — the bridge registry reads status, not text, for a failure). */
+  message_t req2 = bridge_request(FRM_RECALL, 91, "alsomissing", NULL);
+  frame_dispatch(f, &req2);
+  ASSERT_EQ(completion.corrs.size(), 2u);
+  EXPECT_EQ(completion.corrs[1], 91u);
+  EXPECT_EQ(completion.statuses[1], 1u);
+  EXPECT_EQ(completion.texts[1], "");
+
+  bridge_completion_mount(NULL);
+  frame_destroy(f);
   wave_db_close(db);
 }
 

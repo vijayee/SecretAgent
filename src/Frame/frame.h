@@ -54,6 +54,14 @@ int frame_join(frame_t* child);   /* frame.join event in the parent; child becom
    (bounded to last 512, root-level absolute-bounds scan) */
 char* frame_debug_events(frame_t* f);
 
+/* Test/synchronous-entry point: run ONE behavior dispatch on `msg` exactly as
+   the scheduler would run it. In production the embedded actor's mailbox
+   routes through this same dispatch; tests call it directly to exercise a
+   behavior in-line. The behavior CONSUMES the message's payload (msg->payload
+   is NULL on return when the type was handled); never blocks beyond a µs
+   batch. */
+void frame_dispatch(frame_t* f, message_t* msg);
+
 #endif /* SA_HAS_WDB */
 
 #endif // SA_FRAME_H
