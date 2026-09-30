@@ -61,6 +61,21 @@ if (BUILD_TESTING)
       target_sources(testsecretagent PRIVATE test_live_loop.cpp)
     endif()
 
+    # The ported streams server suite rides the streams gate (same CMake-level
+    # SA_HAS_STREAMS variable the root sets; the ported server core needs
+    # poll-dancer + OpenSSL + libcbor, and libcbor arrives via SA_ENABLE_WDB).
+    if(SA_HAS_STREAMS)
+      target_sources(testsecretagent PRIVATE test_streams_server.cpp)
+      # The ported headers reach <cbor.h> through Buffer/buffer.h, whose
+      # include dirs are PRIVATE on the library (same libcbor dirs the root's
+      # WaveDB block gives secretagent); the test TU needs them directly.
+      target_include_directories(testsecretagent PRIVATE
+        ${WDB_ROOT}/deps/libcbor/src
+        ${WDB_BUILD}/deps/libcbor
+        ${WDB_BUILD}/deps/libcbor/src
+        ${WDB_ROOT}/deps/hashmap/include)
+    endif()
+
     if(SA_HAS_PYTHON)
       target_sources(testsecretagent PRIVATE test_pyrt.cpp)
 
