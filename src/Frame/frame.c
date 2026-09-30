@@ -1013,6 +1013,7 @@ model_backend_t* _frame_backend_get(frame_t* f) {
   if (f->backend != NULL) return f->backend;
   if (f->owned_backend != NULL) return f->owned_backend;
 
+#if defined(SA_HAS_STREAMS)
   frame_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
   cfg.model_base_url = f->model_base_url;
@@ -1028,6 +1029,16 @@ model_backend_t* _frame_backend_get(frame_t* f) {
   }
   f->owned_backend = mb;
   return mb;
+#else
+  /* The default backend rides the streams transport in model.c; a no-streams
+     build has NO creatable default, so this is a loud build-shape refusal —
+     the message must not claim a config problem that does not exist. Scripted
+     backends via frame_set_model_backend remain the no-streams path. */
+  log_error("frame: no backend set and no streams transport in this build "
+            "(SA_ENABLE_STREAMS=OFF) — inject a backend on '%s' via "
+            "frame_set_model_backend", f->sid_path);
+  return NULL;
+#endif
 }
 
 uint8_t _frame_cell_pending(const frame_t* f) {

@@ -29,18 +29,30 @@
 //     layer's reason; non-2xx responses carry the status CODE plus a bounded
 //     body excerpt (a non-2xx arrives success-shaped from http: status=code,
 //     error=NULL); decode failures carry the json_parse reason.
-//   - The http client is constructed per call (http_post_json is one-shot, one
-//     connection per request) — no connection reuse in this milestone; the
-//     reconnect cost is turn-scale, and port-refusals fail instantly while
-//     blocked connects are bounded by the kernel default.
+//   - The http client is constructed per call (one POST, one connection per
+//     request) over the process's ONE streams loop thread, which the first
+//     backend mounts and the last backend tears down. No connection reuse in
+//     this milestone; the reconnect cost is turn-scale, and port-refusals
+//     fail instantly while blocked connects are bounded by the client timer.
+//   - complete() is synchronous on the calling turn thread: submit, wait on
+//     the completion record's condvar, then decode. Blocking the caller is
+//     acceptable for the same reason py_agent's bridge wait is — the caller
+//     is a dedicated runtime/turn thread, the wait is BOUNDED (the client's
+//     request timer plus dispatch slack), and nothing on the reactor loop
+//     ever waits on a caller (the completion callback is µs-scale).
 //
 // Body is compiled only in the WaveDB build: frame_config_t lives inside
 // frame.h's SA_HAS_WDB guard (same gate as frame.c's store body).
 
 #include "model.h"
 
-#include "../Net/http.h"
+#include "../Streams/http_client.h"
+#include "../Streams/loop_thread.h"
+#include "../Platform/platform.h"
+#include "../RefCounter/refcounter.h"
 #include "../Util/allocator.h"
+#include "../Util/atomic_compat.h"
+#include "../Util/log.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -50,10 +62,15 @@
 #ifdef SA_HAS_WDB
 
 /* One-shot POST bound: the model client has no connection reuse and no
-   retries, so the timeout only has to cover one send/recv exchange.
-   frame_config_t's model_timeout_ms overrides it per-backend (0 = this
-   default) — local models on big tool-calling turns can run minutes. */
+   retries, so the timeout only has to cover one send/recv exchange. The
+   request timer rides the streams client's loop timer; frame_config_t's
+   model_timeout_ms overrides it per-backend (0 = this default) — local
+   models on big tool-calling turns can run minutes. */
 #define SA_MODEL_TIMEOUT_MS 30000
+/* Dispatch slack over the client's own request timer: the waiter bound is
+   timeout_ms + this. When the completion misses even THAT, the request was
+   lost (loop thread died mid-flight) — the failure is loud, not a hang. */
+#define SA_MODEL_SLACK_MS 5000
 /* Heap error strings are formatted into a bounded scratch (truncation-safe
    like the http layer's reason strings). */
 #define SA_MODEL_ERROR_MAX 512
@@ -62,6 +79,13 @@
 /* Joined URL scratch; local endpoints never approach this (overflow is a
    loud request-build error, not silent truncation). */
 #define SA_MODEL_URL_MAX 1024
+
+/* The http backend rides BOTH gates: the completion boundary is the WaveDB
+   gate's shape (frame_config_t), but its transport is the streams client —
+   so the machinery below is wrapped in SA_HAS_STREAMS too. Under a
+   WDB-no-streams build only the three always-linked functions below remain
+   (the frame refuses its default-backend build there in the same shape). */
+#if defined(SA_HAS_STREAMS)
 
 static const char* EXECUTE_TOOL_DESCRIPTION =
   "Execute one Python cell in the frame's interpreter. Give the COMPLETE cell "
@@ -158,12 +182,142 @@ static json_value_t* _model_execute_tool(void) {
   return tools;
 }
 
+/* ------------------------------------------------------------------ */
+/* The process's one streams loop                                     */
+/* ------------------------------------------------------------------ */
+
+/* Every http model backend rides ONE reactor thread per process: the first
+   backend create mounts it, the LAST backend destroy tears it down (a plain
+   user count under the same lock). The thread itself is a dedicated runtime
+   thread whose completions callback for microseconds — the same shape as
+   py_agent's bridge wait (dedicated worker thread, bounded caller-side
+   block), so blocking a turn on the completion record below is acceptable.
+   The guard mutex doubles as the mount lock and is never freed (installed
+   once, like py_agent's registry mount — a process-lifetime primitive). */
+static _Atomic(platform_mutex_t*) _model_loop_guard = NULL;
+static streams_loop_thread_t* _model_loop = NULL;   /* guarded by the guard lock */
+static unsigned _model_loop_users = 0;              /* guarded by the guard lock */
+
+/* Acquires the process's streams loop thread, creating it on first use, and
+   pins it for this backend's lifetime. Returns NULL when the loop thread
+   cannot be mounted. */
+static streams_loop_thread_t* _model_loop_acquire(void) {
+  platform_mutex_t* m = platform_mutex_create();
+  platform_mutex_t* expected = NULL;
+  if (!atomic_compare_exchange_strong(&_model_loop_guard, &expected, m)) {
+    /* Lost the install race: the winner's mutex is in the guard. */
+    platform_mutex_destroy(m);
+    m = atomic_load(&_model_loop_guard);
+  }
+  if (m == NULL) {
+    log_error("model_http_backend_create: loop guard install failed");
+    return NULL;
+  }
+  platform_mutex_lock(m);
+  if (_model_loop == NULL) {
+    _model_loop = streams_loop_create();
+  }
+  if (_model_loop != NULL) {
+    _model_loop_users++;
+  }
+  streams_loop_thread_t* loop = _model_loop;
+  platform_mutex_unlock(m);
+  return loop;
+}
+
+/* Drops one backend's pin; the loop dies only with the LAST backend. */
+static void _model_loop_release(void) {
+  platform_mutex_t* m = atomic_load(&_model_loop_guard);   /* install-once */
+  if (m == NULL) return;   /* never mounted: no backend did either */
+  platform_mutex_lock(m);
+  if (_model_loop_users > 0 && --_model_loop_users == 0) {
+    streams_loop_destroy(_model_loop);
+    _model_loop = NULL;
+  }
+  platform_mutex_unlock(m);
+}
+
+/* ------------------------------------------------------------------ */
+/* The per-request completion record (refcounted wait block)          */
+/* ------------------------------------------------------------------ */
+
+/* One POST's wait block, heap: the completion may fire long after the
+   submitting frame returned (a timed-out waiter must not race the record's
+   death, and a lost completion must not leak it). Ref discipline: the
+   WAITER (the turn thread inside complete()) holds its own reference from
+   before submit until after it has settled the record under the lock; the
+   CALLBACK holds one pre-claimed reference and releases it when done
+   filling+firing. Whoever releases LAST frees the record and the primitives
+   — that is what makes fire-past-a-timed-out-waiter and waiter-outlived-
+   cancel both safe and leak-free without ordering the two sides. */
+typedef struct _model_completion_t {
+  refcounter_t refcounter;    /* FIRST member: casts between the types are exact */
+  platform_mutex_t* lock;     /* shared pair; freed by the last releaser */
+  platform_condvar_t* cv;
+  int done;                   /* set under the lock before the signal */
+  int status;                 /* http status, or -1 on transport failure */
+  char* body;                 /* steal-slot: heap body moves out to the waiter */
+  size_t body_len;
+  char* error;                /* transport reason on status -1 */
+} _model_completion_t;
+
+static _model_completion_t* _model_completion_create(void) {
+  _model_completion_t* rec = get_clear_memory(sizeof(_model_completion_t));
+  rec->lock = platform_mutex_create();
+  rec->cv = platform_condvar_create();
+  if (rec->lock == NULL || rec->cv == NULL) {
+    log_error("model client: completion record primitives failed");
+    if (rec->lock != NULL) platform_mutex_destroy(rec->lock);
+    if (rec->cv != NULL) platform_condvar_destroy(rec->cv);
+    free(rec);
+    return NULL;
+  }
+  refcounter_init(&rec->refcounter);   /* the waiter's own reference; LAST */
+  return rec;
+}
+
+/* Drops one reference; the last out tears the record down (never-freed
+   steal-slot strings are the dropped waiter's leftovers — the record is the
+   only owner once the completion filled them). */
+static void _model_completion_release(_model_completion_t* rec) {
+  if (refcounter_dereference_is_zero(&rec->refcounter)) {
+    free(rec->body);
+    free(rec->error);
+    platform_condvar_destroy(rec->cv);
+    platform_mutex_destroy(rec->lock);
+    free(rec);
+  }
+}
+
+/* The http client's completion — runs ON the loop thread, µs-scale (a lock,
+   some field writes, a broadcast). The completion's heap strings move into
+   the steal-slot; the waiter takes them, a dropped waiter leaves them to
+   this record's teardown. */
+static void _model_completion_on(void* ctx, int status, char* body,
+                                 size_t body_len, char* error) {
+  _model_completion_t* rec = (_model_completion_t*)ctx;
+  platform_mutex_lock(rec->lock);
+  rec->status = status;
+  rec->body = body;
+  rec->body_len = body_len;
+  rec->error = error;
+  rec->done = 1;
+  platform_condvar_broadcast(rec->cv);
+  platform_mutex_unlock(rec->lock);
+  _model_completion_release(rec);
+}
+
+/* ------------------------------------------------------------------ */
+/* Backend                                                            */
+/* ------------------------------------------------------------------ */
+
 typedef struct _model_http_backend_t {
   model_backend_t base;      /* FIRST member: casts between the types are exact */
   char* base_url;
   char* api_key;             /* NULL when unused (Ollama) */
   char* model_name;
   unsigned timeout_ms;       /* one-shot POST bound (resolved from the config) */
+  streams_loop_thread_t* loop;   /* borrowed; pinned by _model_loop_acquire */
 } _model_http_backend_t;
 
 /* Fills *body_out with the serialized request document. Caller frees. */
@@ -398,56 +552,161 @@ static int _model_http_complete(void* self, json_value_t* messages,
     return -1;
   }
 
-  http_response_t* r = http_post_json(url, b->api_key, request_text,
-                                      b->timeout_ms);
-  free(request_text);
-  if (r == NULL) {
+  /* One client per POST (the completion record below pins nothing longer);
+     the request timer rides the client's own loop timer. */
+  http_client_t* client = http_client_create(b->loop);
+  if (client == NULL) {
     if (error_out != NULL) {
-      *error_out = _model_error("model client: transport: http client returned "
-                                "no response");
+      *error_out = _model_error("model client: transport: http client "
+                                "allocation failed");
+    }
+    free(request_text);
+    return -1;
+  }
+
+  _model_completion_t* rec = _model_completion_create();
+  if (rec == NULL) {
+    if (error_out != NULL) {
+      *error_out = _model_error("model client: transport: wait record "
+                                "allocation failed");
+    }
+    free(request_text);
+    http_client_destroy(client);
+    return -1;
+  }
+
+  /* The callback's reference is claimed BEFORE submit: the completion may
+     fire the instant the submit op lands on the loop thread, and it must
+     never fire into a record whose only reference is a waiter that already
+     left (or keep it alive only by luck of ordering). */
+  refcounter_reference(&rec->refcounter);   /* the callback's reference */
+  int rc = http_client_submit(client, url, b->api_key, request_text,
+                              b->timeout_ms, _model_completion_on, rec);
+  free(request_text);
+  if (rc != 0) {
+    /* Rejected before any I/O: this completion NEVER fires (the http
+       client's contract), so the pre-claimed reference is dropped here. */
+    _model_completion_release(rec);          /* the callback's reference */
+    _model_completion_release(rec);          /* the waiter's own */
+    http_client_destroy(client);
+    if (error_out != NULL) {
+      *error_out = _model_error("model client: transport: request refused "
+                                "before any I/O");
     }
     return -1;
   }
-  if (r->status < 200 || r->status >= 300) {
+
+  /* The bounded wait: the client owns the request timeout (its loop timer
+     fires a transport-error completion); the +5000 ms is dispatch slack, so
+     a LOST completion fails loud instead of hanging the turn forever. */
+  uint64_t deadline_ns = platform_monotonic_ns() +
+      ((uint64_t)b->timeout_ms + SA_MODEL_SLACK_MS) * 1000000ULL;
+  int fired = 0;
+  int settled = 0;             /* 1 once the steal-slot moved into the locals */
+  int status = 0;
+  char* body = NULL;
+  size_t body_len = 0;
+  char* error = NULL;
+  platform_mutex_lock(rec->lock);
+  while (!rec->done) {
+    uint64_t now = platform_monotonic_ns();
+    if (now >= deadline_ns) break;
+    uint64_t remaining_ms = (deadline_ns - now) / 1000000ULL + 1;
+    platform_condvar_timed_wait(rec->cv, rec->lock, (uint32_t)remaining_ms);
+  }
+  /* Steal the result under the lock the completion fired under. */
+  fired = rec->done;
+  if (fired) {
+    status = rec->status;
+    body = rec->body;
+    rec->body = NULL;
+    body_len = rec->body_len;
+    error = rec->error;
+    rec->error = NULL;
+    settled = 1;
+  }
+  platform_mutex_unlock(rec->lock);
+
+  /* http_client_destroy is the settle point: the loop thread is serial and
+     this op is the client's last, so every completion callback has already
+     run (filled the record and released its reference) — or the request was
+     cancelled and its callback will NEVER run, so the pre-claimed reference
+     must be absorbed by this waiter below. A completion that raced the
+     wait's give-up filled the record in between: settle it now. */
+  http_client_destroy(client);
+  if (!settled) {
+    platform_mutex_lock(rec->lock);
+    fired = rec->done;
+    if (fired) {
+      status = rec->status;
+      body = rec->body;
+      rec->body = NULL;
+      body_len = rec->body_len;
+      error = rec->error;
+      rec->error = NULL;
+      settled = 1;
+    }
+    platform_mutex_unlock(rec->lock);
+  }
+  _model_completion_release(rec);              /* the waiter's own reference */
+  if (!fired) {
+    _model_completion_release(rec);            /* absorb the never-fired callback's */
+  }
+
+  if (!fired) {
     if (error_out != NULL) {
-      char* excerpt = _model_excerpt(r->body, r->body_len);
+      *error_out = _model_error("model client: transport: completion never "
+                                "fired within %u ms (the request was lost or "
+                                "cancelled)", b->timeout_ms + SA_MODEL_SLACK_MS);
+    }
+    return -1;
+  }
+  if (status < 200 || status >= 300) {
+    if (error_out != NULL) {
+      char* excerpt = _model_excerpt(body, body_len);
       /* Transport failures (status -1) carry the http layer's reason in
-         r->error and no body — surface it so a live misdiagnosis never
-         reads as an empty reply. */
+         error and no body — surface it so a live misdiagnosis never reads
+         as an empty reply. */
       const char* detail =
         (excerpt != NULL && excerpt[0] != '\0') ? excerpt
-        : (r->error != NULL && r->error[0] != '\0') ? r->error
+        : (error != NULL && error[0] != '\0') ? error
         : "(no body)";
-      *error_out = _model_error("model client: HTTP %d: %s", r->status, detail);
+      *error_out = _model_error("model client: HTTP %d: %s", status, detail);
       free(excerpt);
     }
-    net_http_response_destroy(r);
+    free(body);
+    free(error);
     return -1;
   }
 
   model_reply_t* decoded = NULL;
   char* decode_err = NULL;
-  if (_model_decode_body(r->body, r->body_len, &decoded, &decode_err) != 0) {
+  if (_model_decode_body(body, body_len, &decoded, &decode_err) != 0) {
     if (error_out != NULL) *error_out = decode_err; else free(decode_err);
-    net_http_response_destroy(r);
+    free(body);
     return -1;
   }
-  if (raw_out != NULL && r->body != NULL) {
-    *raw_out = _model_heap_str(r->body);
+  /* The stolen body (heap, NUL-terminated by the client) moves out raw. */
+  if (raw_out != NULL) {
+    *raw_out = body;
+    body = NULL;
   }
-  net_http_response_destroy(r);
+  free(body);
   *reply = decoded;
   return 0;
-}
-
-unsigned model_timeout_ms_resolve(unsigned cfg_ms) {
-  return (cfg_ms != 0) ? cfg_ms : SA_MODEL_TIMEOUT_MS;
 }
 
 model_backend_t* model_http_backend_create(const frame_config_t* cfg) {
   if (cfg == NULL) return NULL;
   if (cfg->model_base_url == NULL || cfg->model_base_url[0] == '\0') return NULL;
   if (cfg->model_name == NULL || cfg->model_name[0] == '\0') return NULL;
+
+  /* Acquire the process's one streams loop BEFORE building (a loop mount
+     failure refuses the backend instead of failing per request later). The
+     loop create is blocking thread setup on the caller — acceptable here
+     (init-time) and documented at _model_loop_acquire. */
+  streams_loop_thread_t* loop = _model_loop_acquire();
+  if (loop == NULL) return NULL;
 
   /* Not a refcounted object: the backend is a plain owned vtable node, freed
      exactly once through model_backend_destroy. */
@@ -457,19 +716,34 @@ model_backend_t* model_http_backend_create(const frame_config_t* cfg) {
   b->base_url = _model_heap_str(cfg->model_base_url);
   b->model_name = _model_heap_str(cfg->model_name);
   b->timeout_ms = model_timeout_ms_resolve(cfg->model_timeout_ms);
+  b->loop = loop;
   /* Empty key == no key (Ollama); NULL out rather than carrying "". */
   b->api_key = (cfg->model_api_key != NULL && cfg->model_api_key[0] != '\0')
                  ? _model_heap_str(cfg->model_api_key) : NULL;
   return &b->base;
 }
 
+#endif /* SA_HAS_STREAMS — end of the http-transport machinery */
+
+unsigned model_timeout_ms_resolve(unsigned cfg_ms) {
+  return (cfg_ms != 0) ? cfg_ms : SA_MODEL_TIMEOUT_MS;
+}
+
 void model_backend_destroy(model_backend_t* mb) {
   if (mb == NULL) return;
+#if defined(SA_HAS_STREAMS)
   _model_http_backend_t* b = (_model_http_backend_t*)mb;
   free(b->base_url);
   free(b->api_key);
   free(b->model_name);
   free(b);
+  _model_loop_release();   /* drop this backend's pin; last out kills the loop */
+#else
+  /* No-streams build: no http backend can be built (model_http_backend_create
+     does not exist and the frame refuses its default-backend build), so the
+     destroy only ever sees a caller's own vtable node — free the shell. */
+  free(mb);
+#endif
 }
 
 void model_reply_destroy(model_reply_t* r) {

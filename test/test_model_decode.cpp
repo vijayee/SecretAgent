@@ -4,9 +4,9 @@
 
 /* Direct decode tests for the model client (plan Task 9). These drive
    model_backend_t.complete through the REAL http path against a local fake
-   HTTP server (same fixture pattern as test_http.cpp: test-side sockets are
-   allowed; the runtime uses src/Net/http only). All canned OpenAI-shaped
-   bodies; offline. */
+   HTTP server (test-side sockets are allowed; the runtime's model client
+   rides the async streams client on the process loop). All canned
+   OpenAI-shaped bodies; offline. */
 
 #include <gtest/gtest.h>
 #include <atomic>
@@ -356,8 +356,9 @@ TEST(TestModelDecode, TestTransportErrorReportsReason) {
   ASSERT_NE(err, nullptr);
   EXPECT_NE(strstr(err, "model client"), nullptr);
   /* The http layer's transport reason is surfaced, not hidden behind the
-     body placeholder (status -1 means no body, but error is set). */
-  EXPECT_NE(strstr(err, "http_post_json: connect"), nullptr);
+     body placeholder (status -1 means no body, but error is set). The async
+     client's connect failure carries its own reason shape. */
+  EXPECT_NE(strstr(err, "http client: connect"), nullptr);
   EXPECT_EQ(strstr(err, "(no body)"), nullptr);
   EXPECT_EQ(reply, nullptr);
   EXPECT_EQ(raw, nullptr);

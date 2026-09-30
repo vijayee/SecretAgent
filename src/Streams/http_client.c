@@ -291,6 +291,7 @@ static int _set_nonblocking(int fd) {
 
 static void _req_complete(http_client_req_t* req, int status, char* body,
                           size_t body_len, char* error);
+static void _req_parse_error(http_client_req_t* req);
 static void _op_drain(void* p);
 static void _op_start(void* p);
 
@@ -465,6 +466,16 @@ static http_parser_settings _parser_settings = {
    while Content-Length: 0 (or an empty close-delimited tail) stays NULL. */
 static void _req_finalize(http_client_req_t* req) {
   char* body = NULL;
+
+  /* An absurd framing claim marked at headers_complete (a Content-Length
+     over the body cap halts the parser without an error) must still be a
+     transport failure when the parser reaches message end — the sync
+     client's up-front reject survives: NO part of a body-caplying response
+     ever completes as success, whether or not any body bytes followed. */
+  if (req->cap_error) {
+    _req_parse_error(req);
+    return;
+  }
 
   if (req->saw_chunked) {
     if (req->dec_buf == NULL) {

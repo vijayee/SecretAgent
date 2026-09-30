@@ -39,7 +39,6 @@ if (BUILD_TESTING)
             test_scheduler.cpp
             test_refcounter.cpp
             test_json.cpp
-            test_http.cpp
             )
 
     # Same CMake-level mirror idiom as the pyrt gate above: frame store tests
@@ -48,7 +47,12 @@ if (BUILD_TESTING)
     # tests share that gate.
     if(SA_HAS_WDB)
       target_sources(testsecretagent PRIVATE test_frame.cpp)
-      target_sources(testsecretagent PRIVATE test_model_decode.cpp)
+      # The model client's real-http tests drive model_http_backend_create —
+      # which rides the streams transport in model.c — so they need the
+      # streams gate too, not just the WDB gate their fixtures share.
+      if(SA_HAS_STREAMS)
+        target_sources(testsecretagent PRIVATE test_model_decode.cpp)
+      endif()
       # The loop suite rides both gates internally: restart/replay and the
       # content-only paths are WDB-only; the cell-running tests nest the
       # real `#if defined(SA_HAS_WDB) && defined(SA_HAS_PYTHON)` form inside.
@@ -67,7 +71,7 @@ if (BUILD_TESTING)
     if(SA_HAS_STREAMS)
       target_sources(testsecretagent PRIVATE test_streams_server.cpp)
       # The async client suite: real loop thread + real loopback fake servers
-      # (same house fixture the legacy sync-client tests use).
+      # (the house fixture the retired sync-client suite originated).
       target_sources(testsecretagent PRIVATE test_streams_client.cpp)
       # The ported headers reach <cbor.h> through Buffer/buffer.h, whose
       # include dirs are PRIVATE on the library (same libcbor dirs the root's

@@ -6,11 +6,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 extern "C" {
 #include "../src/Streams/loop_thread.h"
@@ -18,9 +20,9 @@ extern "C" {
 }
 
 /* Async HTTP client proofs: one POST, one response, on the real poll-dancer
-   reactor thread. Fake servers reuse the house idiom from test_http.cpp
-   (bind 127.0.0.1 on an ephemeral port, one connection, one canned reply,
-   one server thread per test); completion records are waited on with
+   reactor thread. Fake servers reuse the retired sync-client suite's house
+   idiom (bind 127.0.0.1 on an ephemeral port, one connection, one canned
+   reply, one server thread per test); completion records are waited on with
    mutex+cv — no sleeps-as-timing. */
 
 #include <arpa/inet.h>
@@ -72,6 +74,7 @@ struct completion_record {
   int fire_count = 0;
   int status = 0;
   std::string body;
+  size_t body_len = 0;     /* the client's reported length (not body.size()) */
   bool body_null = true;
   bool error_null = true;
   std::string error;
@@ -83,6 +86,7 @@ static void completion_record_reset(completion_record* r) {
   r->fire_count = 0;
   r->status = 0;
   r->body.clear();
+  r->body_len = 0;
   r->body_null = true;
   r->error_null = true;
   r->error.clear();
@@ -95,6 +99,7 @@ extern "C" void completion_record_on(void* ctx, int status, char* body,
     std::lock_guard<std::mutex> lk(r->m);
     r->status = status;
     r->body_null = (body == NULL);
+    r->body_len = body_len;
     if (body != NULL) r->body.assign(body, body_len);
     r->error_null = (error == NULL);
     if (error != NULL) r->error.assign(error);
@@ -444,4 +449,402 @@ static void fake_server_run(int listen_fd, std::string* seen_body,
   seen->store(1);
 
   close(client_fd);
+}
+
+/* ------------------------------------------------------------------ */
+/* The framing battery, re-pinned from the retired sync client         */
+/* ------------------------------------------------------------------ */
+
+/* The Task-8-era framing battery lived in test/test_http.cpp and retired
+   with the sync client; these pins carry its rules over to the async
+   client, where http-parser (the pinned lib) now owns framing. What the
+   move changed, and how each pin was adjusted honestly:
+
+   - A Content-Length together with chunked is now a TRANSPORT FAILURE: the
+     strict parse flags the RFC 7230 3.3.3 smuggling shape
+     (HPE_UNEXPECTED_CONTENT_LENGTH) instead of the sync client's lenient
+     "chunked wins". The repeated-TE pin therefore drops its Content-Length
+     line, and the TE+CL combo gets its own failure pin below.
+   - A malformed size line surfaces through the parser's dialect verdict —
+     the client's "parse error (...) HPE_*" wording — so those pins assert
+     the transport-failure shape and the stable "parse error" framing
+     rather than a synced-on phrase.
+   - An absurd CHUNK-SIZE claim is not caught AT the claim (the pinned
+     parser accepts any hex size); the close/cap disciplines catch it as
+     soon as real evidence arrives. Those pins assert the failure shape
+     ("chunked" ... connection closed), not where the reject fires.
+   - A never-ending raw stream is caught well before the 64 MiB read cap —
+     by the parser's own ~8 KB per-header-block bound on a header flood —
+     so the raw-flood pin asserts the rejection shape, not which bound won. */
+
+/* Builds a canned chunked HTTP/1.1 response: each piece becomes one chunk
+   (lower-case hex size, ";ext=1" parameter on the second), and with_trailer
+   puts a trailer field between the zero-size chunk and the final CRLF. */
+static std::string chunked_reply(const std::vector<std::string>& pieces,
+                                 bool with_trailer) {
+  std::string reply =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: application/json\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "Connection: close\r\n"
+    "\r\n";
+  for (size_t i = 0; i < pieces.size(); i++) {
+    char head[32];
+    snprintf(head, sizeof(head), "%zx%s\r\n", pieces[i].size(),
+             (i == 1) ? ";ext=1" : "");
+    reply += head;
+    reply += pieces[i];
+    reply += "\r\n";
+  }
+  reply += "0\r\n";
+  if (with_trailer) reply += "X-Wave-Note: ignored-by-decode\r\n";
+  reply += "\r\n";
+  return reply;
+}
+
+/* One canned exchange through the full client stack: server thread, loop
+   thread, submit, completion wait. Returns true when the completion fired;
+   `rec` carries the completion's outcome either way. */
+static bool canned_roundtrip(const std::string& canned, completion_record& rec) {
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  EXPECT_GE(listen_fd, 0);
+  if (listen_fd < 0) return false;
+  std::string seen_body;
+  std::atomic<uint8_t> seen;
+  seen.store(0);
+  std::thread server(fake_server_run, listen_fd, &seen_body, &seen,
+                     canned.c_str());
+
+  streams_loop_thread_t* lt = streams_loop_create();
+  EXPECT_NE(lt, nullptr);
+  http_client_t* c = http_client_create(lt);
+  EXPECT_NE(c, nullptr);
+  std::string url = "http://127.0.0.1:" + std::to_string(port) + "/v1/x";
+  int rc = http_client_submit(c, url.c_str(), NULL, "{}", 10000,
+                              completion_record_on, &rec);
+  EXPECT_EQ(rc, 0);
+  bool fired = wait_completion(&rec, 10000);
+  EXPECT_TRUE(fired);
+
+  server.join();
+  close(listen_fd);
+  http_client_destroy(c);
+  streams_loop_destroy(lt);
+  return fired;
+}
+
+TEST(TestStreamsClient, TestChunkedMultiChunkBodyDecodes) {
+  /* Three chunks whose boundaries deliberately cut mid-JSON (no alignment
+     with token or CRLF boundaries); the last carries an odd hex size. */
+  const std::string original =
+    "{\"choices\":[{\"message\":{\"content\":\"wave wave wave\"}}],"
+    "\"usage\":{\"total_tokens\":42}}";
+  std::vector<std::string> pieces = {original.substr(0, 19),
+                                     original.substr(19, 37),
+                                     original.substr(56)};
+  ASSERT_EQ(pieces[0].size() + pieces[1].size() + pieces[2].size(),
+            original.size());
+
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(chunked_reply(pieces, true), rec));
+  EXPECT_EQ(rec.status, 200);
+  EXPECT_TRUE(rec.error_null);
+  EXPECT_FALSE(rec.body_null);
+  EXPECT_EQ(rec.body_len, original.size()); /* no trailing CRLF noise */
+  EXPECT_EQ(rec.body, original);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedSizeLineDialects) {
+  /* Dialects the wire carries: the header VALUE capitalised ("Chunked"),
+     uppercase hex sizes, and a parameter on every size line. Decode must
+     stay byte-exact across all of it (the parser matches case-insensitively
+     and ignores chunk parameters). */
+  const std::string original = "{\"wave\":[1,2,3,{\"note\":\"deepest\"}]}";
+  std::vector<std::string> pieces = {original.substr(0, 11),
+                                     original.substr(11, 14),
+                                     original.substr(25)};
+  ASSERT_EQ(pieces[0].size() + pieces[1].size() + pieces[2].size(),
+            original.size());
+
+  std::string canned =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+    "Transfer-Encoding: Chunked\r\nConnection: close\r\n\r\n";
+  for (size_t i = 0; i < pieces.size(); i++) {
+    char head[32];
+    snprintf(head, sizeof(head), "%X;wave=go\r\n", (unsigned)pieces[i].size());
+    canned += head;
+    canned += pieces[i];
+    canned += "\r\n";
+  }
+  canned += "0\r\n\r\n";
+
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(canned, rec));
+  EXPECT_EQ(rec.status, 200);
+  EXPECT_TRUE(rec.error_null);
+  ASSERT_FALSE(rec.body_null);
+  EXPECT_EQ(rec.body_len, original.size());
+  EXPECT_EQ(rec.body, original);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedHeaderValueDialects) {
+  /* Header-VALUE dialects around the coding LIST: value capitalised, OWS
+     around the list comma (chunked declared last, as RFC 7230 requires on
+     the chunked-wins rule). Decode must stay byte-exact. */
+  const std::string original = "{\"note\":\"list dialect\"}";
+  std::vector<std::string> pieces = {original.substr(0, 12),
+                                     original.substr(12)};
+  std::string canned =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+    "Transfer-Encoding: gzip , Chunked\r\nConnection: close\r\n\r\n";
+  for (size_t i = 0; i < pieces.size(); i++) {
+    char head[32];
+    snprintf(head, sizeof(head), "%zX\r\n", pieces[i].size());
+    canned += head;
+    canned += pieces[i];
+    canned += "\r\n";
+  }
+  canned += "0\r\n\r\n";
+
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(canned, rec));
+  EXPECT_EQ(rec.status, 200);
+  EXPECT_TRUE(rec.error_null);
+  ASSERT_FALSE(rec.body_null);
+  EXPECT_EQ(rec.body_len, original.size());
+  EXPECT_EQ(rec.body, original);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedDeclaredOnRepeatedTransferEncodingLines) {
+  /* RFC 7230 section 3.2.2: repeated Transfer-Encoding field-lines are ONE
+     field value list — every later field-line still contributes its codings.
+     chunked declared on a line AFTER a chunkless line must still win (here
+     over the close-delimited reading an earlier chunkless TE would imply).
+     The sync-client-era pin also carried a Content-Length alongside; the
+     pinned strict parser now rejects that combination outright (RFC 7230
+     3.3.3's smuggling rule — see the failure pin below), so the length lie
+     was dropped from this dialect pin. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\n"
+    "Transfer-Encoding: gzip\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "\r\n"
+    "c\r\n{\"split\":tr}\r\n0\r\n\r\n", rec));
+  EXPECT_EQ(rec.status, 200);
+  EXPECT_TRUE(rec.error_null);
+  ASSERT_FALSE(rec.body_null);
+  EXPECT_EQ(rec.body_len, 12u);
+  EXPECT_EQ(rec.body, "{\"split\":tr}");
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestContentLengthWithChunkedIsTransportFailure) {
+  /* Both framings on one response: the pinned strict parser rejects the
+     smuggling shape (HPE_UNEXPECTED_CONTENT_LENGTH) instead of the sync
+     client's lenient let-chunked-win — an honest semantic move to the
+     parser's verdict. The pin is the failure shape; never a success. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 12\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "\r\n"
+    "c\r\n{\"split\":tr}\r\n0\r\n\r\n", rec));
+  EXPECT_EQ(rec.status, -1);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_FALSE(rec.error_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedMalformedSizeLineFailsClean) {
+  /* "zz" is not a hex size: the client reports a transport failure with the
+     documented shape (status -1, error set, no body) and not a crash. The
+     reason travels through the pinned parser's verdict ("parse error ...
+     HPE_INVALID_CHUNK_SIZE"), so the pin is the shape plus the "parse
+     error" framing, not the retired client's own "chunked" phrase. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\nzz\r\n{\"a\":1}\r\n0\r\n\r\n", rec));
+  EXPECT_EQ(rec.status, -1);
+  ASSERT_FALSE(rec.error_null);
+  EXPECT_NE(rec.error.find("parse error"), std::string::npos);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedTruncatedChunkFailsClean) {
+  /* Chunk size promises 5 bytes of data, the connection closes after 3:
+     unexpected EOF before the terminator is a transport failure, never a
+     silently truncated success. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\n5\r\nabc", rec));
+  EXPECT_EQ(rec.status, -1);
+  ASSERT_FALSE(rec.error_null);
+  EXPECT_NE(rec.error.find("chunked"), std::string::npos);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedAbsurdSizeClaimRejected) {
+  /* A size claim over the 64 MiB cap with only a fragment delivered. The
+     pinned parser accepts the size as a number — the reject fires on real
+     evidence (the fragment feeds the buffer, the close makes the frame
+     unfinishable). Pinned as the failure shape ("chunked", no body), not
+     as an up-front claim check that the parser does not make. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\n40000001\r\njunk", rec));
+  EXPECT_EQ(rec.status, -1);
+  ASSERT_FALSE(rec.error_null);
+  EXPECT_NE(rec.error.find("chunked"), std::string::npos);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedMissingFinalCrlfFailsClean) {
+  /* The last-chunk terminator arrives ("0\r\n") and then the connection
+     closes without the final CRLF that ends the empty trailer section: the
+     frame is incomplete, so this is a transport failure — never a silently
+     truncated success. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\n5\r\nhello\r\n0\r\n", rec));
+  EXPECT_EQ(rec.status, -1);
+  ASSERT_FALSE(rec.error_null);
+  EXPECT_NE(rec.error.find("chunked"), std::string::npos);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedEmptyBodyZeroLengthNotNull) {
+  /* An empty completion comes back as headers + "0\r\n\r\n" — zero data
+     chunks. The reply is still a success: status 200 and a zero-length
+     (non-NULL, NUL-terminated) body, never a NULL store or a crash. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(chunked_reply({}, false), rec));
+  EXPECT_EQ(rec.status, 200);
+  EXPECT_TRUE(rec.error_null);
+  EXPECT_FALSE(rec.body_null);
+  EXPECT_EQ(rec.body_len, 0u);
+  EXPECT_EQ(rec.body, "");
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestChunkedEmptyBodyWithTrailerZeroLengthNotNull) {
+  /* Same empty-body reply, but with a trailer field between the zero-size
+     chunk and the final CRLF: trailers must not change the success shape. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(chunked_reply({}, true), rec));
+  EXPECT_EQ(rec.status, 200);
+  EXPECT_TRUE(rec.error_null);
+  EXPECT_FALSE(rec.body_null);
+  EXPECT_EQ(rec.body_len, 0u);
+  EXPECT_EQ(rec.body, "");
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestContentLengthZeroIsNullBody) {
+  /* Content-Length: 0 is the CLOSE-delimited rule's twin: the body store
+     stays NULL (an empty chunked body is the only non-NULL empty). */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", rec));
+  EXPECT_EQ(rec.status, 200);
+  EXPECT_TRUE(rec.error_null);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestContentLengthOverBodyCapRejected) {
+  /* A promised Content-Length over the 64 MiB cap is a transport failure
+     before the read loop can grow toward the lie (1 GiB claimed here; the
+     delivered fragment + close would otherwise resolve to a plain
+     short-body error, so the message naming the cap pins the reject). */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\nConnection: close\r\n"
+    "\r\n{\"tiny\":1}", rec));
+  EXPECT_EQ(rec.status, -1);
+  ASSERT_FALSE(rec.error_null);
+  EXPECT_NE(rec.error.find("cap"), std::string::npos);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+TEST(TestStreamsClient, TestContentLengthOverBodyCapRejectedBeforeAnyBody) {
+  /* Same lie with NO body bytes at all: the reject must not depend on body
+     evidence either — the headers alone complete, and the cap marked there
+     still fails the response instead of a 200 with a NULL body. */
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\nConnection: close\r\n"
+    "\r\n", rec));
+  EXPECT_EQ(rec.status, -1);
+  ASSERT_FALSE(rec.error_null);
+  EXPECT_NE(rec.error.find("cap"), std::string::npos);
+  EXPECT_TRUE(rec.body_null);
+  EXPECT_EQ(rec.fire_count, 1);
+}
+
+/* A header value that never ends: the wire keeps coming long past any sane
+   header block. http-parser's own header-bound catches the flood (HPE_HEADER
+_OVERFLOW) long before the 64 MiB read cap — the pin is the REJECTION (a
+   transport failure, no body), not which bound fired or at what byte. */
+static void flood_server_run(int listen_fd) {
+  signal(SIGPIPE, SIG_IGN);   /* the client closes mid-flood; that is the test */
+  int client_fd = accept(listen_fd, NULL, NULL);
+  if (client_fd < 0) return;
+  const char* head = "HTTP/1.1 200 OK\r\nX-Flood: ";
+  size_t head_len = strlen(head);
+  size_t head_sent = 0;
+  while (head_sent < head_len) {
+    ssize_t w = send(client_fd, head + head_sent, head_len - head_sent,
+                     MSG_NOSIGNAL);
+    if (w <= 0) break;
+    head_sent += (size_t)w;
+  }
+  std::string blob(65536, 'a');
+  while (true) {
+    ssize_t w = send(client_fd, blob.data(), blob.size(), MSG_NOSIGNAL);
+    if (w <= 0) break;   /* the client's rejection closed the socket */
+  }
+  close(client_fd);
+}
+
+TEST(TestStreamsClient, TestNeverEndingRawStreamIsRejected) {
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  ASSERT_GE(listen_fd, 0);
+  std::thread server(flood_server_run, listen_fd);
+
+  streams_loop_thread_t* lt = streams_loop_create();
+  ASSERT_NE(lt, nullptr);
+  http_client_t* c = http_client_create(lt);
+  ASSERT_NE(c, nullptr);
+  completion_record rec;
+  std::string url = "http://127.0.0.1:" + std::to_string(port) + "/v1/x";
+  int rc = http_client_submit(c, url.c_str(), NULL, "{}", 15000,
+                              completion_record_on, &rec);
+  ASSERT_EQ(rc, 0);
+  ASSERT_TRUE(wait_completion(&rec, 30000));
+
+  EXPECT_EQ(rec.status, -1);          /* a flood is a transport failure */
+  EXPECT_TRUE(rec.body_null);         /* nothing ever assembles */
+  EXPECT_FALSE(rec.error_null);
+  EXPECT_FALSE(rec.error.empty());
+  EXPECT_EQ(rec.fire_count, 1);       /* exactly one completion, then done */
+
+  server.join();
+  http_client_destroy(c);
+  streams_loop_destroy(lt);
 }
