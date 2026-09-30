@@ -384,6 +384,79 @@ TEST(TestHttp, TestChunkedTruncatedChunkFailsClean) {
   http_response_destroy(r);
 }
 
+TEST(TestHttp, TestChunkedDeclaredOnRepeatedTransferEncodingLines) {
+  /* RFC 7230 section 3.2.2: repeated Transfer-Encoding field-lines are ONE
+     field value list — every later field-line still contributes its codings.
+     chunked declared on a line AFTER a chunkless line must still win (and the
+     client must ignore Content-Length for it, per RFC 7230 section 3.3.3). */
+  http_response_t* r = post_against_canned(
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 12\r\n"
+    "Transfer-Encoding: gzip\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "\r\n"
+    "c\r\n{\"split\":tr}\r\n0\r\n\r\n");
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, 200);
+  EXPECT_EQ(r->error, nullptr);
+  ASSERT_NE(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 12u);
+  EXPECT_STREQ(r->body, "{\"split\":tr}");
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestChunkedAbsurdSizeClaimRejected) {
+  /* A size claim over the 64 MiB cap is rejected as absurd before any of the
+     promised chunk data is looked for: claim 0x40000001 bytes, send a
+     fragment, close — the reject must already have happened (the cap check
+     precedes the truncation check). */
+  http_response_t* r = post_against_canned(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\n40000001\r\njunk");
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, -1);
+  ASSERT_NE(r->error, nullptr);
+  EXPECT_NE(strstr(r->error, "chunked"), nullptr);
+  EXPECT_EQ(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 0u);
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestChunkedMissingFinalCrlfFailsClean) {
+  /* The last-chunk terminator arrives ("0\r\n") and then the connection
+     closes without the final CRLF that ends the empty trailer section: the
+     frame is incomplete, so this is a transport failure — never a silently
+     truncated success. */
+  http_response_t* r = post_against_canned(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\n5\r\nhello\r\n0\r\n");
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, -1);
+  ASSERT_NE(r->error, nullptr);
+  EXPECT_NE(strstr(r->error, "chunked"), nullptr);
+  EXPECT_EQ(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 0u);
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestContentLengthOverBodyCapRejected) {
+  /* A promised Content-Length over the 64 MiB cap is a transport failure
+     up front, before the read loop grows the buffer toward the lie (1 GiB
+     claimed here; the delivered fragment + close would otherwise resolve to
+     a plain short-body error, so the message naming the cap pins the
+     pre-read reject). */
+  http_response_t* r = post_against_canned(
+    "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\nConnection: close\r\n"
+    "\r\n{\"tiny\":1}");
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, -1);
+  ASSERT_NE(r->error, nullptr);
+  EXPECT_NE(strstr(r->error, "cap"), nullptr);
+  EXPECT_EQ(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 0u);
+  http_response_destroy(r);
+}
+
 TEST(TestHttp, TestChunkedEmptyBodyZeroLengthNotNull) {
   /* An empty completion comes back as headers + "0\r\n\r\n" — zero data
      chunks. The reply is still a success: status 200 and a zero-length

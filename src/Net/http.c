@@ -55,10 +55,18 @@
 
 #define _HTTP_HOST_MAX 256
 #define _HTTP_HEADER_BLOCK_MAX 4096
-/* Absurd-body reject: a decoded (or raw-promised) response body larger than
-   this is treated as a transport failure, never assembled. Model completions
-   are kilobytes; 64 MiB is orders past any real turn. */
+/* Absurd-body reject: a response body larger than this is treated as a
+   transport failure and never assembled — enforced on BOTH framings: on the
+   Content-Length promise (rejected up front, before the read loop can grow
+   toward it) and on the running total inside the chunked decode. Model
+   completions are kilobytes; 64 MiB is orders past any real turn. */
 #define _HTTP_BODY_MAX (64u * 1024u * 1024u)
+/* Read-loop ceiling on the raw wire size (header block + framing + body):
+   a legal response of a cap-sized body never needs more than the body cap
+   plus the header-block bound plus chunk-framing slack, so a peer pushing
+   past this is flooding (or lying about a length) — the buffer stops
+   growing and the response is a transport failure. */
+#define _HTTP_READ_MAX (_HTTP_BODY_MAX + _HTTP_HEADER_BLOCK_MAX + 4096)
 
 /* ---------------------------------------------------------------- */
 /* Response plumbing                                                */
@@ -244,9 +252,12 @@ static ssize_t _parse_content_length(const char* headers, size_t len) {
 /* Case-insensitive scan of the header block for a Transfer-Encoding whose
    value declares the chunked transfer codings (RFC 7230 §3.3.1): the match
    tolerates parameters after ';' on the token, surrounding encodings
-   separated by ',', and OWS around those commas (RFC 7230 §3.3.1). When
-   chunked is declared, Content-Length must be ignored — chunked wins by
-   RFC (and by what proxies actually send). */
+   separated by ',', and OWS around those commas. Repeated Transfer-Encoding
+   field-lines are one field value list (RFC 7230 §3.2.2), so the scan keeps
+   going after a field-line whose list had no chunked — a chunked token
+   declared on ANY later field-line wins. When chunked is declared,
+   Content-Length must be ignored — chunked wins by RFC (and by what proxies
+   actually send). */
 static int _parse_chunked(const char* headers, size_t len) {
   size_t i;
   for (i = 0; i + 18 < len; i++) {
@@ -267,10 +278,12 @@ static int _parse_chunked(const char* headers, size_t len) {
       }
       while (value < end && (*value == ',' || *value == ' ' ||
                              *value == '\t')) value++;
-      if (value >= end || *value == '\r') return 0;
-      if (tok_len == 0) return 0;
+      /* This field-line's value list is exhausted without a chunked token:
+         later Transfer-Encoding field-lines still need scanning. */
+      if (value >= end || *value == '\r') break;
+      if (tok_len == 0) return 0;  /* no progress possible on this list */
     }
-    return 0;
+    /* fall through: this field-line had no chunked, keep scanning lines */
   }
   return 0;
 }
@@ -332,11 +345,15 @@ static char* _decode_chunked(const char* src, size_t src_len, size_t* decoded_le
 
     if (chunk_size == 0) break;                    /* terminator reached */
 
-    if ((size_t)(end - p) < chunk_size) goto malformed;  /* data truncated */
+    /* The size claim is judged against the cap before the promised chunk
+       data is looked for: an absurd claim is rejected as absurd even when no
+       (or too little) data followed it, making the cap reject independent of
+       how or when the stream truncates. */
     if (chunk_size > _HTTP_BODY_MAX ||
         decoded_used + (size_t)chunk_size > _HTTP_BODY_MAX) {
       goto malformed;                              /* absurd total body */
     }
+    if ((size_t)(end - p) < chunk_size) goto malformed;  /* data truncated */
     if (decoded == NULL) {
       decoded_cap = (size_t)chunk_size + 1 < 8192 ? 8192 : (size_t)chunk_size + 1;
       decoded = get_memory(decoded_cap);
@@ -398,6 +415,7 @@ http_response_t* http_post_json(const char* url,
   ssize_t content_length = -1;
   int chunked = 0;
   int eof = 0;
+  int too_big = 0;
   int status = 0;
 
   if (body_json == NULL) {
@@ -509,11 +527,18 @@ http_response_t* http_post_json(const char* url,
   free(path);
 
   /* Read the response: headers until CRLF CRLF, then the body either to
-     Content-Length or to connection close. */
+     Content-Length or to connection close. The buffer never grows past the
+     body cap: a promised Content-Length over the cap is rejected as soon as
+     the headers are parsed, and a stream with no believable end is cut at
+     the raw-size ceiling before the next growth. */
   cap = 8192;
   resp_buf = get_memory(cap);
   while (1) {
     ssize_t n;
+    if (total >= _HTTP_READ_MAX) {
+      too_big = 1;
+      break;
+    }
     if (total + 1 >= cap) {
       resp_buf = _buf_grow(resp_buf, total, cap * 2);
       cap *= 2;
@@ -531,9 +556,12 @@ http_response_t* http_post_json(const char* url,
       if (header_end != 0) {
         content_length = _parse_content_length(resp_buf, header_end);
         chunked = _parse_chunked(resp_buf, header_end);
-        if (!chunked && content_length >= 0 &&
-            total >= header_end + (size_t)content_length) {
-          break;
+        if (!chunked && content_length >= 0) {
+          if ((size_t)content_length > _HTTP_BODY_MAX) {
+            too_big = 1;                   /* promised body over the cap */
+            break;
+          }
+          if (total >= header_end + (size_t)content_length) break;
         }
       }
     } else if (!chunked && content_length >= 0 &&
@@ -542,6 +570,12 @@ http_response_t* http_post_json(const char* url,
     }
   }
   close(fd);
+
+  if (too_big) {
+    free(resp_buf);
+    return _http_error_response("http_post_json: response from %s:%u exceeds "
+                                "the 64 MiB body cap", host, (unsigned)port);
+  }
 
   if (header_end == 0) {
     free(resp_buf);

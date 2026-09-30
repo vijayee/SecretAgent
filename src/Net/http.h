@@ -9,10 +9,13 @@
 #include <stdint.h>
 
 /* Minimal HTTP/1.1 client for local model endpoints (Ollama/vLLM style).
-   One POST, one response; the body framing is transparent to the caller —
+   One POST, one response; the body framing is decoded for the caller —
    Content-Length responses pass through as-is, Transfer-Encoding: chunked
    responses are decoded into a single contiguous body (chunk extensions and
-   trailers are discarded); connection per request (fine for turn-scale
+   trailers are discarded). One asymmetry when the body is empty: a chunked
+   empty body yields a NON-NULL zero-length body (""), while Content-Length: 0
+   yields a NULL body (body_len 0) — keep that in mind when the caller can
+   hand back either framing. Connection per request (fine for turn-scale
    rates). */
 typedef struct http_response_t {
   int status;            /* HTTP code, or -1 (transport error) */
