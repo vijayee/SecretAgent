@@ -34,6 +34,14 @@ model_backend_t* model_http_backend_create(const frame_config_t* cfg);
 
 #endif /* SA_HAS_WDB */
 
+/* The completion timeout the http backend passes to the http client: the
+   frame config's model_timeout_ms when nonzero, otherwise the built-in
+   default (SA_MODEL_TIMEOUT_MS's 30000). Declared outside the WDB gate
+   (pure arithmetic) but defined in model.c's gated body — reachable from
+   the same builds that can call model_http_backend_create. Exposed so tests
+   can pin the 0-means-default derivation. */
+unsigned model_timeout_ms_resolve(unsigned cfg_ms);
+
 void model_backend_destroy(model_backend_t* mb);
 void model_reply_destroy(model_reply_t* r);
 

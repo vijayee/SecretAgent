@@ -19,6 +19,11 @@ typedef struct frame_config_t {
   const char* model_api_key;     /* may be NULL/empty for Ollama */
   const char* model_name;        /* e.g. a local model tag */
   unsigned max_depth;            /* SA_FRAME_MAX_DEPTH equivalent (default 4) */
+  unsigned model_timeout_ms;     /* one completion POST bound, ms; 0 = the
+                                    built-in default (model.h's
+                                    SA_MODEL_TIMEOUT_MS). Local models on
+                                    big tool-calling turns can run minutes —
+                                    the default 30 s is for cloud endpoints. */
 } frame_config_t;
 
 wave_database_root_t* wave_db_open(const char* location /* NULL = in-memory */);

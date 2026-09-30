@@ -50,7 +50,9 @@
 #ifdef SA_HAS_WDB
 
 /* One-shot POST bound: the model client has no connection reuse and no
-   retries, so the timeout only has to cover one send/recv exchange. */
+   retries, so the timeout only has to cover one send/recv exchange.
+   frame_config_t's model_timeout_ms overrides it per-backend (0 = this
+   default) — local models on big tool-calling turns can run minutes. */
 #define SA_MODEL_TIMEOUT_MS 30000
 /* Heap error strings are formatted into a bounded scratch (truncation-safe
    like the http layer's reason strings). */
@@ -161,6 +163,7 @@ typedef struct _model_http_backend_t {
   char* base_url;
   char* api_key;             /* NULL when unused (Ollama) */
   char* model_name;
+  unsigned timeout_ms;       /* one-shot POST bound (resolved from the config) */
 } _model_http_backend_t;
 
 /* Fills *body_out with the serialized request document. Caller frees. */
@@ -323,6 +326,24 @@ static int _model_decode_body(const char* body, size_t body_len,
     return -1;
   }
 
+  /* Reasoning models (Ollama gemma4-class) legitimately answer with an
+     empty `content` and their text in a `reasoning` string field. When
+     content is EMPTY (whether absent, null, or literally ""), the reasoning
+     IS the assistant's turn text — surfacing it keeps the transcript and
+     the audit trail from vanishing into a silent empty completion. A
+     non-empty content always wins; both are kept verbatim then. */
+  if (reply->content[0] == '\0') {
+    json_value_t* reasoning = json_get(message, "reasoning");
+    if (reasoning != NULL && json_type(reasoning) == JSON_STRING &&
+        json_as_string(reasoning)[0] != '\0') {
+      char* r = _model_heap_str(json_as_string(reasoning));
+      if (r != NULL) {
+        free(reply->content);
+        reply->content = r;
+      }
+    }
+  }
+
   /* tool_calls: only the FIRST call is consumed — the single-tool surface
      means one cell per turn. */
   json_value_t* tool_calls = json_get(message, "tool_calls");
@@ -378,7 +399,7 @@ static int _model_http_complete(void* self, json_value_t* messages,
   }
 
   http_response_t* r = http_post_json(url, b->api_key, request_text,
-                                      SA_MODEL_TIMEOUT_MS);
+                                      b->timeout_ms);
   free(request_text);
   if (r == NULL) {
     if (error_out != NULL) {
@@ -390,9 +411,14 @@ static int _model_http_complete(void* self, json_value_t* messages,
   if (r->status < 200 || r->status >= 300) {
     if (error_out != NULL) {
       char* excerpt = _model_excerpt(r->body, r->body_len);
-      *error_out = _model_error("model client: HTTP %d: %s", r->status,
-                                (excerpt != NULL && excerpt[0] != '\0')
-                                  ? excerpt : "(no body)");
+      /* Transport failures (status -1) carry the http layer's reason in
+         r->error and no body — surface it so a live misdiagnosis never
+         reads as an empty reply. */
+      const char* detail =
+        (excerpt != NULL && excerpt[0] != '\0') ? excerpt
+        : (r->error != NULL && r->error[0] != '\0') ? r->error
+        : "(no body)";
+      *error_out = _model_error("model client: HTTP %d: %s", r->status, detail);
       free(excerpt);
     }
     http_response_destroy(r);
@@ -414,6 +440,10 @@ static int _model_http_complete(void* self, json_value_t* messages,
   return 0;
 }
 
+unsigned model_timeout_ms_resolve(unsigned cfg_ms) {
+  return (cfg_ms != 0) ? cfg_ms : SA_MODEL_TIMEOUT_MS;
+}
+
 model_backend_t* model_http_backend_create(const frame_config_t* cfg) {
   if (cfg == NULL) return NULL;
   if (cfg->model_base_url == NULL || cfg->model_base_url[0] == '\0') return NULL;
@@ -426,6 +456,7 @@ model_backend_t* model_http_backend_create(const frame_config_t* cfg) {
   b->base.complete = _model_http_complete;
   b->base_url = _model_heap_str(cfg->model_base_url);
   b->model_name = _model_heap_str(cfg->model_name);
+  b->timeout_ms = model_timeout_ms_resolve(cfg->model_timeout_ms);
   /* Empty key == no key (Ollama); NULL out rather than carrying "". */
   b->api_key = (cfg->model_api_key != NULL && cfg->model_api_key[0] != '\0')
                  ? _model_heap_str(cfg->model_api_key) : NULL;

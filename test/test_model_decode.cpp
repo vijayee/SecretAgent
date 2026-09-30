@@ -355,10 +355,125 @@ TEST(TestModelDecode, TestTransportErrorReportsReason) {
   EXPECT_NE(rc, 0);
   ASSERT_NE(err, nullptr);
   EXPECT_NE(strstr(err, "model client"), nullptr);
+  /* The http layer's transport reason is surfaced, not hidden behind the
+     body placeholder (status -1 means no body, but error is set). */
+  EXPECT_NE(strstr(err, "http_post_json: connect"), nullptr);
+  EXPECT_EQ(strstr(err, "(no body)"), nullptr);
   EXPECT_EQ(reply, nullptr);
   EXPECT_EQ(raw, nullptr);
 
   free(err);
   model_backend_destroy(mb);
   json_value_destroy(msgs);
+}
+
+TEST(TestModelDecode, TestReasoningOnlyReplySurfacesContent) {
+  /* Reasoning models (Ollama gemma4-class) legitimately answer with
+     content:"" + a non-empty `reasoning` field and NO tool call — the
+     assistant text lives in reasoning and the caller must see it, or the
+     turn ends silently with an empty transcript and zero audit events. */
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  ASSERT_GE(listen_fd, 0);
+  std::string seen_body;
+  std::atomic<uint8_t> seen;
+  seen.store(0);
+  std::thread server(fake_server_run_canned, listen_fd, 200,
+    "{\"choices\":[{\"index\":0,\"finish_reason\":\"stop\","
+    "\"message\":{\"role\":\"assistant\",\"content\":\"\","
+    "\"reasoning\":\"thought it out\"}}]}",
+    &seen_body, &seen);
+
+  std::string base_url = "http://127.0.0.1:" + std::to_string(port);
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", 4};
+  model_backend_t* mb = model_http_backend_create(&cfg);
+  ASSERT_NE(mb, nullptr);
+
+  json_value_t* msgs = make_messages();
+  model_reply_t* reply = NULL;
+  char* err = NULL;
+  char* raw = NULL;
+  int rc = mb->complete(mb, msgs, NULL, &raw, &reply, &err);
+  ASSERT_EQ(rc, 0) << (err ? err : "(no error string)");
+  ASSERT_NE(reply, nullptr);
+  EXPECT_STREQ(reply->content, "thought it out");
+  EXPECT_EQ(reply->tool_code, nullptr);
+  EXPECT_STREQ(reply->finish_reason, "stop");
+
+  free(raw);
+
+  model_reply_destroy(reply);
+  model_backend_destroy(mb);
+  json_value_destroy(msgs);
+  server.join();
+  close(listen_fd);
+}
+
+/* Accepts the request, then holds the connection open WITHOUT ever replying
+   (a hanging model endpoint): the client's only escape is its timeout. */
+static void fake_server_run_hang(int listen_fd, std::atomic<uint8_t>* seen) {
+  int client_fd = accept(listen_fd, NULL, NULL);
+  if (client_fd < 0) return;
+
+  struct timeval tv = {3, 0};
+  setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  char buf[8192];
+  recv(client_fd, buf, sizeof(buf) - 1, 0);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+  close(client_fd);
+  seen->store(1);
+}
+
+TEST(TestModelDecode, TestTimeoutResolveDerivation) {
+  /* 0 = the built-in default; anything else passes through unchanged. */
+  EXPECT_EQ(model_timeout_ms_resolve(0), 30000u);
+  EXPECT_EQ(model_timeout_ms_resolve(1u), 1u);
+  EXPECT_EQ(model_timeout_ms_resolve(30000u), 30000u);
+  EXPECT_EQ(model_timeout_ms_resolve(180000u), 180000u);
+}
+
+TEST(TestModelDecode, TestConfigTimeoutReachesTransport) {
+  /* The frame config's model_timeout_ms must actually bound the POST: a
+     server that never answers fails in the configured window, not the
+     built-in default (30 s) and not the server's own 3 s hold. The http
+     layer reports a recv timeout and a peer close with one reason shape
+     ("no complete header block from ..."), so the ELAPSED time is the
+     proof the field reached the socket — 0.3 s configured vs 3 s hold vs
+     30 s default. */
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  ASSERT_GE(listen_fd, 0);
+  std::atomic<uint8_t> seen;
+  seen.store(0);
+  std::thread server(fake_server_run_hang, listen_fd, &seen);
+
+  std::string base_url = "http://127.0.0.1:" + std::to_string(port);
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", 4, 300};
+  model_backend_t* mb = model_http_backend_create(&cfg);
+  ASSERT_NE(mb, nullptr);
+
+  json_value_t* msgs = make_messages();
+  model_reply_t* reply = NULL;
+  char* err = NULL;
+  char* raw = NULL;
+  auto start = std::chrono::steady_clock::now();
+  int rc = mb->complete(mb, msgs, NULL, &raw, &reply, &err);
+  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start).count();
+
+  EXPECT_NE(rc, 0);
+  ASSERT_NE(err, nullptr);
+  EXPECT_NE(strstr(err, "model client"), nullptr)
+      << "err: " << (err ? err : "(null)");
+  EXPECT_GE(elapsed_ms, 250) << "err: " << (err ? err : "(null)");
+  EXPECT_LT(elapsed_ms, 2500) << "err: " << (err ? err : "(null)");
+  EXPECT_EQ(reply, nullptr);
+  EXPECT_EQ(raw, nullptr);
+
+  free(err);
+  model_backend_destroy(mb);
+  json_value_destroy(msgs);
+  server.join();
+  close(listen_fd);
 }

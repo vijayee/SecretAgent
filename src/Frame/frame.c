@@ -123,6 +123,7 @@ struct frame_t {
   char* model_api_key;
   char* model_name;
   unsigned max_depth;
+  unsigned model_timeout_ms;  /* 0 = built-in default (model_timeout_ms_resolve) */
   uint64_t seq;               /* last allocated event seq (0 = none yet) */
   uint32_t depth;
   /* --- the turn-loop pieces (Task 10; see frame_internal.h) ---------------
@@ -1018,6 +1019,7 @@ model_backend_t* _frame_backend_get(frame_t* f) {
   cfg.model_api_key = f->model_api_key;
   cfg.model_name = f->model_name;
   cfg.max_depth = f->max_depth;
+  cfg.model_timeout_ms = f->model_timeout_ms;
   model_backend_t* mb = model_http_backend_create(&cfg);
   if (mb == NULL) {
     log_error("frame: no backend set and the default http backend cannot be "
@@ -1188,6 +1190,7 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
 
   if (cfg != NULL) {
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
+    f->model_timeout_ms = cfg->model_timeout_ms;
     if (cfg->model_base_url != NULL) {
       f->model_base_url = strdup(cfg->model_base_url);
       if (f->model_base_url == NULL) goto fail;
@@ -1203,6 +1206,7 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
   } else if (parent != NULL) {
     /* Spawned children inherit the parent's depth budget and model config. */
     f->max_depth = parent->max_depth;
+    f->model_timeout_ms = parent->model_timeout_ms;
     if (parent->model_base_url != NULL) {
       f->model_base_url = strdup(parent->model_base_url);
       if (f->model_base_url == NULL) goto fail;
@@ -1357,6 +1361,7 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
      (NULL cfg carries none). */
   if (cfg != NULL) {
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
+    f->model_timeout_ms = cfg->model_timeout_ms;
     if (cfg->model_base_url != NULL) {
       f->model_base_url = strdup(cfg->model_base_url);
       if (f->model_base_url == NULL) goto fail;
