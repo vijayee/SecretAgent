@@ -5,14 +5,14 @@
 // THE CALLER'S THREAD against an OpenAI-compatible endpoint (local Ollama by
 // default) — no daemon, no RPC. The store is REAL disk (create-if-absent).
 //
-// STREAMING: the loop is a single blocking call (frame_run_loop), so the
-// public surface offers no turn-by-turn polling seam. The live-streaming
-// surface is Util/log.h's callback hook: the loop and the frame behaviors
-// log_info/log_error their progress lines ("cell corr ... completed with
-// status", errors, stop requests) THROUGH THE LOG, so a quiet-mode callback
-// streams them to stdout as they arrive. The frame's own event records land
-// in the store and are printed when the loop returns (audit dump + the final
-// assistant content).
+// STREAMING (scoped): the loop is a single blocking call (frame_run_loop),
+// so the public surface offers no turn-by-turn polling seam. The lines that
+// DO stream live are the loop/cell progress lines ("cell corr ... completed
+// with status", errors, stop requests), which ride Util/log.h's callback
+// hook as they arrive. Control events (e.g. model-error) carry NO log line
+// on their way in — they exist only as stored event records, so they first
+// surface in the post-loop audit dump below, alongside the final assistant
+// content.
 //
 // CTRL-C: pyrt_interrupt exists for python cells, but the frame layer owns
 // its pyrt privately — frame_t exposes NO interrupt entry point, and a
@@ -26,10 +26,18 @@
 #include "../../src/Util/log.h"
 
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* The aliased WaveDB logger (see the family-shared symbol aliasing block in
+   the root CMakeLists.txt) carries its OWN quiet flag — the demo's
+   log_set_quiet below only touches SecretAgent's logger, so WaveDB's INFO
+   lines around open/close would flood stderr without this. Only defined
+   under SA_ENABLE_WDB, which is the only configuration the demo builds in. */
+extern void wavedb_log_set_quiet(bool enable);
 
 #ifdef SA_HAS_PYTHON
 /* Reached through the bare extern (the test_loop.cpp idiom): py_agent.h
@@ -88,6 +96,9 @@ static int _demo_print_outcome(frame_t* f) {
     return 1;
   }
 
+  /* final_assistant/final_report stay pointed INTO the parsed tree, so the
+     tree is destroyed only at the single exit below — the status/final
+     prints happen while the strings are still alive. */
   const char* final_assistant = NULL;
   const char* final_report = NULL;
   for (size_t i = 0; i < json_size(events); i++) {
@@ -95,42 +106,53 @@ static int _demo_print_outcome(frame_t* f) {
     json_value_t* payload = json_get(rec, "payload");
     if (payload == NULL) continue;
     const char* type_name = json_as_string(json_get(rec, "type"));
+    if (type_name == NULL) continue;
     if (strcmp(type_name, "msg.append") == 0) {
       const char* role = json_as_string(json_get(payload, "role"));
-      printf("[event] msg.append %s: %s\n", role,
-             json_as_string(json_get(payload, "content")));
-      if (strcmp(role, "assistant") == 0) {
-        final_assistant = json_as_string(json_get(payload, "content"));
+      const char* content = json_as_string(json_get(payload, "content"));
+      if (role == NULL) {
+        printf("[event] msg.append <no role>: %s\n",
+               (content != NULL) ? content : "");
+      } else {
+        printf("[event] msg.append %s: %s\n", role,
+               (content != NULL) ? content : "");
+        if (strcmp(role, "assistant") == 0 && content != NULL) {
+          final_assistant = content;
+        }
       }
     } else if (strcmp(type_name, "frame.report") == 0) {
-      printf("[event] report: %s\n",
-             json_as_string(json_get(payload, "text")));
-      final_report = json_as_string(json_get(payload, "text"));
+      const char* text = json_as_string(json_get(payload, "text"));
+      printf("[event] report: %s\n", (text != NULL) ? text : "");
+      if (text != NULL) final_report = text;
     } else if (strcmp(type_name, "cell.result") == 0) {
+      const char* text = json_as_string(json_get(payload, "text"));
       printf("[event] cell result (status %lld): %s\n",
              (long long)json_as_int(json_get(payload, "status")),
-             json_as_string(json_get(payload, "text")));
+             (text != NULL) ? text : "");
     } else if (strcmp(type_name, "control") == 0) {
-      printf("[event] control %s: %s\n",
-             json_as_string(json_get(payload, "kind")),
-             json_as_string(json_get(payload, "text")));
+      const char* kind = json_as_string(json_get(payload, "kind"));
+      const char* text = json_as_string(json_get(payload, "text"));
+      printf("[event] control %s: %s\n", (kind != NULL) ? kind : "?",
+             (text != NULL) ? text : "");
     }
     /* state.remember / cell.run / spawn / join: shape-only on the audit
        trail; their effects already stream through the log hook. */
   }
-  json_value_destroy(events);
 
   const char* final_text = (final_assistant != NULL) ? final_assistant
                                                      : final_report;
+  int rc;
   printf("status: %s\n", (frame_is_done(f) == 1) ? "done" : "incomplete");
   if (frame_is_done(f) != 1 || final_text == NULL || final_text[0] == '\0') {
     printf("final: (the frame ended without assistant content)\n");
-    fflush(stdout);
-    return (frame_is_done(f) == 1) ? 0 : 1;
+    rc = (frame_is_done(f) == 1) ? 0 : 1;
+  } else {
+    printf("final: %s\n", final_text);
+    rc = 0;
   }
-  printf("final: %s\n", final_text);
   fflush(stdout);
-  return 0;
+  json_value_destroy(events);
+  return rc;
 }
 
 int main(int argc, char** argv) {
@@ -163,7 +185,12 @@ int main(int argc, char** argv) {
   signal(SIGINT, _demo_on_sigint);
   /* The stderr surface goes quiet; the hook below is the stream surface. */
   log_set_quiet(true);
-  log_add_callback(_demo_log_line, NULL, LOG_INFO);
+  if (log_add_callback(_demo_log_line, NULL, LOG_INFO) != 0) {
+    fprintf(stderr,
+            "frame-demo: log callback table is full — running degraded "
+            "(loop progress will not stream, the audit dump still prints)\n");
+  }
+  wavedb_log_set_quiet(true);
 #ifdef SA_HAS_PYTHON
   py_agent_init();
 #endif

@@ -262,6 +262,31 @@ if(SA_ENABLE_WDB)
   endif()
   target_include_directories(frame-demo PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  # Match the sanitizer gates from test/CMakeLists.txt: the library's
+  # INTERFACE link option pulls the runtime in, but main.c itself stays
+  # uninstrumented without matching compile options — mirror them so bugs in
+  # the demo surface under the sanitizer builds too.
+  if(SA_ENABLE_ASAN)
+    if(MSVC)
+      target_compile_options(frame-demo PRIVATE /fsanitize=address /Z7)
+      target_link_options(frame-demo PRIVATE /DEBUG)
+    else()
+      target_compile_options(frame-demo PRIVATE -fsanitize=address -fno-omit-frame-pointer -g)
+      target_link_options(frame-demo PRIVATE -fsanitize=address)
+    endif()
+  endif()
+  if(SA_ENABLE_UBSAN AND NOT MSVC)
+    target_compile_options(frame-demo PRIVATE -fsanitize=undefined -fno-omit-frame-pointer -g)
+    target_link_options(frame-demo PRIVATE -fsanitize=undefined)
+  endif()
+  if(SA_ENABLE_TSAN AND NOT MSVC)
+    if(SA_ENABLE_ASAN)
+      message(FATAL_ERROR "SA_ENABLE_TSAN and SA_ENABLE_ASAN are mutually exclusive; enable only one.")
+    endif()
+    target_compile_options(frame-demo PRIVATE -fsanitize=thread -fno-omit-frame-pointer -g)
+    target_link_options(frame-demo PRIVATE -fsanitize=thread)
+  endif()
 endif()
 
 if(SA_BUILD_TESTS)
