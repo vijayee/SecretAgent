@@ -5,9 +5,11 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 extern "C" {
 #include "../src/Net/http.h"
 }
@@ -21,8 +23,9 @@ extern "C" {
 #include <sys/time.h>
 #include <unistd.h>
 
-static void _serve_once(int client_fd);
-static void fake_server_run(int listen_fd, std::string* seen_body, std::atomic<uint8_t>* seen);
+static void _serve_once(int client_fd, const char* canned);
+static void fake_server_run(int listen_fd, std::string* seen_body,
+                            std::atomic<uint8_t>* seen, const char* canned);
 
 static int fake_server_listen(uint16_t* port_out) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -47,7 +50,7 @@ TEST(TestHttp, TestPostJsonRoundTrip) {
   std::string seen_body;
   std::atomic<uint8_t> seen;
   seen.store(0);
-  std::thread server(fake_server_run, listen_fd, &seen_body, &seen);
+  std::thread server(fake_server_run, listen_fd, &seen_body, &seen, nullptr);
 
   std::string url = "http://127.0.0.1:" + std::to_string(port) + "/v1/chat/completions";
   http_response_t* r = http_post_json(url.c_str(), NULL, "{\"model\":\"m\",\"messages\":[]}", 3000);
@@ -76,12 +79,27 @@ TEST(TestHttp, TestTransportErrorIsReported) {
 }
 
 /* Fills in the canned 200 reply: a body containing "ok":true with an honest
-   Content-Length. _serve_once only ever gets a connected, request-answered
-   descriptor from fake_server_run, so it never inspects the request. */
-static void _serve_once(int client_fd) {
+   Content-Length. With a non-NULL canned reply, that full raw response is
+   sent verbatim instead (chunked framing tests use this). _serve_once only
+   ever gets a connected, request-answered descriptor from fake_server_run,
+   so it never inspects the request. */
+static void _serve_once(int client_fd, const char* canned) {
   const char* body = "{\"ok\":true}";
   size_t body_len = strlen(body);
   char reply[256];
+  size_t sent;
+  if (canned != NULL) {
+    body = canned;
+    body_len = strlen(body);
+    sent = 0;
+    while (sent < body_len) {
+      ssize_t w = write(client_fd, body + sent, body_len - sent);
+      ASSERT_GT(w, 0);
+      sent += (size_t)w;
+    }
+    shutdown(client_fd, SHUT_WR);
+    return;
+  }
   int n = snprintf(reply, sizeof(reply),
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: application/json\r\n"
@@ -91,7 +109,7 @@ static void _serve_once(int client_fd) {
     body_len);
   ASSERT_GT(n, 0);
   ASSERT_LT((size_t)n, sizeof(reply));
-  size_t sent = 0;
+  sent = 0;
   while (sent < (size_t)n) {
     ssize_t w = write(client_fd, reply + sent, (size_t)n - sent);
     ASSERT_GT(w, 0);
@@ -106,7 +124,8 @@ static void _serve_once(int client_fd) {
   shutdown(client_fd, SHUT_WR);
 }
 
-static void fake_server_run(int listen_fd, std::string* seen_body, std::atomic<uint8_t>* seen) {
+static void fake_server_run(int listen_fd, std::string* seen_body,
+                            std::atomic<uint8_t>* seen, const char* canned) {
   int client_fd = accept(listen_fd, NULL, NULL);
   ASSERT_GT(client_fd, 0);
 
@@ -161,7 +180,7 @@ static void fake_server_run(int listen_fd, std::string* seen_body, std::atomic<u
 
   /* Reply once the full request arrived, so the client's response read
      begins on a clean, well-formed exchange. */
-  _serve_once(client_fd);
+  _serve_once(client_fd, canned);
   seen->store(1);
 
   close(client_fd);
@@ -179,7 +198,7 @@ TEST(TestHttp, TestLongUrlAndKeyDoNotLeak) {
   std::string seen_body;
   std::atomic<uint8_t> seen;
   seen.store(0);
-  std::thread server(fake_server_run, listen_fd, &seen_body, &seen);
+  std::thread server(fake_server_run, listen_fd, &seen_body, &seen, nullptr);
 
   std::string giant_path(4096, 'a');
   std::string url = "http://127.0.0.1:" + std::to_string(port) + "/" + giant_path;
@@ -202,4 +221,165 @@ TEST(TestHttp, TestLongUrlAndKeyDoNotLeak) {
   close(listen_fd);
   server.join();   /* fake_server_run tolerates never receiving a request:
                       bounded read, then it closes its accepted fd and exits */
+}
+
+/* -------- chunked responses (Transfer-Encoding: chunked decode) -------- */
+
+/* Builds a canned chunked HTTP/1.1 response: each piece becomes one chunk
+   (lower-case hex size, ";ext=1" parameter on the second), and with_trailer
+   puts a trailer field between the zero-size chunk and the final CRLF. */
+static std::string chunked_reply(const std::vector<std::string>& pieces,
+                                 bool with_trailer) {
+  std::string reply =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: application/json\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "Connection: close\r\n"
+    "\r\n";
+  for (size_t i = 0; i < pieces.size(); i++) {
+    char head[32];
+    snprintf(head, sizeof(head), "%zx%s\r\n", pieces[i].size(),
+             (i == 1) ? ";ext=1" : "");
+    reply += head;
+    reply += pieces[i];
+    reply += "\r\n";
+  }
+  reply += "0\r\n";
+  if (with_trailer) reply += "X-Wave-Note: ignored-by-decode\r\n";
+  reply += "\r\n";
+  return reply;
+}
+
+/* One fake-server round trip against a canned raw reply; returns the client
+   response to destroy in the caller's test. */
+static http_response_t* post_against_canned(const std::string& canned) {
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  EXPECT_GE(listen_fd, 0);
+  std::string seen_body;
+  std::atomic<uint8_t> seen;
+  seen.store(0);
+  std::thread server(fake_server_run, listen_fd, &seen_body, &seen,
+                     canned.c_str());
+  std::string url = "http://127.0.0.1:" + std::to_string(port) + "/v1/chat/completions";
+  http_response_t* r = http_post_json(url.c_str(), NULL, "{}", 3000);
+  EXPECT_NE(r, nullptr);
+  server.join();
+  close(listen_fd);
+  return r;
+}
+
+TEST(TestHttp, TestChunkedMultiChunkBodyDecodes) {
+  /* Three chunks whose boundaries deliberately cut mid-JSON (no alignment
+     with token or CRLF boundaries); the last carries an odd hex size. */
+  const std::string original =
+    "{\"choices\":[{\"message\":{\"content\":\"wave wave wave\"}}],"
+    "\"usage\":{\"total_tokens\":42}}";
+  std::vector<std::string> pieces = {original.substr(0, 19),
+                                     original.substr(19, 37),
+                                     original.substr(56)};
+  ASSERT_EQ(pieces[0].size() + pieces[1].size() + pieces[2].size(),
+            original.size());
+  std::string reply = chunked_reply(pieces, true);
+
+  http_response_t* r = post_against_canned(reply);
+  ASSERT_NE(r, nullptr);
+  ASSERT_NE(r->body, nullptr);
+  EXPECT_EQ(r->status, 200);
+  EXPECT_EQ(r->error, nullptr);
+  EXPECT_EQ(r->body_len, original.size());          /* no trailing CRLF noise */
+  EXPECT_STREQ(r->body, original.c_str());          /* decoded + NUL-terminated */
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestChunkedSizeLineDialects) {
+  /* Dialect field servers may send: the header VALUE capitalised
+     ("Chunked"), uppercase hex sizes, and a parameter on every size line.
+     The decode must still be byte-exact across all of it. */
+  const std::string original = "{\"wave\":[1,2,3,{\"note\":\"deepest\"}]}";
+  std::vector<std::string> pieces = {original.substr(0, 11),
+                                     original.substr(11, 14),
+                                     original.substr(25)};
+  ASSERT_EQ(pieces[0].size() + pieces[1].size() + pieces[2].size(),
+            original.size());
+
+  std::string canned =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+    "Transfer-Encoding: Chunked\r\nConnection: close\r\n\r\n";
+  for (size_t i = 0; i < pieces.size(); i++) {
+    char head[32];
+    snprintf(head, sizeof(head), "%X;wave=go\r\n", (unsigned)pieces[i].size());
+    canned += head;
+    canned += pieces[i];
+    canned += "\r\n";
+  }
+  canned += "0\r\n\r\n";
+
+  http_response_t* r = post_against_canned(canned);
+  ASSERT_NE(r, nullptr);
+  ASSERT_NE(r->body, nullptr);
+  EXPECT_EQ(r->status, 200);
+  EXPECT_EQ(r->error, nullptr);
+  EXPECT_EQ(r->body_len, original.size());
+  EXPECT_STREQ(r->body, original.c_str());
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestChunkedHeaderValueDialects) {
+  /* Header-VALUE dialects around the coding LIST: value capitalised, OWS
+     around the list comma (chunked declared last, as RFC 7230 requires on
+     the chunked-wins rule). Decode must still be byte-exact. */
+  const std::string original = "{\"note\":\"list dialect\"}";
+  std::vector<std::string> pieces = {original.substr(0, 12),
+                                     original.substr(12)};
+  std::string canned =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+    "Transfer-Encoding: gzip , Chunked\r\nConnection: close\r\n\r\n";
+  for (size_t i = 0; i < pieces.size(); i++) {
+    char head[32];
+    snprintf(head, sizeof(head), "%zX\r\n", pieces[i].size());
+    canned += head;
+    canned += pieces[i];
+    canned += "\r\n";
+  }
+  canned += "0\r\n\r\n";
+
+  http_response_t* r = post_against_canned(canned);
+  ASSERT_NE(r, nullptr);
+  ASSERT_NE(r->body, nullptr);
+  EXPECT_EQ(r->status, 200);
+  EXPECT_EQ(r->error, nullptr);
+  EXPECT_EQ(r->body_len, original.size());
+  EXPECT_STREQ(r->body, original.c_str());
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestChunkedMalformedSizeLineFailsClean) {
+  /* "zz" is not a hex size: the client must report a transport failure with
+     the documented shape (status -1, error set, no body) and not crash. */
+  http_response_t* r = post_against_canned(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\nzz\r\n{\"a\":1}\r\n0\r\n\r\n");
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, -1);
+  ASSERT_NE(r->error, nullptr);
+  EXPECT_NE(strstr(r->error, "chunked"), nullptr);
+  EXPECT_EQ(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 0);
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestChunkedTruncatedChunkFailsClean) {
+  /* Chunk size promises 5 bytes of data, the connection closes after 3:
+     unexpected EOF before the terminator is a transport failure, never a
+     silently truncated success. */
+  http_response_t* r = post_against_canned(
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n"
+    "\r\n5\r\nabc");
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, -1);
+  ASSERT_NE(r->error, nullptr);
+  EXPECT_EQ(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 0);
+  http_response_destroy(r);
 }

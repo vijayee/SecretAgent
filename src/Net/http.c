@@ -28,6 +28,13 @@
 //     searched for the header end, the status line and Content-Length are
 //     parsed from it, and the body is read to Content-Length (or, when the
 //     server omits Content-Length with Connection: close, to close).
+//
+// Added beyond the liboffs contract (local proxies answer even non-streaming
+// requests with Transfer-Encoding: chunked):
+//   - chunked body decode after the read: chunk framing
+//     (RFC 7230 §4.1) is peeled off into a contiguous body — chunk
+//     extensions and trailer fields are discarded; malformed framing is a
+//     transport failure exactly like a short Content-Length body.
 
 #include "http.h"
 
@@ -38,6 +45,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <strings.h>
+#include <ctype.h>
 #include <errno.h>
 
 #include <sys/socket.h>
@@ -47,6 +55,10 @@
 
 #define _HTTP_HOST_MAX 256
 #define _HTTP_HEADER_BLOCK_MAX 4096
+/* Absurd-body reject: a decoded (or raw-promised) response body larger than
+   this is treated as a transport failure, never assembled. Model completions
+   are kilobytes; 64 MiB is orders past any real turn. */
+#define _HTTP_BODY_MAX (64u * 1024u * 1024u)
 
 /* ---------------------------------------------------------------- */
 /* Response plumbing                                                */
@@ -229,6 +241,50 @@ static ssize_t _parse_content_length(const char* headers, size_t len) {
   return -1;
 }
 
+/* Case-insensitive scan of the header block for a Transfer-Encoding whose
+   value declares the chunked transfer codings (RFC 7230 §3.3.1): the match
+   tolerates parameters after ';' on the token, surrounding encodings
+   separated by ',', and OWS around those commas (RFC 7230 §3.3.1). When
+   chunked is declared, Content-Length must be ignored — chunked wins by
+   RFC (and by what proxies actually send). */
+static int _parse_chunked(const char* headers, size_t len) {
+  size_t i;
+  for (i = 0; i + 18 < len; i++) {
+    const char* value;
+    const char* end = headers + len;
+    if (strncasecmp(headers + i, "Transfer-Encoding:", 18) != 0) continue;
+    value = headers + i + 18;
+    while (value < end && (*value == ' ' || *value == '\t')) value++;
+    while (value < end) {
+      size_t tok_len;
+      const char* tok = value;
+      while (value < end && *value != ',' && *value != '\r' &&
+             *value != ' ' && *value != '\t') value++;
+      tok_len = (size_t)(value - tok);
+      if (tok_len >= 7 && strncasecmp(tok, "chunked", 7) == 0 &&
+          (tok_len == 7 || tok[7] == ';')) {
+        return 1;
+      }
+      while (value < end && (*value == ',' || *value == ' ' ||
+                             *value == '\t')) value++;
+      if (value >= end || *value == '\r') return 0;
+      if (tok_len == 0) return 0;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/* First CRLF inside [p, search_end), or NULL. All chunked reads are bounded
+   by search_end == end-of-received-data, never past. */
+static const char* _find_crlf(const char* p, const char* search_end) {
+  while (p + 1 < search_end) {
+    if (p[0] == '\r' && p[1] == '\n') return p;
+    p++;
+  }
+  return NULL;
+}
+
 /* Grow the response buffer (get_memory semantics: never a failure return,
    contents carried over). */
 static char* _buf_grow(char* buf, size_t used, size_t need) {
@@ -236,6 +292,78 @@ static char* _buf_grow(char* buf, size_t used, size_t need) {
   memcpy(grown, buf, used);
   free(buf);
   return grown;
+}
+
+/* Decode chunked framing (RFC 7230 §4.1) into a contiguous NUL-terminated
+   buffer. Chunk extensions on a size line and the trailer section after the
+   zero-size chunk are parsed past, contents discarded. Returns NULL on any
+   malformed frame or overflow of _HTTP_BODY_MAX — same failure class as a
+   short Content-Length body; on success *decoded_len carries the body
+   length (the NUL is not counted). */
+static char* _decode_chunked(const char* src, size_t src_len, size_t* decoded_len) {
+  const char* p = src;
+  const char* end = src + src_len;
+  char* decoded = NULL;
+  size_t decoded_used = 0;
+  size_t decoded_cap = 0;
+
+  while (1) {
+    const char* crlf = _find_crlf(p, end);
+    const char* q;
+    size_t digits;
+    char size_text[17];
+    unsigned long long chunk_size;
+
+    if (crlf == NULL) goto malformed;              /* unfinished size line */
+    digits = 0;
+    q = p;
+    while (q < crlf && *q != ';') {                /* hex digits, then ext */
+      if (!isxdigit((unsigned char)*q)) goto malformed;
+      if (digits >= sizeof(size_text) - 1) goto malformed;  /* not a size */
+      size_text[digits++] = *q;
+      q++;
+    }
+    if (digits == 0) goto malformed;               /* empty size line */
+    size_text[digits] = '\0';
+    chunk_size = strtoull(size_text, NULL, 16);
+    p = crlf + 2;
+
+    if (chunk_size == 0) break;                    /* terminator reached */
+
+    if ((size_t)(end - p) < chunk_size) goto malformed;  /* data truncated */
+    if (chunk_size > _HTTP_BODY_MAX ||
+        decoded_used + (size_t)chunk_size > _HTTP_BODY_MAX) {
+      goto malformed;                              /* absurd total body */
+    }
+    if (decoded == NULL) {
+      decoded_cap = (size_t)chunk_size + 1 < 8192 ? 8192 : (size_t)chunk_size + 1;
+      decoded = get_memory(decoded_cap);
+    } else if (decoded_used + (size_t)chunk_size + 1 > decoded_cap) {
+      while (decoded_cap < decoded_used + (size_t)chunk_size + 1) decoded_cap *= 2;
+      decoded = _buf_grow(decoded, decoded_used, decoded_cap);
+    }
+    memcpy(decoded + decoded_used, p, (size_t)chunk_size);
+    decoded_used += (size_t)chunk_size;
+    p += (size_t)chunk_size;
+    if (end - p < 2 || p[0] != '\r' || p[1] != '\n') goto malformed;
+    p += 2;
+  }
+
+  /* Trailer section: header lines until the empty line; content ignored. */
+  while (1) {
+    const char* crlf = _find_crlf(p, end);
+    if (crlf == NULL) goto malformed;              /* unfinished trailer */
+    if (crlf == p) break;                          /* empty line: done */
+    p = crlf + 2;
+  }
+
+  decoded[decoded_used] = '\0';
+  *decoded_len = decoded_used;
+  return decoded;
+
+malformed:
+  free(decoded);
+  return NULL;
 }
 
 http_response_t* http_post_json(const char* url,
@@ -261,6 +389,7 @@ http_response_t* http_post_json(const char* url,
   size_t total = 0;
   size_t header_end = 0;
   ssize_t content_length = -1;
+  int chunked = 0;
   int eof = 0;
   int status = 0;
 
@@ -394,12 +523,13 @@ http_response_t* http_post_json(const char* url,
       header_end = _find_header_end(resp_buf, total);
       if (header_end != 0) {
         content_length = _parse_content_length(resp_buf, header_end);
-        if (content_length >= 0 &&
+        chunked = _parse_chunked(resp_buf, header_end);
+        if (!chunked && content_length >= 0 &&
             total >= header_end + (size_t)content_length) {
           break;
         }
       }
-    } else if (content_length >= 0 &&
+    } else if (!chunked && content_length >= 0 &&
                total >= header_end + (size_t)content_length) {
       break;
     }
@@ -414,8 +544,9 @@ http_response_t* http_post_json(const char* url,
   }
 
   /* A promised Content-Length the server never delivered is a short read —
-     a transport failure, not a truncated success. */
-  if (content_length >= 0 && total < header_end + (size_t)content_length) {
+     a transport failure, not a truncated success. (A chunked response has no
+     promised length to check; framing errors surface in the decode below.) */
+  if (!chunked && content_length >= 0 && total < header_end + (size_t)content_length) {
     free(resp_buf);
     return _http_error_response("http_post_json: short body from %s:%u "
                                 "(expected %zd, got %zu, connection %s)",
@@ -440,6 +571,26 @@ http_response_t* http_post_json(const char* url,
 
   r = get_clear_memory(sizeof(http_response_t));
   r->status = status;
+
+  /* Chunked framing is peeled into a contiguous body here — the caller
+     never learns how the body was framed. A malformed frame (or a decoded
+     body over _HTTP_BODY_MAX) is a transport failure, same class as the
+     short-body rejection above. */
+  if (chunked) {
+    size_t decoded_len;
+    r->body = _decode_chunked(resp_buf + header_end, total - header_end,
+                              &decoded_len);
+    free(resp_buf);
+    if (r->body == NULL) {
+      free(r);
+      return _http_error_response("http_post_json: malformed chunked body from "
+                                  "%s:%u (connection %s)", host, (unsigned)port,
+                                  eof ? "closed" : "timed out");
+    }
+    r->body_len = decoded_len;
+    return r;
+  }
+
   r->body_len = total - header_end;
   if (r->body_len > 0) {
     r->body = get_memory(r->body_len + 1);
