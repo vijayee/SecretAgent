@@ -119,8 +119,11 @@ typedef void (*http_client_completion_fn)(void* ctx, int status,
 
 - Client fd/timeout failures: the completion carries `status=-1` + a heap
   reason string — no new error vocabulary for callers.
-- Server: parse failures answer 400 from the connection layer; handlers return
-  statuses that map to responses (C has no exceptions to launder).
+- Server: parse failures CLOSE the connection (the ported liboffs core has no
+  400 path — pinned as reality by TestStreamsServer.TestMalformedRequestClosesConnection;
+  handlers return statuses that map to responses, and the auth middleware
+  distinguishes missing (401) from wrong (403) Bearer tokens — C has no
+  exceptions to launder).
 - Batch/body caps: the Task-8-era `_HTTP_BODY_MAX`/`_HTTP_READ_MAX` discipline
   carries over to the async client (fail loud, never silent truncation).
 
