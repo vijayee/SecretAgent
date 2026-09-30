@@ -38,6 +38,7 @@ if (BUILD_TESTING)
             test_deque.cpp
             test_scheduler.cpp
             test_refcounter.cpp
+            test_json.cpp
             )
 
     if(SA_HAS_PYTHON)
