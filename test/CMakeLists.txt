@@ -39,6 +39,7 @@ if (BUILD_TESTING)
             test_scheduler.cpp
             test_refcounter.cpp
             test_json.cpp
+            test_http.cpp
             )
 
     # Same CMake-level mirror idiom as the pyrt gate above: frame store tests
