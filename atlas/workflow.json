@@ -55,7 +55,7 @@
       "kind": "leaf",
       "intent": "delivery",
       "status": "planned",
-      "description": "Sessions live as WaveDB subtrees: events at sessions/<sid>/events/<seq>, lineage at meta/parent, depth at meta/depth. Every state mutation is both a store write and a logged event (one atomic batch), so the log is the single source of truth and views (message history, tree) are projections. If cut, agent runs die with the process — no audit trail, no continuity across desktop sessions, and the log-as-safety doctrine never holds.",
+      "description": "Sessions live as WaveDB subtrees: events at sessions/<sid>/events/<seq>, lineage at meta/parent, depth at meta/depth. Every state mutation is both a store write and a logged event (one atomic batch), so the log is the single source of truth and views (message history, tree) are projections. Verified WaveDB facts that shape this slice (docs/wavedb-exploration.md): root batches span subtrees atomically as one WAL_BATCH/txn but must fit wal_config.max_file_size (default 128 KB) in concurrent mode; scan resume is seek-based with half-open bounds (no persistent cursor); lineage queries are per-hop SPO/POS scans (depth-N lineage = N+1); durability at ack is a wal_sync_mode choice (immediate vs 250ms debounce default) chosen by the slice owner; seq keys must be zero-padded for byte-lexical ordering; WaveDB has no cheap subtree-clone primitive, which the lineage-as-pointer (not copy) design avoids. If cut, agent runs die with the process — no audit trail, no continuity, and log-as-safety never holds.",
       "contains": [],
       "requires": [],
       "route": {
