@@ -1,7 +1,7 @@
 {
   "schema": "rp036-atlas-v1",
-  "revision": 2,
-  "lastUpdated": "2026-09-29T12:10:00.000Z",
+  "revision": 3,
+  "lastUpdated": "2026-09-29T20:30:00.000Z",
   "project": {
     "id": "SECRETAGENT",
     "label": "SecretAgent — embeddable agent runtime and its desktop agent",
@@ -18,6 +18,7 @@
       "description": "A synthesis of the best parts of four symlink'd agent harnesses, rebuilt as a portable C library (embeddable in any host language/environment) plus the desktop agent that runs it, with WaveDB as the durable floor. What each donor contributes (design rationale in docs/chat.json): DeepSeek Harness (./deepseek-harness) — the spine: log-is-source-of-truth, the loop, the guarded tool pipeline; Prime Agent (./prime-agent) — the shape: scoped frames, encapsulation, memory hierarchy, /refine; Claude Code (./claude-code-source-code) — the escalation pattern (plan → ask → act); Onyx (./onyx) — the persona: its response instructions distilled into the loadable persona text (the 'hammer' spec, chat.json message 4148) — and WaveDB (pre-existing, done) as the substrate. All work must stay cross-platform (Linux and Windows green) and embeddable; portability is an invariant of every record, not a separate slice. Layer traceability: L0 WaveDB substrate (done), L1 unified log/tree, L2 frame/scope + surface API, L3 the loop, L4 tool pipeline + interpreter-as-a-tool, L5 persona + escalation as loadable text. The extracted liboffs actor runtime (actor, mailbox, scheduler, refcounter, platform shims) and its 58 passing tests are the existing foundation.",
       "contains": [
         "execute-agent-code-without-blocking",
+        "drive-model-driven-frame-tree",
         "remember-session-across-restarts",
         "subdivide-session-into-accountable-agents",
         "run-agent-as-desktop"
@@ -55,9 +56,11 @@
       "kind": "leaf",
       "intent": "delivery",
       "status": "planned",
-      "description": "Sessions live as WaveDB subtrees: events at sessions/<sid>/events/<seq>, lineage at meta/parent, depth at meta/depth. Every state mutation is both a store write and a logged event (one atomic batch), so the log is the single source of truth and views (message history, tree) are projections. Verified WaveDB facts that shape this slice (docs/wavedb-exploration.md): root batches span subtrees atomically as one WAL_BATCH/txn but must fit wal_config.max_file_size (default 128 KB) in concurrent mode; scan resume is seek-based with half-open bounds (no persistent cursor); lineage queries are per-hop SPO/POS scans (depth-N lineage = N+1); durability at ack is a wal_sync_mode choice (immediate vs 250ms debounce default) chosen by the slice owner; seq keys must be zero-padded for byte-lexical ordering; WaveDB has no cheap subtree-clone primitive — forks are lineage pointers + a new subtree (never copies); one WaveDB per process: all frames are subtrees of the single root database. If cut, agent runs die with the process — no audit trail, no continuity, and log-as-safety never holds.",
+      "description": "Sessions live as WaveDB subtrees: events at sessions/<sid>/events/<seq>, lineage at meta/parent, depth at meta/depth. Every state mutation is both a store write and a logged event (one atomic batch), so the log is the single source of truth and views (message history, tree) are projections. RECUT (2026-09-29): the frame-tree slice builds state directly on WaveDB (docs/superpowers/specs/2026-09-29-frame-tree-model-loop-design.md), so this slice is now the kill-and-replay VERIFICATION, not a build: rebuild with a fresh boot, reverse-scan seq restore, replay-derived context, recovery from non-compacted WAL. Sessions live as WaveDB subtrees: events at sessions/<sid>/events/<seq>, lineage at meta/parent, depth at meta/depth. Verified WaveDB facts that shape the verification (docs/wavedb-exploration.md): batch atomicity spans subtrees as one WAL_BATCH/txn (capped by wal_config.max_file_size, 128 KB default); scan resume is seek-based half-open; durability at ack is a wal_sync_mode choice; seq keys zero-padded; lineage = graph SPO/POS per-hop scans; one WaveDB per process (frames = subtrees of the single root database); no clone/snapshot needed (fork = lineage pointer + new subtree). If cut, agent runs die with the process — no audit trail, no continuity, and log-as-safety never holds.",
       "contains": [],
-      "requires": [],
+      "requires": [
+        "drive-model-driven-frame-tree"
+      ],
       "route": {
         "completionEvidence": [
           "A session persists to WaveDB and reconstructs fully (events, lineage, tree projection) after a mid-run process restart",
@@ -67,7 +70,7 @@
         ],
         "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
         "next": [
-          "subdivide-session-into-accountable-agents"
+          "run-agent-as-desktop"
         ],
         "onRejection": "Keep planned and correct only within this slice's boundary (key layout, batch semantics, WAL ordering)."
       }
@@ -78,7 +81,7 @@
       "kind": "leaf",
       "intent": "delivery",
       "status": "planned",
-      "description": "Spawning a subagent opens a child subtree scoped to its own work; the parent exposes state only through a surface API (projections, not raw key access), and children return reports, not transcripts — a parent's view grows by one report per child. The whole tree derives from the event log (lineage pointers), so what every subagent did is reconstructable. This is L2. If cut, jobs stay single-frame: no delegation or parallelism, and any large job floods a single context.",
+      "description": "RECUT (2026-09-29): the frame-tree slice (drive-model-driven-frame-tree) built spawn/report/admission semantics; this slice is now the ACCOUNTABILITY VERIFICATION at tree scale (docs/superpowers/specs/2026-09-29-frame-tree-model-loop-design.md): parent context grows by exactly one report event per child regardless of child work volume; the frame tree derives reconstructably from lineage pointers; no #819-style scoping blind spot (children see inherited ctx only via the resolve walk, never local); compaction stays per-frame. If cut, tree sessions lose accountability guarantees at any real depth/fan-out.",
       "contains": [],
       "requires": [
         "remember-session-across-restarts"
@@ -108,6 +111,7 @@
       "contains": [],
       "requires": [
         "execute-agent-code-without-blocking",
+        "drive-model-driven-frame-tree",
         "remember-session-across-restarts",
         "subdivide-session-into-accountable-agents"
       ],
@@ -122,6 +126,32 @@
         "next": [],
         "onRejection": "Keep planned and correct only within this slice's boundary (client scope, persona module format, escalation gate)."
       }
+    },
+    "drive-model-driven-frame-tree": {
+      "id": "drive-model-driven-frame-tree",
+      "label": "Drive a model-driven frame tree on WaveDB",
+      "kind": "leaf",
+      "intent": "delivery",
+      "status": "in-progress",
+      "description": "The turn loop, one OpenAI-compatible model client (single execute tool, PA-verified single-tool RLM shape), the four bridge verbs as actor behaviors (remember/recall/spawn/report) — in-process, no wire protocol — admission-only spawn/report, frame state as WaveDB subtrees of one root database per process, one atomic root batch per effect (event + state + lineage triples). Design: docs/superpowers/specs/2026-09-29-frame-tree-model-loop-design.md. Absorbs the build that S003/S004 would have front-loaded; S004's accountability invariants and S003's replay proof verify this work rather than building it.",
+      "contains": [],
+      "requires": [
+        "execute-agent-code-without-blocking"
+      ],
+      "route": {
+        "completionEvidence": [
+          "A model-driven session runs end to end from the demo CLI against a configured OpenAI-compatible endpoint (local Ollama), with every effect an atomic root batch (event + state + lineage)",
+          "The four bridge verbs round-trip corr-matched: remember/recall/spawn/report as actor behaviors",
+          "Spawn is admission-only with fail-loud depth validation; children report exactly one event up",
+          "Unit tests drive the full loop with the injected model vtable (no network)",
+          "Cross-platform: Linux green; Windows tracked on slice 1's record"
+        ],
+        "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
+        "next": [
+          "remember-session-across-restarts"
+        ],
+        "onRejection": "Keep in-progress and correct only within this slice's boundary (bridge shapes, loop stop rules, batch composition)."
+      }
     }
   },
   "edges": {
@@ -129,6 +159,10 @@
       {
         "from": "atlas-root",
         "to": "execute-agent-code-without-blocking"
+      },
+      {
+        "from": "atlas-root",
+        "to": "drive-model-driven-frame-tree"
       },
       {
         "from": "atlas-root",
@@ -145,12 +179,24 @@
     ],
     "requires": [
       {
+        "from": "drive-model-driven-frame-tree",
+        "to": "execute-agent-code-without-blocking"
+      },
+      {
+        "from": "remember-session-across-restarts",
+        "to": "drive-model-driven-frame-tree"
+      },
+      {
         "from": "subdivide-session-into-accountable-agents",
         "to": "remember-session-across-restarts"
       },
       {
         "from": "run-agent-as-desktop",
         "to": "execute-agent-code-without-blocking"
+      },
+      {
+        "from": "run-agent-as-desktop",
+        "to": "drive-model-driven-frame-tree"
       },
       {
         "from": "run-agent-as-desktop",
@@ -163,13 +209,14 @@
     ]
   },
   "references": {
-    "next": 6,
+    "next": 7,
     "byId": {
       "atlas-root": "S001",
       "execute-agent-code-without-blocking": "S002",
       "remember-session-across-restarts": "S003",
       "subdivide-session-into-accountable-agents": "S004",
-      "run-agent-as-desktop": "S005"
+      "run-agent-as-desktop": "S005",
+      "drive-model-driven-frame-tree": "S006"
     }
   },
   "lifecycle": {
@@ -192,5 +239,6 @@
     }
   },
   "reviews": [],
-  "unresolvedHistory": []
+  "unresolvedHistory": [],
+  "contains_edges": null
 }
