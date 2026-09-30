@@ -24,8 +24,8 @@ if(MSVC)
   add_compile_options(/experimental:c11atomics)
 endif()
 
-file(GLOB_RECURSE C_SRC "src/*/*.c")
-file(GLOB_RECURSE C_INC "src/*/*.h")
+file(GLOB_RECURSE C_SRC CONFIGURE_DEPENDS "src/*/*.c")
+file(GLOB_RECURSE C_INC CONFIGURE_DEPENDS "src/*/*.h")
 
 include(CTest)
 add_subdirectory(deps)
@@ -63,12 +63,18 @@ endif()
  # Streams/http transport family port (src/Streams + its src/Util, src/Buffer,
  # src/Platform closure). The C_SRC glob above picks the ported sources up
  # globally; when the gate is OFF they are excluded the same way the Python
- # layer is, so an OFF build stays sans streams.
+ # layer is, so an OFF build stays sans streams. The regexes anchor on the
+ # absolute source root because file(GLOB_RECURSE) returns absolute paths and
+ # the unanchored forms were matching mid-path (a future non-streams
+ # src/Buffer/<anything>/file.c — or any deeper path carrying a gate component
+ # inside its name) would otherwise be silently dropped from OFF builds.
 if(NOT SA_ENABLE_STREAMS)
-  list(FILTER C_SRC EXCLUDE REGEX "src/Streams/|src/Buffer/")
-  list(FILTER C_SRC EXCLUDE REGEX "src/Util/(vec|validation|error|bcrypt)\\.c$")
   list(FILTER C_SRC EXCLUDE
-    REGEX "src/Platform/(platform_random|platform_file|platform_socket)\\.c$")
+    REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/src/(Streams|Buffer)/")
+  list(FILTER C_SRC EXCLUDE
+    REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/src/Util/(vec|validation|error|bcrypt)\\.c$")
+  list(FILTER C_SRC EXCLUDE
+    REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/src/Platform/(platform_random|platform_file|platform_socket)\\.c$")
 endif()
 
 # WaveDB: the durable floor (embedded HBTrie/MVCC/WAL/subtree store). Built
@@ -144,7 +150,9 @@ if(SA_ENABLE_WDB)
   set(_wdb_alias_syms ${_wdb_alias_dir}/family-shared.syms)
   set(_wdb_alias_archive ${_wdb_alias_dir}/libwavedb-alias.a)
   file(WRITE ${_wdb_alias_syms}
-"get_memory wavedb_get_memory
+"error_create wavedb_error_create
+error_destroy wavedb_error_destroy
+get_memory wavedb_get_memory
 get_clear_memory wavedb_get_clear_memory
 log_add_callback wavedb_log_add_callback
 log_add_fp wavedb_log_add_fp
@@ -316,11 +324,10 @@ if(SA_ENABLE_STREAMS)
   target_link_libraries(secretagent PUBLIC pthread)
   add_dependencies(secretagent poll-dancer-ext)
 
-  # The ported streams/Buffer family files live in their own dirs; the
-  # C_SRC/C_INC glob already carries src/Buffer/buffer.h, and the HTTP core
-  # reaches it as "../Buffer/buffer.h", but make the Buffer include dir
-  # explicit here so the ported sources also compile against it directly.
-  target_include_directories(secretagent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/Buffer)
+  # The ported streams sources reach src/Buffer/buffer.h as
+  # "../Buffer/buffer.h"; the Buffer include dir itself already rides the
+  # C_INC glob passed to target_include_directories above, so no explicit
+  # include path is added here.
 
   # The ported http_connection/http_server include <openssl/ssl.h>
   # unconditionally (TLS connections are part of the copied core), so the
