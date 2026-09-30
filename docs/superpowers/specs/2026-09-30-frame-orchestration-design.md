@@ -1,7 +1,7 @@
 # Frame Orchestration — Design
 
 **Date:** 2026-09-30
-**Status:** agreed with owner in session (sections approved inline; the mechanics below — pool attachment, turn-state fields, message set — were resolved from the code by the planning pass, recorded here as decisions)
+**Status:** agreed with owner in session (sections approved inline; the mechanics below — pool attachment, turn-state fields, message set — were resolved from the code by the planning pass, recorded here as decisions). AMENDED 2026-09-30 by the owner before implementation: the WaveDB root is wrapped in a store actor — *"this suggests we need to wrap wavedb in an actor therefore serializing writes and reads and eliminating the need for locks"* — which REPLACES §5's per-frame write-lock decision (the original §5 decision and the consequences the owner approved are recorded in the rewritten §5).
 **Atlas slice:** `drive-model-driven-frame-tree` milestone (spawned frames actually run, fully event-driven); folds in `subdivide-session-into-accountable-agents`' verification assertions and closes `remember-session-across-restarts` as evidence-only.
 **Predecessor spec:** docs/superpowers/specs/2026-09-30-liboffs-streams-port-design.md (transport shape — "posting completions into an owner actor's mailbox is the documented extension point"; THIS slice builds that glue).
 
@@ -66,8 +66,11 @@ frame_start ──▶ FRM_TURN ─┬─▶ derive ─▶ submit model ─phase=
 Every arrow above is a **mailbox dispatch or a repost** — never a wait. The actor yields
 to its scheduler pool between phases; a pool worker picks it up again when the next
 arrival lands in the mailbox (model completion, PYRT_RESULT, child report). The derive
-is unchanged (stateless projection from the store, bounded caps — nothing accumulates in
-engine memory), which is what makes any arrival order benign: whichever dispatch runs
+itself is one MORE store round trip (§5): the FRM_TURN step posts the bounded events scan
+(`FRAME_PHASE_STORE`), yields; the `FRM_STORE_REPLY` router parses the materialized
+records and runs the projection + submit in that same dispatch. The projection is
+unchanged (stateless, from the store, bounded caps — nothing accumulates in engine
+memory), which is what makes any arrival order benign: whichever dispatch runs
 last re-derives from the store and sees everything.
 
 ### Engine state (frame_t additions, single-writer via mailbox dispatch)
@@ -78,11 +81,24 @@ typedef enum frame_phase_e {
   FRAME_PHASE_NONE = 0,   /* between steps (a step just ran / engine not started) */
   FRAME_PHASE_MODEL,      /* an async model submit is in flight */
   FRAME_PHASE_CELL,       /* the turn's one cell is in flight */
+  FRAME_PHASE_STORE,      /* a store round trip is in flight (§5: the derive
+                             scan, the awaited cell.run commit, the finish batch) */
   FRAME_PHASE_CHILDREN,   /* yielded: live children; the engine resumes on FRM_CHILD_REPORT */
 } frame_phase_e;
+/* What the pending FRAME_PHASE_STORE round trip is for: */
+typedef enum frame_store_kind_e {
+  FRAME_STORE_DERIVE = 1,   /* the bounded events scan; the reply runs the projection */
+  FRAME_STORE_CELL_RUN,     /* the cell.run audit commit; the reply dispatches
+                               FRM_CELL_EXECUTE (no untracked cell may ever run) */
+  FRAME_STORE_FINISH        /* msg.append (+ meta/status=done for a top frame) in one
+                               batch; the reply ends the engine (top) or drives the
+                               child's report bind (child) */
+} frame_store_kind_e;
 /* frame_t gains: */
 uint8_t        engine_live;    /* 1 between frame_start and a terminal step */
 frame_phase_e  phase;
+frame_store_kind_e store_kind; /* routing of the pending FRAME_PHASE_STORE reply */
+uint64_t       store_corr;     /* the frame's own round-trip key for that reply */
 unsigned       turns_issued;   /* model turns issued THIS RUN (cap check) */
 uint8_t        model_retries;  /* consecutive failed-model calls (retry-once is per call) */
 uint8_t        engine_failed;  /* the last terminal step failed (frame_run_loop's rc) */
@@ -101,6 +117,13 @@ slice's business, recorded as a known limit.
 FRM_TURN,          /* engine -> itself: the scheduled turn-step continuation (payload NULL) */
 FRM_MODEL_RESULT,  /* transport -> frame: the model completion arrived (frm_model_payload_t) */
 FRM_CHILD_REPORT   /* child -> parent: this child's engine is terminal (frm_child_report_payload_t) */
+/* The store vocabulary (Section 5 — all types owned by frame_messages.h): */
+FRM_STORE_BATCH,   /* any frame thread -> store actor: one atomic op list (frm_store_batch_payload_t) */
+FRM_STORE_SCAN,    /* -> store actor: bounded reverse range read (frm_store_scan_payload_t) */
+FRM_STORE_RECALL,  /* -> store actor: the lineage resolve walk (frm_store_recall_payload_t) */
+FRM_STORE_REPLY,   /* store actor -> requester: corr-matched result (frm_store_reply_payload_t) */
+FRM_REPORT_BIND    /* child frame actor -> parent frame actor: compose the cross-subtree
+                      report batch there (frm_report_bind_payload_t; Section 5) */
 ```
 
 ```c
@@ -111,10 +134,11 @@ FRM_CHILD_REPORT   /* child -> parent: this child's engine is terminal (frm_chil
    thread. Ownership of body/error transfers to the frame behavior. */
 typedef struct frm_model_payload_t { int status; char* body; size_t body_len; char* error; } frm_model_payload_t;
 /* child terminal: the parent re-schedules its engine. The parent-side log
-   binding ALREADY happened (in the child's report batch, under the parent's
-   write lock — see §5), so this payload is bookkeeping only: which child
-   ended, and whether to log the resume loudly (the failed flag — the parent's
-   thread still logs the failure even though the binding already landed). */
+   binding ALREADY happened (the child's report bind batch was confirmed
+   committed by the store actor's reply BEFORE this message is posted — see
+   §5), so this payload is bookkeeping only: which child ended, and whether
+   to log the resume loudly (the failed flag — the parent's thread still
+   logs the failure even though the binding already landed). */
 typedef struct frm_child_report_payload_t { char* child_sid; uint8_t failed; } frm_child_report_payload_t;
 ```
 
@@ -269,10 +293,12 @@ The engine's terminal step (`_frame_engine_terminate(f, ok, text)`):
 - TOP frame failure: no status change — `frame_is_done` stays 0 (TestTurnLimitFailsLoud's
   pinned "the cap is a failure, not completion").
 - CHILD (any terminal kind — report verb, quiet content end, or failure): if the frame is
-  not already done, ONE `frame_report(f, text)` binds the outcome (child's own
-  `frame.report` event + status done + the parent-bound report event — the existing
-  one-atomic-batch shape), then ONE `FRM_CHILD_REPORT{child_sid, failed}` on the parent's
-  mailbox: the parent's engine resumes.
+  not already done, ONE `FRM_REPORT_BIND` to the parent's actor (§5): the parent composes
+  ONE atomic batch (the child's `frame.report` event at the child's pre-allocated seq +
+  the child's status→done + the bound report event) and the store actor's reply routes
+  back to the CHILD, whose router posts ONE `FRM_CHILD_REPORT{child_sid, failed}` on the
+  PARENT's mailbox: the parent's engine resumes only after the binding is CONFIRMED
+  committed (stronger than racing it).
 
 Consequent semantics changes (each a deliberate recut of loop.c's REPORT SEMANTICS
 comment, which predates running children):
@@ -306,22 +332,158 @@ resumed between spawn and child-done carries no live-children count — its engi
 restarted) ends on its next content turn and any disk-"running" children stay
 unresumed. The restart/reconcile slice (re-linking lineage parents) owns it.
 
-## 5. Cross-frame write discipline (resolved mechanics)
+## 5. The store actor: WaveDB behind one mailbox (owner amendment, supersedes the per-frame write lock)
 
-With pool-parallel frames, a child's report batch writes into the PARENT's subtree and
-bumps `parent->seq` from the child's worker while the parent's own worker may be writing
-events. WaveDB handles concurrent batches (concurrent mode exists for exactly this), but
-the in-memory seq counter and event-key uniqueness are frame-local state.
+**Amendment (owner, 2026-09-30, verbatim):** *"this suggests we need to wrap wavedb in an
+actor therefore serializing writes and reads and eliminating the need for locks."* The
+original §5 (one `platform_mutex_t* write_lock` per frame, taken in lineage order) is
+SUPERSEDED and its consequences were reviewed and approved by the owner in session.
 
-**Decision: one `platform_mutex_t* write_lock` per frame, taken for every event-bearing
-write THE FRAME'S LOG RECEIVES — wherever the frame whose log it is.** Specifically:
-`_frame_event_write` / `_frame_remember_variant` take the frame's own; `frame_spawn` takes
-the parent's (spawn event + parent seq; the child's birth meta is a fresh subtree, no
-writers yet); `frame_report` takes BOTH (child's first, then the parent's ancestor —
-lock order is `the log's frame, then its lineage ancestors upward`, which is acyclic on a
-tree, so no deadlock exists). Held across the sync batch (µs–ms); the uncontended inline
-path (every existing test) pays one uncontended mutex per effect. Locks are created in
-`_frame_alloc`/`frame_resume`, freed in `frame_destroy`.
+**Decision: `wave_database_root_t` becomes an actor-owned store.** Its behavior executes
+store operations — batches, the bounded events scan, the recall resolve walk — ONE
+message at a time on the store actor's own thread (a pool worker, or the driver's thread
+for the inline shape). Serialization comes from being ONE actor: no
+platform_mutex/rwlock/barrier anywhere in the frame layer, no lock-order discipline to
+document or deadlock-audit.
+
+Structure (`wave_database_root_t`, still opaque in frame.h, defined in frame.c):
+
+```c
+struct wave_database_root_t {
+  actor_t store_actor;        /* FIRST member (house rule: actor states lead with actor_t) */
+  database_t* db;             /* the ONE root database */
+  graph_layer_t* lineage;     /* subtree-mode graph layer over lineage_st */
+  database_subtree_t* lineage_st;  /* reserved "lineage" subtree (open for life) */
+  uint32_t rng;               /* xorshift32 state for sid randomness */
+  ATOMIC(uint64_t) counter;   /* sid uniqueness counter */
+  scheduler_pool_t* store_pool;  /* BORROWED; NULL = inline (tests/demo pump by hand) */
+};
+```
+
+It is not refcounted (it is a process-wide root with explicit open/close), so the
+refcounter-first rule does not apply; the actor-first rule does, and is met by
+`store_actor` as the first member. `wave_db_open` becomes a thin wrapper over the new
+`wave_db_open_config` (location + store pool) — the store actor's init/destroy IS the
+`wave_db_open/close` lifecycle: `wave_db_open_config` runs today's existing
+`database_create_with_config` shape (same config, `sync_only=0`, fail-loud on failure)
+unchanged, then `actor_init(&root->store_actor, root, _store_behavior, store_pool)`;
+`wave_db_close` runs `actor_destroy(&root->store_actor)` first (queues retire pending
+payloads; the IDLE/RUNNING waits break out for inline and stopped pools), then the
+existing graph/subtree/db teardown. The dual-driver rule applies to the store actor too:
+NULL pool = inline, hand-pumped by tests/demos (`wave_db_pump`, which refuses loud on a
+pooled store); a producer pool is carried/borrowed exactly like the frame pool of §2.
+
+### Message contracts (frame_messages.h owns the payload structs + destroyers)
+
+```c
+typedef struct frm_store_op_t { char* key; uint8_t* value; size_t value_len; } frm_store_op_t;
+/* one put; key/value heap, OWNERSHIP transfers with the payload */
+
+typedef struct frm_store_batch_payload_t {
+  frm_store_op_t* ops; size_t nops;   /* OWNED; consumed by the store behavior */
+  const char* op_name;                /* BORROWED label for the store worker's loud log */
+  actor_t* reply_to;                  /* BORROWED; NULL = fire-and-post (audit/control
+                                         writes whose commitment nothing waits on) */
+  uint64_t corr;                      /* the requester's round-trip key (0 = fire-and-post) */
+} frm_store_batch_payload_t;
+
+typedef struct frm_store_scan_payload_t {
+  char* start; char* end;             /* OWNED absolute root-level bounds */
+  size_t limit;                       /* newest-record cap (SA_FRAME_DEBUG_MAX_EVENTS) */
+  actor_t* reply_to; uint64_t corr;
+} frm_store_scan_payload_t;
+
+typedef struct frm_store_recall_payload_t {
+  char* key; char* sid_path;          /* OWNED; the resolve walk's start */
+  unsigned max_hops;                  /* the frame's depth budget */
+  actor_t* reply_to; uint64_t corr;
+} frm_store_recall_payload_t;
+
+/* The round-trip result (store -> requester; the ROUTER on the requester's
+   actor decides what to do with it). rc = 0 committed / the store's refusal
+   code. `records` carries the MATERIALIZED RAW record texts (heap, ascending
+   seq order) for scans and the recall-walk resolution (n == 1 or 0); batch
+   replies carry n == 0. The store worker does NOT parse JSON — payload
+   decision (resolved from the code): the derive's records are raw texts, the
+   FRM_STORE_REPLY router on the frame parses each (µs-scale, bounded 512)
+   into the DOM the projection already consumes. Raw texts are honest (the
+   store deals in store values, not app JSON) and the cheap side of the
+   parse/serialize trade (serializing a DOM into an array on the store worker
+   would parse-then-serialize every record; raw copy is one memcpy per
+   record). Unparseable raw records are dropped LOUD by the router. */
+typedef struct frm_store_reply_payload_t {
+  uint64_t corr; int rc; size_t n; char** records;   /* records; OWNED */
+} frm_store_reply_payload_t;
+
+/* child frame actor -> parent frame actor: COMPOSE THE CROSS-SUBTREE REPORT
+   BATCH THERE (the parent's actor pre-allocates the parent's seq — see the
+   seq discipline below). All heap strings OWNED by the payload.
+   engine_driven (the terminate path) routes the FRM_CHILD_REPORT resume. */
+typedef struct frm_report_bind_payload_t {
+  actor_t* reply_to;         /* BORROWED: the CHILD's actor gets the store reply */
+  uint64_t corr;             /* the child's own store round-trip key */
+  uint64_t bridge_corr;      /* the cell's bridge corr, or 0 when not cell-side */
+  uint8_t engine_driven;     /* 1 = the child posts FRM_CHILD_REPORT on the reply */
+  char* child_sid;           /* owned */
+  uint64_t child_seq;        /* the child's pre-allocated seq */
+  char* child_event_text;    /* owned; the child's OWN frame.report record JSON */
+  char* text;                /* owned; the report text (the parent re-composes its bound event) */
+} frm_report_bind_payload_t;
+```
+
+### Seq discipline (the lock's replacement)
+
+Every `f->seq` stays in its own frame actor, single-threaded — no lock, no atomic:
+
+- **Seq numbers are PRE-ALLOCATED at compose time** (the frame reads `f->seq`, allocates
+  `seq = f->seq + 1`, and writes `f->seq = seq` on its own actor thread — this is the
+  owner-approved "the originating frame actor(s) pre-allocate their seq counters").
+- The composing frame of a cross-subtree effect allocates ONLY its own seq: in a report
+  bind, the CHILD's actor allocates `child_seq` and composes the child's own record; the
+  PARENT's actor (receiving `FRM_REPORT_BIND`) allocates the parent's seq and composes the
+  WHOLE batch (child's record + child status=done + the parent's bound event) before
+  posting `FRM_STORE_BATCH` with `reply_to =` the child's actor. One composer per batch;
+  every seq allocated in its own actor; the batch is ONE atomic root
+  `database_batch_sync_raw` — wave_spawn admission, join, remember, events, status writes
+  that span a fresh child subtree stay composed by the (single-live-writer) spawning
+  frame exactly as today.
+- **On a store rejection** the allocated numbers are abandoned: the frame's reply handler
+  attempts a best-effort ROLL-BACK (`if (f->seq == abandoned) f->seq = abandoned - 1;` —
+  exact when the frame was single-flight, which restores today's no-gap discipline
+  whenever there is no concurrent compose) and logs loud when a gap must stay. No store
+  state half-applies (the batch is atomic); only the counter may carry a gap, never a
+  wrong key.
+- Structural single-flight: the engine is one turn step at a time (one awaited batch per
+  phase change); bridge verbs (remember/recall) and PYRT_RESULT's cell.result post
+  corr-scoped batches that do not await — FIFO at the store means a frame's composes never
+  reuse a seq: bump-at-compose handles even overlapped batches from one frame's dispatches.
+
+### Reads
+
+- **The derive's bounded events scan and the recall resolve walk ARE store messages**
+  (`FRM_STORE_SCAN` / `FRM_STORE_RECALL`) — serialized reads, FIFO-ordered with the
+  writes, so a derive can never observe an uncommitted-then-reordered future. The
+  from-cells remember/recall round trips ride the EXISTING py-agent bridge wait pattern
+  (bounded pure-drain wait on the pyrt thread) — the store actor is their reply source
+  now: the frame's behavior composes and posts the store message INSTEAD of answering
+  synchronously, and the `FRM_STORE_REPLY` router answers the corr through the bridge sink.
+- Two DELIBERATE carve-outs, documented as such: `_frame_restore_seq` (frame_resume boot,
+  before any engine on that frame exists) and `frame_debug_events` (test/debug accessor,
+  called between runs) keep their direct root-level scans — both are WaveDB
+  concurrent-mode-shaped reads, never an engine's causal read. `frame_is_done` keeps its
+  direct meta/status read: the engine's use is advisory (its causal truth is the
+  store-serialized derive; a store-FIFO derive always sees the report a `frame_is_done`
+  check could lag behind), and the public API keeps its sync contract.
+- **The synchronous public API (`frame_recall` / `frame_remember_local` /
+  `frame_remember_ctx` / `frame_append_msg` / `frame_spawn` / `frame_report` /
+  `frame_join`) stays synchronous by PUMPING, not by locking:** on an inline store actor
+  the direct caller composes, posts, and pump-waits (bounded, corr-matched, the same
+  shape `_frame_cell_wait` runs) — tests keep every existing call site unchanged. On a
+  POOLED store the synchronous API refuses loud: production's pooled store is actor-paced,
+  and mixing an arbitrary caller's thread into pool-driven serialization would re-open the
+  lock question. A pooled FRAME therefore REQUIRES a pooled store — enforced loud at
+  `frame_create`/`frame_resume` (a pooled frame whose root store is inline could post into
+  a mailbox nobody pumps, i.e. a hang posing as an API call).
 
 ## 6. The synchronous driver keeps working (compat contract)
 
@@ -333,7 +495,9 @@ int frame_run_loop(frame_t* f);
 /* 0 = clean end-of-run; 1 = failed loud (engine_failed); 2 = yielded awaiting
    children (live); the pump deadlines: FRAME_PHASE_CELL stays
    SA_LOOP_CELL_WAIT_MS (60000), FRAME_PHASE_MODEL gains SA_LOOP_MODEL_WAIT_MS
-   (300000 — a config-slow model's own timeout + slack must fit under it). */
+   (300000 — a config-slow model's own timeout + slack must fit under it),
+   FRAME_PHASE_STORE gains SA_LOOP_STORE_WAIT_MS (30000 — a store round trip
+   is µs–ms; a breaking deadline is a loud store stall, never a hang). */
 ```
 
 Contract: existing scripted (sync) backends drive the same engine inline — every current
@@ -373,18 +537,28 @@ slice's interrupt story covers hung cells with interrupt). Escalated below.
 - A process-default scheduler pool (Section 2 — escalated deliberately).
 - Frame-side timer/watchdog facilities for pooled cells (Section 6 — escalated).
 
-## Escalations for the owner (open)
+## Escalations for the owner
 
-1. **Quiet-completion reports for children** (ends loop.c's "dangling running child"
-   behavior): a child that answers content and never calls actor.report now reports its
-   content implicitly. Alternative: an explicit "child ended quietly" control bound into
-   the parent. Both resume the parent; the difference is only the parent-facing text.
-2. **No process-default pool**: every embedding caller that wants event-driven frames
-   creates a scheduler pool and hands it in via `frame_config_t`. If the desktop slice
-   wants a default, it is an additive later field.
-3. **Pooled engine has no cell watchdog** (a hung cell hangs that frame's turn, silently —
-   loudly logged only at frame_destroy). Accept for this slice, or pull interrupt wiring
-   forward?
+1. **Quiet-completion reports for children** — RESOLVED in this slice's plan (the owner
+   approved the event-driven resume shape; Tasks 3/5/6 implement the content-end report +
+   resume). Recorded here rather than silently dropped: a child that answers content and
+   never calls actor.report reports its content implicitly.
+2. **No process-default pool** — still open/deliberate: every embedding caller that wants
+   event-driven frames creates a scheduler pool and hands it in via `frame_config_t` and
+   `wave_db_open_config` (the store pool rides the same caller decision). If the desktop
+   slice wants defaults, they are additive later fields.
+3. **Pooled engine has no cell watchdog** — still open (a hung cell hangs that frame's
+   turn, silently — loudly logged only at frame_destroy). Accept for this slice, or pull
+   interrupt wiring forward?
+4. **Atlas validator completion lifecycle** — recorded in §7: `completed` only if the
+   validator accepts without a review record; otherwise the node stays `in-progress` with
+   its evidence text and the validator gate noted — never a faked review record.
+
+Additional consequences of §5's amendment the owner should glance at (recorded decisions,
+not blockers): pre-allocated seq numbers may leave a key GAP in `events/` after a store
+rejection (best-effort roll-back collapses the single-flight case; never a wrong key);
+the synchronous frame API (`frame_recall`, `frame_spawn`, …) requires an inline store
+actor and refuses loud against a pooled one.
 
 ## Risks
 
@@ -394,6 +568,12 @@ slice's interrupt story covers hung cells with interrupt). Escalated below.
 - actor_send from the streams loop thread under backpressure has mute paths (a fast model
   + slow parent can pressure a mailbox): the engine's re-posts are one-message-per-arrival,
   bounded by the model's own turn cadence — no runaway queuing to flag beyond a note.
-- The write lock holds a sync batch — the documented write-path bar is ~1 ms; WAL batches
-  on this path are µs-to-ms; a compaction-sized batch hitting frame_report would exceed it —
-  the spawn/report batch caps (SA_FRAME_MAX_BATCH_BYTES) bound exactly this.
+- Store round trips add dispatch hops to the sync paths tests exercise (a bridge verb's
+  answer is now store-reply-routed): every inline driver (frame_run_loop,
+  `_frame_cell_wait`, the direct pump-waits) pumps frame, then live ancestors, then the
+  inline store actor in ONE cycle, so round trips stay completion-in-one-pump — the plan's
+  tests re-run at every step first.
+- Bounded-wait consumers (py_agent's SA_PY_AGENT_WAIT_MS, the engine's phase deadlines,
+  the direct sync API's pump) must each cover the store round trip's µs–ms latency — the
+  existing bounds (30 s+, minutes elsewhere) dwarf it; a store WAL stall shows up as a
+  loud deadline break, not a hang, and the store worker's own log carries the refusal.
