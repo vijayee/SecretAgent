@@ -136,6 +136,43 @@ void py_agent_note_reply(uint64_t corr, uint8_t status, const char* text) {
             (unsigned long long)corr, (unsigned)status, text ? text : "(no text)");
 }
 
+/* The JSON encoding of a python value (heap C string): every remember value
+   is JSON-encoded at the python boundary — the store contract is JSON
+   documents, and a bare python string ('wave') would be refused by the
+   frame's remember validation. The interpreter's own json.dumps encodes
+   containers/bools/None correctly (repr's 'True' is not JSON); failures
+   propagate as exceptions. Caller frees. */
+static char* _py_agent_json_of(PyObject* obj) {
+  PyObject* json_mod = PyImport_ImportModule("json");
+  if (json_mod == NULL) return NULL;
+  PyObject* dumped = PyObject_CallMethod(json_mod, "dumps", "O", obj);
+  Py_DECREF(json_mod);
+  if (dumped == NULL) return NULL;
+  const char* utf = PyUnicode_AsUTF8(dumped);
+  if (utf == NULL) {
+    Py_DECREF(dumped);
+    return NULL;
+  }
+  char* out = strdup(utf);   /* strdup precedes any DECREF: dumped owns the buffer */
+  Py_DECREF(dumped);
+  if (out == NULL) PyErr_NoMemory();
+  return out;
+}
+
+/* The python value of a JSON document string (new reference): the mirror of
+   _py_agent_json_of on the recall path. On a parse failure returns the raw
+   text as a python str instead (defensive — the store only writes JSON, so
+   this branch should never fire). */
+static PyObject* _py_agent_json_load(const char* text) {
+  PyObject* json_mod = PyImport_ImportModule("json");
+  if (json_mod == NULL) return NULL;
+  PyObject* loaded = PyObject_CallMethod(json_mod, "loads", "s", text);
+  Py_DECREF(json_mod);
+  if (loaded != NULL) return loaded;
+  PyErr_Clear();
+  return PyUnicode_FromString(text);
+}
+
 /* -------------------------- request round-trip --------------------------- */
 
 typedef enum py_agent_wait_rc_e {
@@ -297,10 +334,12 @@ static char* _py_agent_text_of(PyObject* obj) {
 
 /* remember(key, value) -> bool.
 
-   `value` is the JSON text stored verbatim under key (str taken as-is,
-   anything else coerced through repr, see _py_agent_text_of). Bridges to
-   FRM_REMEMBER; the frame's durable-ctx remember runs on the frame's
-   dispatch thread and answers corr-matched through the sink. */
+   `value` is encoded with the interpreter's json.dumps at the boundary (a
+   bare python str 'wave' stores as the JSON string "wave"; containers and
+   bools/None encode the same way) — the python surface speaks python, the
+   store contract is JSON. Bridges to FRM_REMEMBER; the frame's durable-ctx
+   remember runs on the frame's dispatch thread and answers corr-matched
+   through the sink. */
 static PyObject* _py_agent_remember(PyObject* self, PyObject* args) {
   (void)self;
   PyObject* key_o = NULL;
@@ -310,7 +349,7 @@ static PyObject* _py_agent_remember(PyObject* self, PyObject* args) {
   }
   char* key = _py_agent_text_of(key_o);
   if (key == NULL) return NULL;
-  char* value = _py_agent_text_of(val_o);
+  char* value = _py_agent_json_of(val_o);
   if (value == NULL) {
     free(key);
     return NULL;
@@ -340,13 +379,14 @@ static PyObject* _py_agent_remember(PyObject* self, PyObject* args) {
   Py_RETURN_FALSE;
 }
 
-/* recall(key) -> str | None.
+/* recall(key) -> value | None.
 
    Bridges to FRM_RECALL; a delivered success carries the resolved raw JSON
-   text, which is returned as a python string. Unresolvable key (status 1),
-   send failure, and the bounded-wait timeout all answer None — a failed
-   lookup is never distinguished from a lost reply by the return value (the
-   loud log on the reply path carries that story). */
+   text, decoded back to the python value it was remembered as (the mirror
+   of remember's dumps — a bare str round trips as bare str). Unresolvable
+   key (status 1), send failure, and the bounded-wait timeout all answer
+   None — a failed lookup is never distinguished from a lost reply by the
+   return value (the loud log on the reply path carries that story). */
 static PyObject* _py_agent_recall(PyObject* self, PyObject* args) {
   (void)self;
   PyObject* key_o = NULL;
@@ -373,7 +413,7 @@ static PyObject* _py_agent_recall(PyObject* self, PyObject* args) {
       _py_agent_request((uint32_t)FRM_RECALL, rp, frm_remember_payload_destroy,
                         corr, &status, &text);
   if (rc == PY_AGENT_OK && status == 0 && text != NULL) {
-    PyObject* out = PyUnicode_FromString(text);
+    PyObject* out = _py_agent_json_load(text);
     free(text);
     return out;   /* NULL (exception set) propagates the OOM verbatim */
   }

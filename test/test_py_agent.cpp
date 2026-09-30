@@ -205,7 +205,10 @@ static void bridge_run_setup_and_probe(bridge_frame_t* self,
 }
 
 /* remember + recall: corr-matched round-trips through the bridge registry;
-   the probe cell embeds all three answers (two delivered, one unresolvable). */
+   the probe cell embeds all three answers (two delivered, one unresolvable).
+   The value is a BARE python string — the bridge encodes it ('fast' stores
+   as the JSON text "fast") and recall decodes it back, so a live model's
+   natural actor.remember('word', 'wave') round trips as python values. */
 TEST(TestPyAgent, TestRememberRecallCorrMatched) {
   py_agent_init();   /* idempotent; re-mounts after other suites' demounts */
   bridge_frame_t* self = bridge_frame_create(1, NULL);
@@ -213,12 +216,12 @@ TEST(TestPyAgent, TestRememberRecallCorrMatched) {
   bridge_run_setup_and_probe(
       self,
       "import actor\n"
-      "ok = actor.remember('mode', '\"fast\"')\n"
+      "ok = actor.remember('mode', 'fast')\n"
       "got = actor.recall('mode')\n"
       "miss = actor.recall('absent')\n",
       "(ok, got, miss)");
 
-  EXPECT_STREQ(self->results[1]->text, "(True, '\"fast\"', None)");
+  EXPECT_STREQ(self->results[1]->text, "(True, 'fast', None)");
 
   /* Three requests reached the owner; each carried heap-copies of the
      python-heap strings and its own correlation id. */
