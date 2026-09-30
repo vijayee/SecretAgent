@@ -2,6 +2,7 @@
 // Created by victor on 10/12/25.
 //
 #include "stream.h"
+#include "streams_messages.h"
 #include "../Buffer/buffer.h"
 #include "../Util/allocator.h"
 #include "../Util/log.h"

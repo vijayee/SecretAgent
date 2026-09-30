@@ -322,42 +322,6 @@ if(SA_ENABLE_STREAMS)
   # explicit here so the ported sources also compile against it directly.
   target_include_directories(secretagent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/Buffer)
 
-  # Family API drift accommodation (recorded in the port commit): liboffs's
-  # streams.c / http_request.c / http_connection.c / http_server.c take their
-  # stream-actor and HTTP message-type constants (READABLE_*, STREAM_*,
-  # HTTP_CONNECTION_*, HTTP_SERVER_*) from liboffs's offs-domain
-  # src/Actor/message.h — one shared application enum catalog that also
-  # includes BlockCache/Network headers. Our frozen src/Actor is the generic
-  # per-module family style (see pyrt_messages.h), and the spec forbids
-  # porting offs domain code, so the 21 constants the ported core uses
-  # internally are supplied here as compile-time constants with the EXACT
-  # values liboffs's message_type_e assigns them (the gaps preserve the
-  # shared catalog's numbering). Only the ported .c files reference these
-  # names, so the scope stays inside this build and no header contract
-  # changes.
-  target_compile_definitions(secretagent PRIVATE
-    READABLE_PUSH=26
-    READABLE_READ=27
-    WRITEABLE_WRITE=29
-    CLOSE_STREAM=30
-    READABLE_PULL=31
-    DEFERRED_DEREF=32
-    STREAM_NOTIFY=47
-    HTTP_CONNECTION_DATA=61
-    HTTP_CONNECTION_READABLE=62
-    HTTP_CONNECTION_HANGUP=63
-    HTTP_CONNECTION_ERROR=64
-    HTTP_CONNECTION_WRITE=65
-    HTTP_CONNECTION_WRITABLE=66
-    HTTP_CONNECTION_CLOSE=67
-    HTTP_SERVER_UPDATE_WATCHER=68
-    HTTP_SERVER_STOP_WATCHER=69
-    STREAM_SUBSCRIBE=76
-    STREAM_UNSUBSCRIBE=77
-    STREAM_PIPE=79
-    STREAM_PIPED=80
-    STREAM_SET_PULLING=82)
-
   # The ported http_connection/http_server include <openssl/ssl.h>
   # unconditionally (TLS connections are part of the copied core), so the
   # streams gate carries a hard OpenSSL requirement — liboffs does the same

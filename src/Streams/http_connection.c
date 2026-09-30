@@ -12,6 +12,7 @@
 #include "../Util/validation.h"
 #include "../Actor/actor.h"
 #include "../Actor/message.h"
+#include "streams_messages.h"
 #include "../Scheduler/scheduler.h"
 #include "../Util/log.h"
 #include <string.h>

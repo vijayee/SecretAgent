@@ -9,6 +9,7 @@
 #include "../Util/allocator.h"
 #include "../Platform/platform.h"
 #include "../Actor/message.h"
+#include "streams_messages.h"
 #include "../Actor/message_queue.h"
 #include "../Util/log.h"
 #include <poll-dancer/poll-dancer.h>
