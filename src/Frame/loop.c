@@ -588,6 +588,11 @@ int frame_run_loop(frame_t* f) {
         json_value_destroy(messages);
         return 1;
       }
+    } else {
+      /* An empty stop (no tool call, no content) still lands in the audit
+         trail as a control event — a turn that writes nothing must never
+         vanish from the record. The model chose to stop: the frame ends. */
+      _loop_control(f, "empty-turn", NULL);
     }
     model_reply_destroy(reply);
     json_value_destroy(messages);

@@ -401,6 +401,52 @@ TEST(TestLoop, TestTurnLimitFailsLoud) {
   wave_db_close(db);
 }
 
+TEST(TestLoop, TestSilentEmptyTurnLeavesControlTrail) {
+  /* A reply with neither a tool call nor content (reasoning models stop
+     like this) must NOT vanish: the turn still lands in the audit trail
+     as a control event, then the top frame completes as done. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "go quiet", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::vector<std::string> replies = {
+      R"json({"choices":[{"message":{"role":"assistant","content":""}}]})json"};
+  scripted_model_t sm;
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  bool saw_empty_turn = false;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "control")) {
+      json_value_t* p = json_get(rec, "payload");
+      if (p != NULL && json_get(p, "kind") != NULL &&
+          strcmp(json_as_string(json_get(p, "kind")), "empty-turn") == 0) {
+        saw_empty_turn = true;
+      }
+    }
+  }
+  EXPECT_TRUE(saw_empty_turn) << "an empty stop must be visible in the audit trail";
+  EXPECT_EQ(frame_is_done(f), 1) << "the model chose to stop — the frame ends done";
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 #endif /* python gate */
 
 /* --- restart/replay (also carries the plan's S003 acceptance): a real
