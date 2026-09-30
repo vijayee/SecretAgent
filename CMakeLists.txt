@@ -11,6 +11,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # test executable.
 option(SA_BUILD_TESTS "Build SecretAgent test binaries" ON)
 
+# Declared before add_subdirectory(deps) so deps/CMakeLists.txt can gate the
+# in-tree http_parser static library on the same switch the root uses for the
+# poll-dancer ExternalProject (see the streams block below the WaveDB one).
+option(SA_ENABLE_STREAMS "Build the streams/http transport (requires deps/poll-dancer, deps/http-parser)" ON)
+
 # MSVC does not enable C11 <stdatomic.h> by default — the atomic_compat.h header
 # in this project includes it unconditionally, so the /experimental:c11atomics
 # flag is required on MSVC builds. Other compilers ship <stdatomic.h> by default.
@@ -215,6 +220,56 @@ if(SA_ENABLE_WDB)
   if(OpenSSL_FOUND)
     target_link_libraries(secretagent PUBLIC OpenSSL::Crypto)
   endif()
+endif()
+
+# poll-dancer: the IO event loop (epoll/kqueue/iocp) the streams/http
+# transport runs on. Built from the pinned submodule via ExternalProject
+# (same pattern as wavedb-ext). Backend selection is poll-dancer's own CMake
+# (platform-based); its real option names are POLL_DANCER_BUILD_TESTS /
+# BUILD_EXAMPLES / BUILD_SHARED / THREAD_SAFE, and its static target is
+# `poll_dancer` (OUTPUT_NAME already poll_dancer, so the artifact is
+# libpoll_dancer.a). OFF keeps the library streams-free for embedders that
+# only need the actor runtime.
+if(SA_ENABLE_STREAMS)
+  if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/poll-dancer/CMakeLists.txt)
+    message(FATAL_ERROR "deps/poll-dancer submodule missing. Run: git submodule update --init --recursive")
+  endif()
+  include(ExternalProject)
+  set(PD_ROOT  ${CMAKE_CURRENT_SOURCE_DIR}/deps/poll-dancer)
+  set(PD_BUILD ${CMAKE_BINARY_DIR}/deps/poll-dancer)
+  set(PD_CONFIGURE ${CMAKE_COMMAND} -S ${PD_ROOT} -B ${PD_BUILD}
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      -DPOLL_DANCER_BUILD_TESTS=OFF -DPOLL_DANCER_BUILD_EXAMPLES=OFF
+      -DPOLL_DANCER_BUILD_SHARED=OFF -DPOLL_DANCER_THREAD_SAFE=ON)
+  set(PD_INSTALL ${CMAKE_COMMAND} -E echo "Skipping install; consuming build-dir artifacts directly")
+  ExternalProject_Add(poll-dancer-ext
+    SOURCE_DIR ${PD_ROOT}
+    CONFIGURE_COMMAND ${PD_CONFIGURE}
+    BUILD_COMMAND ${CMAKE_COMMAND} --build ${PD_BUILD} --target poll_dancer
+    INSTALL_COMMAND ${PD_INSTALL}
+    BUILD_BYPRODUCTS ${PD_BUILD}/libpoll_dancer.a
+    BINARY_DIR ${PD_BUILD}
+  )
+  # NOTE: bumping the deps/poll-dancer pin does not touch these ExternalProject
+  # stamps — after a re-pin, wipe ${CMAKE_BINARY_DIR}/deps/poll-dancer to
+  # force a fresh configure+build.
+endif()
+
+if(SA_ENABLE_STREAMS)
+  # CMake-level mirror of the PUBLIC compile definition below; test sources
+  # gate streams additions with a plain if(SA_HAS_STREAMS) check.
+  set(SA_HAS_STREAMS ON)
+  target_compile_definitions(secretagent PUBLIC SA_HAS_STREAMS=1)
+  target_include_directories(secretagent PRIVATE
+    ${PD_ROOT}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps/http-parser)
+  # The dep archives link now (an unused static archive pulls nothing, so the
+  # link stays clean until src/Streams consumes them); the transport sources
+  # ride this same gate from the port task on. http_parser is defined in
+  # deps/CMakeLists.txt (plain static lib — upstream has no CMakeLists, gyp
+  # only).
+  target_link_libraries(secretagent PUBLIC ${PD_BUILD}/libpoll_dancer.a http_parser)
+  add_dependencies(secretagent poll-dancer-ext)
 endif()
 
 # Opt-in AddressSanitizer instrumentation of the secretagent library only (not

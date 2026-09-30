@@ -7,3 +7,12 @@
 [submodule "deps/wavedb"]
 	path = deps/wavedb
 	url = https://github.com/vijayee/WaveDB.git
+[submodule "deps/poll-dancer"]
+	path = deps/poll-dancer
+	url = https://github.com/vijayee/poll-dancer.git
+[submodule "deps/http-parser"]
+	path = deps/http-parser
+	url = https://github.com/nodejs/http-parser.git
+[submodule "deps/pcre2"]
+	path = deps/pcre2
+	url = https://github.com/PCRE2Project/pcre2.git
