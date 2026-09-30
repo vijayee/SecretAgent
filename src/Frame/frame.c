@@ -27,6 +27,21 @@ void frm_reply_payload_destroy(void* p) {
   free(rp);
 }
 
+void frm_spawn_payload_destroy(void* p) {
+  frm_spawn_payload_t* sp = (frm_spawn_payload_t*)p;
+  if (sp == NULL) return;
+  free(sp->goal);
+  free(sp->context_json);
+  free(sp);
+}
+
+void frm_report_payload_destroy(void* p) {
+  frm_report_payload_t* rp = (frm_report_payload_t*)p;
+  if (rp == NULL) return;
+  free(rp->text);
+  free(rp);
+}
+
 #ifdef SA_HAS_WDB
 
 #include <Database/database.h>
@@ -452,8 +467,10 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
    makes both delivery paths (queue + actor_run, and the tests' direct
    frame_dispatch) work without claiming it twice. FRM_REPLY is the OUTGOING
    answer shape, so one arriving at a frame is a routing bug. The loop's
-   verbs (FRM_CELL_EXECUTE / FRM_STOP) stay mailbox-cleaned until Task 10
-   claims them. Unknown types are ignored likewise. */
+   verbs (FRM_CELL_EXECUTE / FRM_STOP) and the cell-side spawn/report bridge
+   verbs (FRM_SPAWN / FRM_REPORT — posted by py_agent.c) stay mailbox-cleaned
+   until the slices that drive them claim them. Unknown types are ignored
+   likewise. */
 static void _frame_behavior(void* state, message_t* msg) {
   frame_t* f = (frame_t*)state;
   if (msg == NULL) return;

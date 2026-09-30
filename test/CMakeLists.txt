@@ -50,6 +50,19 @@ if (BUILD_TESTING)
     if(SA_HAS_PYTHON)
       target_sources(testsecretagent PRIVATE test_pyrt.cpp)
 
+      # The bridge verbs run on the injected module and answer through the
+      # frame_bridge registry, so this suite needs CPython but not WaveDB
+      # (the scripted owner answers by hand — no store involved).
+      # test_py_agent.cpp includes py_agent.h, which includes Python.h; the
+      # CPython include dirs are PRIVATE on the secretagent target, so this
+      # test target mirrors them (libpython itself arrives via the PUBLIC
+      # link of the parent target).
+      if(SA_ENABLE_PYTHON)
+        target_include_directories(testsecretagent PRIVATE
+          ${CPYTHON_ROOT}/Include ${CPYTHON_BUILD})
+      endif()
+      target_sources(testsecretagent PRIVATE test_py_agent.cpp)
+
       # Order-isolated pyrt pool-cap unit: the global interpreter pool cap is
       # fixed by the FIRST pyrt created in the process, so the cap=1 test must
       # run in a binary where it is the only runtime creator. Same link shape

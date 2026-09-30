@@ -1,0 +1,548 @@
+//
+// Created by victor on 9/29/26.
+//
+
+#include "py_agent.h"
+
+#ifdef SA_HAS_PYTHON
+
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+#include "../Actor/actor.h"
+#include "../Frame/frame_bridge.h"
+#include "../Frame/frame_messages.h"
+#include "../Util/allocator.h"
+#include "../Util/atomic_compat.h"
+#include "../Util/log.h"
+#include "../Platform/platform.h"
+
+#include "pyrt.h"
+#include "pyrt_messages.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+/* WHY IT BLOCKS (the plan's documented reconciliation of the pyrt outbound
+   rule with this bridge's synchronous-request shape):
+   The bridge verbs post a corr-matched request into the frame actor's OWN
+   inbox and then WAIT for the corr-matched reply. Waiting from a callback
+   would violate the pyrt outbound rule ("callbacks must be non-blocking"),
+   EXCEPT that the blocking happens on the PYTHON side of the pyrt WORKER
+   thread — the cell's own thread, which pyrt's design explicitly permits to
+   block on its own work queue. The pyrt thread IS the frame's dedicated
+   python thread, so a queued cell can hold that thread for its whole
+   duration anyway; while this thread waits, the GIL is RELEASED
+   (Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS), so the interpreter (its
+   own PEP-684 subinterpreter GIL included) is not held and sibling frames
+   keep running. The reply is delivered on the frame's dispatch thread
+   through frame_bridge's installed sink, which wakes this very thread via
+   the per-request completion record below. The wait is BOUNDED
+   (SA_PY_AGENT_WAIT_MS) and a timeout is answered as a failure — this is
+   the PA synchronous-request round-trip shape (peer_book precedent:
+   platform_condvar_timed_wait), never an unbounded block. */
+
+/* The bounded wait: overridable so tests can shrink it if a suite must not
+   tolerate the default window. Default 500 ms per verb call. */
+#ifndef SA_PY_AGENT_WAIT_MS
+#define SA_PY_AGENT_WAIT_MS 500
+#endif
+
+/* ----------------------- completion registry ---------------------------- */
+
+/* Per-request wait record. It lives on the CALLER's (pyrt thread's) stack.
+   The registry holds only POINTERS to these, so there is no registry-owned
+   heap memory at all: a waiter registers itself (under the lock) BEFORE
+   posting its request (so a reply racing the send cannot miss it), and
+   unlinks itself (under the lock) after the wait — while the note_reply
+   path only ever chases records that are still linked, no record is ever
+   touched after its stack frame dies. One mutex + one condvar are shared;
+   note_reply fills the corr-matched record, copies the BORROWED reply text
+   into it (good-actors: the sink owns nothing long-term), and broadcasts. */
+typedef struct py_agent_wait_t {
+  uint64_t corr;
+  uint8_t done;
+  uint8_t status;
+  char* text;                     /* heap copy of the reply text; waiter frees */
+  struct py_agent_wait_t* next;
+} py_agent_wait_t;
+
+static platform_mutex_t* _py_agent_lock = NULL;
+static platform_condvar_t* _py_agent_cv = NULL;
+static py_agent_wait_t* _py_agent_waiters = NULL;
+static ATOMIC(uint64_t) _py_agent_corr = 0;
+
+/* Benign-race guard install (pyrt's pool idiom): every racing init caller
+   makes a candidate mutex; the first CAS wins and keeps it, losers destroy
+   theirs. Under the winning mutex the infra pair is created. */
+static _Atomic(platform_mutex_t*) _py_agent_init_guard = NULL;
+
+void py_agent_init(void) {
+  platform_mutex_t* m = platform_mutex_create();
+  platform_mutex_t* expected = NULL;
+  if (!atomic_compare_exchange_strong(&_py_agent_init_guard, &expected, m)) {
+    platform_mutex_destroy(m);
+    m = atomic_load(&_py_agent_init_guard);
+  }
+  if (m == NULL) {
+    log_error("py_agent: init guard missing — registry not mounted");
+    return;
+  }
+  platform_mutex_lock(m);
+  if (_py_agent_lock == NULL) {
+    _py_agent_lock = platform_mutex_create();
+    _py_agent_cv = platform_condvar_create();
+  }
+  /* (Re-)register always: py_agent_init is the mount point for the reply
+     registry, and frame_bridge's tests demount the sink between suites. */
+  frame_bridge_register_reply_sink(py_agent_note_reply);
+  platform_mutex_unlock(m);
+}
+
+/* The reply path. Runs on the frame's DISPATCH thread: never blocks (lock +
+   a small allocation for the text copy only) and never frees the borrowed
+   text. */
+void py_agent_note_reply(uint64_t corr, uint8_t status, const char* text) {
+  if (_py_agent_lock == NULL) {
+    log_error("py_agent: reply corr %llu before any registry mount — dropped",
+              (unsigned long long)corr);
+    return;
+  }
+  platform_mutex_lock(_py_agent_lock);
+  for (py_agent_wait_t* w = _py_agent_waiters; w != NULL; w = w->next) {
+    if (w->corr == corr && w->done == 0) {
+      w->status = status;
+      if (text != NULL) {
+        w->text = strdup(text);   /* the copy outlives the borrowed argument */
+        if (w->text == NULL) {
+          /* OOM on the copy: answer the waiter as a failure instead of
+             handing it a heap pointer it cannot have. */
+          w->status = 1;
+          log_error("py_agent: OOM copying reply text (corr %llu) — answered "
+                    "status 1", (unsigned long long)corr);
+        }
+      }
+      w->done = 1;
+      platform_condvar_broadcast(_py_agent_cv);
+      platform_mutex_unlock(_py_agent_lock);
+      return;
+    }
+  }
+  platform_mutex_unlock(_py_agent_lock);
+  /* No waiter matched (the caller timed out and unlinked, or the request was
+     never posted): loud, consistent with frame_bridge's drop path. */
+  log_error("py_agent: no waiter for reply corr %llu status %u '%s' — "
+            "dropped (the caller timed out or the request was never sent)",
+            (unsigned long long)corr, (unsigned)status, text ? text : "(no text)");
+}
+
+/* -------------------------- request round-trip --------------------------- */
+
+typedef enum py_agent_wait_rc_e {
+  PY_AGENT_OK = 0,          /* reply delivered; the record holds status + text */
+  PY_AGENT_NO_OWNER = 1,    /* no frame owns this thread: answered as failure */
+  PY_AGENT_SEND_FAILED = 2, /* actor_send refused (owner going away): failure */
+  PY_AGENT_TIMEOUT = 3      /* bounded wait elapsed: failure */
+} py_agent_wait_rc_e;
+
+/* Post the corr-matched request to the calling pyrt thread's owning frame
+   actor and wait for the corr-matched bridge reply. The GIL is released for
+   the whole send+wait (see the header comment). On success the reply's
+   status is copied to *status_out and *text_out receives the heap copy of
+   the reply text (may be NULL; the caller frees it). */
+static py_agent_wait_rc_e _py_agent_request(uint32_t msg_type, void* payload,
+                                            void (*destroy)(void*), uint64_t corr,
+                                            uint8_t* status_out, char** text_out) {
+  actor_t* owner = pyrt_thread_owner();
+  if (_py_agent_lock == NULL) {
+    /* Unmountable path: py_agent_init() runs at pyrt's first global boot,
+       before any thread can run a verb — this is a loud defensive guard,
+       never a live path. */
+    if (destroy != NULL && payload != NULL) {
+      destroy(payload);
+    }
+    log_error("py_agent: no registry mounted (uninitialized runtime layer) — "
+              "answering the call as failure (corr %llu)",
+              (unsigned long long)corr);
+    return PY_AGENT_NO_OWNER;
+  }
+  if (owner == NULL) {
+    /* Cells calling agent.* while no frame owns their runtime (or from a
+       stdlib thread without the TLS): answer immediately as failure, loud. */
+    if (destroy != NULL && payload != NULL) {
+      destroy(payload);
+    }
+    log_error("py_agent: verb outside a frame-owned runtime thread — "
+              "answering the call as failure (corr %llu)",
+              (unsigned long long)corr);
+    return PY_AGENT_NO_OWNER;
+  }
+
+  /* The waiter is registered BEFORE the post so a reply racing the send
+     cannot miss the record. */
+  py_agent_wait_t w;
+  memset(&w, 0, sizeof(w));
+  w.corr = corr;
+  platform_mutex_lock(_py_agent_lock);
+  w.next = _py_agent_waiters;
+  _py_agent_waiters = &w;
+  platform_mutex_unlock(_py_agent_lock);
+
+  message_t msg;
+  msg.type = msg_type;
+  msg.payload = payload;
+  msg.payload_destroy = destroy;
+
+  uint8_t sent = 0;
+  char* reply_text = NULL;
+  uint8_t reply_status = 0;
+  uint8_t delivered = 0;
+  Py_BEGIN_ALLOW_THREADS
+  sent = actor_send(owner, &msg) ? 1 : 0;
+  if (sent) {
+    /* actor_send already freed the payload if it refused; wait only then. */
+    uint64_t deadline =
+        platform_monotonic_ns() + (uint64_t)SA_PY_AGENT_WAIT_MS * 1000000ULL;
+    platform_mutex_lock(_py_agent_lock);
+    uint64_t now = platform_monotonic_ns();
+    while (w.done == 0 && now < deadline) {
+      uint64_t remaining_ms = (deadline - now) / 1000000ULL + 1;
+      platform_condvar_timed_wait(_py_agent_cv, _py_agent_lock,
+                                  (uint32_t)remaining_ms);
+      now = platform_monotonic_ns();
+    }
+    /* Unlink the record under the same lock the reply path holds: after
+       this, no note_reply call can reach the stack record again. */
+    py_agent_wait_t** link = &_py_agent_waiters;
+    while (*link != NULL && *link != &w) {
+      link = &(*link)->next;
+    }
+    if (*link != NULL) {
+      *link = w.next;
+    }
+    delivered = w.done;
+    reply_status = w.status;
+    reply_text = w.text;
+    platform_mutex_unlock(_py_agent_lock);
+  }
+  Py_END_ALLOW_THREADS
+
+  if (sent == 0) {
+    platform_mutex_lock(_py_agent_lock);
+    py_agent_wait_t** link = &_py_agent_waiters;
+    while (*link != NULL && *link != &w) {
+      link = &(*link)->next;
+    }
+    if (*link != NULL) {
+      *link = w.next;
+    }
+    platform_mutex_unlock(_py_agent_lock);
+    free(reply_text);
+    log_error("py_agent: send to the owning frame actor failed (corr %llu) — "
+              "answered as failure", (unsigned long long)corr);
+    return PY_AGENT_SEND_FAILED;
+  }
+
+  if (delivered == 0) {
+    free(reply_text);
+    return PY_AGENT_TIMEOUT;
+  }
+  if (status_out != NULL) {
+    *status_out = reply_status;
+  }
+  if (text_out != NULL) {
+    *text_out = reply_text;
+  } else {
+    free(reply_text);
+  }
+  return PY_AGENT_OK;
+}
+
+/* ------------------------- text coercion helpers ------------------------- */
+
+/* One corr per verb call, process-wide (distinct from pyrt's executor corr
+   space: those travel through PYRT_RESULT mailbox payloads, these through
+   the bridge sink, so the two spaces never meet). */
+static uint64_t _py_agent_next_corr(void) {
+  return atomic_fetch_add(&_py_agent_corr, 1) + 1;
+}
+
+/* str → heap copy verbatim; any other object → heap copy of its repr (valid
+   JSON text for scalars and strings; containers that repr to non-JSON are
+   refused downstream, loud). Returns NULL with a python exception set on
+   conversion/OOM failure. The string is OUT of Python's heap before any
+   borrowed pointer can die. */
+static char* _py_agent_text_of(PyObject* obj) {
+  if (PyUnicode_Check(obj)) {
+    const char* utf = PyUnicode_AsUTF8(obj);
+    if (utf == NULL) return NULL;
+    char* out = strdup(utf);
+    if (out == NULL) PyErr_NoMemory();
+    return out;
+  }
+  PyObject* r = PyObject_Repr(obj);
+  if (r == NULL) return NULL;
+  const char* utf = PyUnicode_AsUTF8(r);
+  if (utf == NULL) {
+    Py_DECREF(r);
+    return NULL;
+  }
+  char* out = strdup(utf);   /* strdup precedes any DECREF: r owns the buffer */
+  Py_DECREF(r);
+  if (out == NULL) PyErr_NoMemory();
+  return out;
+}
+
+/* ------------------------------ the verbs -------------------------------- */
+
+/* remember(key, value) -> bool.
+
+   `value` is the JSON text stored verbatim under key (str taken as-is,
+   anything else coerced through repr, see _py_agent_text_of). Bridges to
+   FRM_REMEMBER; the frame's durable-ctx remember runs on the frame's
+   dispatch thread and answers corr-matched through the sink. */
+static PyObject* _py_agent_remember(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* key_o = NULL;
+  PyObject* val_o = NULL;
+  if (!PyArg_ParseTuple(args, "OO:remember", &key_o, &val_o)) {
+    return NULL;
+  }
+  char* key = _py_agent_text_of(key_o);
+  if (key == NULL) return NULL;
+  char* value = _py_agent_text_of(val_o);
+  if (value == NULL) {
+    free(key);
+    return NULL;
+  }
+
+  frm_remember_payload_t* rp = get_clear_memory(sizeof(frm_remember_payload_t));
+  if (rp == NULL) {
+    free(key);
+    free(value);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  rp->key = key;
+  rp->json_value = value;   /* payload owns both (destroyer frees them) */
+
+  uint8_t status = 0;
+  char* text = NULL;
+  uint64_t corr = _py_agent_next_corr();
+  rp->corr = corr;
+  py_agent_wait_rc_e rc =
+      _py_agent_request((uint32_t)FRM_REMEMBER, rp, frm_remember_payload_destroy,
+                        corr, &status, &text);
+  free(text);
+  if (rc == PY_AGENT_OK && status == 0) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
+/* recall(key) -> str | None.
+
+   Bridges to FRM_RECALL; a delivered success carries the resolved raw JSON
+   text, which is returned as a python string. Unresolvable key (status 1),
+   send failure, and the bounded-wait timeout all answer None — a failed
+   lookup is never distinguished from a lost reply by the return value (the
+   loud log on the reply path carries that story). */
+static PyObject* _py_agent_recall(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* key_o = NULL;
+  if (!PyArg_ParseTuple(args, "O:recall", &key_o)) {
+    return NULL;
+  }
+  char* key = _py_agent_text_of(key_o);
+  if (key == NULL) return NULL;
+
+  frm_remember_payload_t* rp = get_clear_memory(sizeof(frm_remember_payload_t));
+  if (rp == NULL) {
+    free(key);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  rp->key = key;
+  rp->json_value = NULL;   /* FRM_RECALL carries no value */
+
+  uint8_t status = 0;
+  char* text = NULL;
+  uint64_t corr = _py_agent_next_corr();
+  rp->corr = corr;
+  py_agent_wait_rc_e rc =
+      _py_agent_request((uint32_t)FRM_RECALL, rp, frm_remember_payload_destroy,
+                        corr, &status, &text);
+  if (rc == PY_AGENT_OK && status == 0 && text != NULL) {
+    PyObject* out = PyUnicode_FromString(text);
+    free(text);
+    return out;   /* NULL (exception set) propagates the OOM verbatim */
+  }
+  free(text);
+  Py_RETURN_NONE;
+}
+
+/* spawn(goal, context=None) -> str | None.
+
+   Bridges to FRM_SPAWN (admission-only child spawn on the frame); a
+   delivered success carries the child sid path, returned as a python
+   string. context=None posts NO handoff key (the py_agent contract: spawn
+   without handoff context); a context string is stored verbatim — the frame
+   validates it as JSON and refuses (loud, status 1 → None) otherwise. */
+static PyObject* _py_agent_spawn(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* goal_o = NULL;
+  PyObject* ctx_o = NULL;
+  if (!PyArg_ParseTuple(args, "O|O:spawn", &goal_o, &ctx_o)) {
+    return NULL;
+  }
+  char* goal = _py_agent_text_of(goal_o);
+  if (goal == NULL) return NULL;
+  char* context = NULL;
+  if (ctx_o != NULL && ctx_o != Py_None) {
+    context = _py_agent_text_of(ctx_o);
+    if (context == NULL) {
+      free(goal);
+      return NULL;
+    }
+  }
+
+  frm_spawn_payload_t* sp = get_clear_memory(sizeof(frm_spawn_payload_t));
+  if (sp == NULL) {
+    free(goal);
+    free(context);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  sp->goal = goal;
+  sp->context_json = context;   /* NULL is the legitimate no-handoff case */
+
+  uint8_t status = 0;
+  char* text = NULL;
+  uint64_t corr = _py_agent_next_corr();
+  sp->corr = corr;
+  py_agent_wait_rc_e rc =
+      _py_agent_request((uint32_t)FRM_SPAWN, sp, frm_spawn_payload_destroy,
+                        corr, &status, &text);
+  if (rc == PY_AGENT_OK && status == 0 && text != NULL) {
+    PyObject* out = PyUnicode_FromString(text);
+    free(text);
+    return out;
+  }
+  free(text);
+  Py_RETURN_NONE;
+}
+
+/* report(value) -> bool.
+
+   Bridges to FRM_REPORT: the report text is the value (str verbatim, any
+   other object coerced through repr — the loop-slice callers hand strings).
+   A delivered success is True; refusal, send failure, and timeout are
+   False. */
+static PyObject* _py_agent_report(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* val_o = NULL;
+  if (!PyArg_ParseTuple(args, "O:report", &val_o)) {
+    return NULL;
+  }
+  char* text = _py_agent_text_of(val_o);
+  if (text == NULL) return NULL;
+
+  frm_report_payload_t* rp = get_clear_memory(sizeof(frm_report_payload_t));
+  if (rp == NULL) {
+    free(text);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  rp->text = text;
+
+  uint8_t status = 0;
+  char* reply_text = NULL;
+  uint64_t corr = _py_agent_next_corr();
+  rp->corr = corr;
+  py_agent_wait_rc_e rc =
+      _py_agent_request((uint32_t)FRM_REPORT, rp, frm_report_payload_destroy,
+                        corr, &status, &reply_text);
+  free(reply_text);
+  if (rc == PY_AGENT_OK && status == 0) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
+/* --------------------- the injected module's method table ---------------- */
+
+/* The base stream verbs (pyrt.c owns the routing; these are the callbacks
+   the injected module has always exposed). */
+static PyObject* _py_agent_log(PyObject* self, PyObject* args) {
+  const char* text = NULL;
+  if (!PyArg_ParseTuple(args, "s", &text)) {
+    return NULL;
+  }
+  pyrt_post_text(PYRT_LOG, text);
+  Py_RETURN_NONE;
+}
+
+static PyObject* _py_agent_status(PyObject* self, PyObject* args) {
+  const char* text = NULL;
+  if (!PyArg_ParseTuple(args, "s", &text)) {
+    return NULL;
+  }
+  pyrt_post_text(PYRT_STATUS, text);
+  Py_RETURN_NONE;
+}
+
+static PyObject* _py_agent_emit(PyObject* self, PyObject* args) {
+  const char* text = NULL;
+  if (!PyArg_ParseTuple(args, "s", &text)) {
+    return NULL;
+  }
+  pyrt_post_text(PYRT_EMIT, text);
+  Py_RETURN_NONE;
+}
+
+static PyMethodDef _py_agent_base_methods[] = {
+    {"log", _py_agent_log, METH_VARARGS, "Stream live narration to the owning actor."},
+    {"status", _py_agent_status, METH_VARARGS, "Stream the current status to the owning actor."},
+    {"emit", _py_agent_emit, METH_VARARGS, "Post a durable-payload candidate to the owning actor."},
+    {NULL, NULL, 0, NULL}};
+
+static PyMethodDef _py_agent_verb_methods[] = {
+    {"remember", _py_agent_remember, METH_VARARGS, "Durable shared state write; returns True or False."},
+    {"recall", _py_agent_recall, METH_VARARGS, "Resolve a key up the frame lineage; returns the JSON text or None."},
+    {"spawn", _py_agent_spawn, METH_VARARGS, "Admission-only child spawn; returns the child sid or None."},
+    {"report", _py_agent_report, METH_VARARGS, "End this frame with a report; returns True or False."},
+    {NULL, NULL, 0, NULL}};
+
+#define _PY_AGENT_TABLE_SIZE ((sizeof(_py_agent_base_methods) + sizeof(_py_agent_verb_methods)) / sizeof(PyMethodDef))
+
+/* Combined table: allocated ONCE (benign-race CAS idiom — pyrt's global boot
+   path calls this under its guard, but own-safe anyway), returned by every
+   later call, freed by nobody: pyrt's module def references it for the life
+   of the process. */
+PyMethodDef* py_agent_methods_combined(void) {
+  static _Atomic(PyMethodDef*) _py_agent_table = NULL;
+  PyMethodDef* existing = atomic_load(&_py_agent_table);
+  if (existing != NULL) {
+    return existing;
+  }
+  PyMethodDef* candidate = get_clear_memory(sizeof(PyMethodDef) * _PY_AGENT_TABLE_SIZE);
+  if (candidate == NULL) {
+    return NULL;
+  }
+  size_t n = 0;
+  for (size_t i = 0; _py_agent_base_methods[i].ml_name != NULL; i++) {
+    candidate[n++] = _py_agent_base_methods[i];
+  }
+  for (size_t i = 0; _py_agent_verb_methods[i].ml_name != NULL; i++) {
+    candidate[n++] = _py_agent_verb_methods[i];
+  }
+  PyMethodDef* expected = NULL;
+  if (!atomic_compare_exchange_strong(&_py_agent_table, &expected, candidate)) {
+    /* Lost the race: the winner's table is authoritative; drop the copy. */
+    free(candidate);
+    return atomic_load(&_py_agent_table);
+  }
+  return candidate;
+}
+
+#endif /* SA_HAS_PYTHON */

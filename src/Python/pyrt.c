@@ -4,6 +4,7 @@
 
 #include "pyrt.h"
 #include "py_subprocess.h"
+#include "py_agent.h"
 
 #ifdef SA_HAS_PYTHON
 
@@ -155,40 +156,10 @@ static void _pyrt_post_result(pyrt_t* py, uint64_t corr, uint8_t status, char* t
 
 /* ------------------------------------------------------------------ */
 /* Injected `actor` module (inittab-registered before any Py_Initialize). */
+/* The method callbacks — log/status/emit AND the four bridge verbs — live */
+/* in py_agent.c; this file owns the module DEF and the thread-local state */
+/* they route through.                                                     */
 /* ------------------------------------------------------------------ */
-
-static PyObject* _py_actor_log(PyObject* self, PyObject* args) {
-  const char* text = NULL;
-  if (!PyArg_ParseTuple(args, "s", &text)) {
-    return NULL;
-  }
-  _pyrt_post_text(_tls_pyrt, PYRT_LOG, text);
-  Py_RETURN_NONE;
-}
-
-static PyObject* _py_actor_status(PyObject* self, PyObject* args) {
-  const char* text = NULL;
-  if (!PyArg_ParseTuple(args, "s", &text)) {
-    return NULL;
-  }
-  _pyrt_post_text(_tls_pyrt, PYRT_STATUS, text);
-  Py_RETURN_NONE;
-}
-
-static PyObject* _py_actor_emit(PyObject* self, PyObject* args) {
-  const char* text = NULL;
-  if (!PyArg_ParseTuple(args, "s", &text)) {
-    return NULL;
-  }
-  _pyrt_post_text(_tls_pyrt, PYRT_EMIT, text);
-  Py_RETURN_NONE;
-}
-
-static PyMethodDef _py_actor_methods[] = {
-    {"log", _py_actor_log, METH_VARARGS, "Stream live narration to the owning actor."},
-    {"status", _py_actor_status, METH_VARARGS, "Stream the current status to the owning actor."},
-    {"emit", _py_actor_emit, METH_VARARGS, "Post a durable-payload candidate to the owning actor."},
-    {NULL, NULL, 0, NULL}};
 
 /* Multi-phase init is REQUIRED, not optional: the pinned 3.12.13 caches a
    single-phase (m_size < 0) built-in def in the process-wide extension table
@@ -210,9 +181,11 @@ static struct PyModuleDef_Slot _py_actor_slots[] = {
 
 /* Field order matches struct PyModuleDef: m_base, m_name, m_doc, m_size,
    m_methods, m_slots, m_traverse, m_clear, m_free. m_size >= 0 selects
-   multi-phase. */
+   multi-phase. m_methods is NULL here and pointed at py_agent's COMBINED
+   table (the base log/status/emit verbs + the bridge verbs) at the first
+   global boot, before the inittab entry can ever be imported. */
 static struct PyModuleDef _py_actor_moduledef = {
-    PyModuleDef_HEAD_INIT, "actor", NULL, 0, _py_actor_methods,
+    PyModuleDef_HEAD_INIT, "actor", NULL, 0, NULL,
     _py_actor_slots, NULL, NULL, NULL};
 
 /* Inittab entry point: returning the def (PyModuleDef_Type) makes
@@ -339,6 +312,26 @@ static uint8_t _pyrt_global_init(void) {
     platform_mutex_lock(guard);
   }
   if (!ATOMIC_LOAD(&_pyrt_global_ready)) {
+    /* The injected module's method table (py_agent.c): the base stream verbs
+       plus the bridge verbs, in ONE heap table. Built first — a NULL table
+       fails the boot loudly before the inittab entry can ever be imported. */
+    PyMethodDef* methods = py_agent_methods_combined();
+    if (methods == NULL) {
+      log_error("pyrt: building the combined 'actor' method table failed");
+      if (guard != NULL) {
+        platform_mutex_unlock(guard);
+      }
+      return 0;
+    }
+    _py_actor_moduledef.m_methods = methods;
+    /* The bridge reply registry mounts HERE, on the first global boot,
+       serialized under the same guard that serializes Py_Initialize —
+       py_agent's reply sink (py_agent_note_reply) is thereby installed
+       before any frame can dispatch and before any cell can run. This is
+       the runtime layer's one-way startup wire documented on
+       frame_bridge.h (frame.c: register -> behaviors answer corr-matched
+       -> py_agent_wait_t records wake). */
+    py_agent_init();
     if (PyImport_AppendInittab("actor", _py_actor_create) != 0) {
       log_error("pyrt: PyImport_AppendInittab('actor') failed");
       if (guard != NULL) {
@@ -623,6 +616,19 @@ static void* _pyrt_thread(void* arg) {
 /* ------------------------------------------------------------------ */
 /* Public API (frozen signatures from pyrt.h).                         */
 /* ------------------------------------------------------------------ */
+
+/* py_agent.c reads the TLS state through these two (the struct and the TLS
+   itself stay private to pyrt.c). Both are meaningful ONLY on the pyrt
+   thread of a runtime — exactly where the injected module's callbacks run. */
+
+actor_t* pyrt_thread_owner(void) {
+  if (_tls_pyrt == NULL) return NULL;
+  return _tls_pyrt->owner;
+}
+
+void pyrt_post_text(uint32_t type, const char* text) {
+  _pyrt_post_text(_tls_pyrt, type, text);
+}
 
 pyrt_t* pyrt_create(actor_t* owner, const pyrt_config_t* cfg) {
   if (!_pyrt_global_init()) {

@@ -46,6 +46,19 @@ uint8_t pyrt_isactive(const pyrt_t* pyrt);
 /* Teardown: sets shutdown, joins the thread, tears down any live backend. */
 void pyrt_destroy(pyrt_t* pyrt);
 
+/* Read on the CALLER's thread: the owner of the runtime whose pyrt worker
+   this thread is (read from the runtime's thread-local state). NULL when the
+   caller is not a pyrt worker thread (e.g. a stdlib thread spawned by a
+   cell) or the runtime has no owner. This is what the injected module's
+   bridge verbs route into (py_agent.c). */
+actor_t* pyrt_thread_owner(void);
+
+/* Route a text payload (PYRT_LOG / PYRT_STATUS / PYRT_EMIT) to the caller's
+   runtime owner — the pyrt-thread-relative form of the injected module's
+   stream verbs. Copies the text OUT of Python's heap inside; never re-enters
+   Python. No-op on a non-pyrt thread or an ownerless runtime. */
+void pyrt_post_text(uint32_t type, const char* text);
+
 #endif /* SA_HAS_PYTHON */
 
 #endif // SA_PYRT_H
