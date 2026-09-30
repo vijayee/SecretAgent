@@ -3,6 +3,7 @@
 //
 
 #include "frame.h"
+#include "frame_internal.h"
 #include "frame_messages.h"
 #include "frame_bridge.h"
 #include "../Util/allocator.h"
@@ -42,7 +43,16 @@ void frm_report_payload_destroy(void* p) {
   free(rp);
 }
 
+void frm_cell_payload_destroy(void* p) {
+  frm_cell_payload_t* cp = (frm_cell_payload_t*)p;
+  if (cp == NULL) return;
+  free(cp->code);
+  free(cp);
+}
+
 #ifdef SA_HAS_WDB
+
+#include "model.h"
 
 #include <Database/database.h>
 #include <Database/database_subtree.h>
@@ -53,6 +63,15 @@ void frm_report_payload_destroy(void* p) {
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+
+#ifdef SA_HAS_PYTHON
+#include "../Python/pyrt.h"   /* brings pyrt_messages.h; the frame's OWN runtime */
+#endif
+/* NOT platform.h: its platform_thread.h barrier declarations collide with
+   WaveDB's own threadding.h barrier prototypes (the family-shared symbol
+   set this build aliases) — a frame TU includes WaveDB headers via
+   Database/. The cell-wait clock only needs the TIME wrappers. */
+#include "../Platform/platform_time.h"
 
 /* One effect = one root batch. A concurrent-mode batch that exceeds the WAL
    file size is REJECTED by WaveDB (default cap 128 KB); we refuse anything
@@ -106,6 +125,30 @@ struct frame_t {
   unsigned max_depth;
   uint64_t seq;               /* last allocated event seq (0 = none yet) */
   uint32_t depth;
+  /* --- the turn-loop pieces (Task 10; see frame_internal.h) ---------------
+     loop_turn_cap: runtime cap override, 0 = SA_LOOP_MAX_TURNS default.
+     backend / owned_backend: the loop's model backend. `backend` is the
+     BORROWED injected override (frame_set_model_backend — never freed here;
+     scripted test backends are caller stack objects). `owned_backend` is the
+     lazily-built DEFAULT http backend: built once at first use from the
+     frame's own config, freed HERE. A set override always wins and the
+     default is then never built. */
+  struct model_backend_t* backend;
+  struct model_backend_t* owned_backend;
+  unsigned loop_turn_cap;
+  /* The pending-cell slot: ONE cell at a time. FRM_CELL_EXECUTE fills it;
+     PYRT_RESULT completes it (status filled, pending cleared) after writing
+     the paired cell.result event. Single-writer discipline: every access
+     happens on the frame's dispatch thread (the loop's thread — the frame is
+     inline); the pyrt worker only pushes into the mailbox. */
+#ifdef SA_HAS_PYTHON
+  pyrt_t* pyrt;               /* the frame's OWN runtime; lazy, freed at destroy */
+#endif
+  uint8_t cell_pending;       /* 1 while FRM_CELL_EXECUTE is in flight */
+  uint64_t cell_corr;         /* the loop's audit corr for the pending cell */
+  uint64_t cell_pyrt_corr;    /* the pyrt executor corr it was handed as */
+  uint8_t cell_status;        /* completion status of the pending/last cell */
+  uint8_t stop_requested;     /* FRM_STOP: the loop drains, then stops */
 };
 
 /* --- bridge reply hook (frame_bridge.h contract) ---------------------------
@@ -306,6 +349,59 @@ static char* _frame_state_key(const char* state_prefix, const char* key) {
   return out;
 }
 
+/* One raw event record write (frame_internal.h contract): at the NEXT seq,
+   record + ONE root batch; seq bumped only after the batch commits. Nothing
+   is written before the batch, so a refusal never half-applies. CONSUMES the
+   payload on every path. */
+int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: event '%s' on a dead frame",
+              type_name != NULL ? type_name : "?");
+    json_value_destroy(payload);
+    return -1;
+  }
+  uint64_t seq = f->seq + 1;
+  char* text = _frame_event_json(f, seq, type_name, payload);   /* consumes payload */
+  if (text == NULL) return -1;
+
+  char* evkey = get_memory(sizeof("events/00000000000000000000"));
+  if (evkey == NULL) {
+    free(text);
+    return -1;
+  }
+  snprintf(evkey, sizeof("events/00000000000000000000"), "events/%020llu",
+           (unsigned long long)seq);
+
+  size_t text_len = strlen(text);
+  if (text_len > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame: event record %zu bytes exceeds the %d-byte WAL batch cap "
+              "— refusing, never truncating",
+              text_len, (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(evkey);
+    free(text);
+    return -3;
+  }
+
+  raw_op_t ops[1];
+  ops[0].key = evkey;
+  ops[0].key_len = strlen(evkey);
+  ops[0].value = (const uint8_t*)text;
+  ops[0].value_len = text_len;
+  ops[0].type = 0;
+
+  int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 1);
+  free(evkey);
+  free(text);
+  if (rc != 0) {
+    log_error("frame: '%s' event batch failed (%d); seq %llu of '%s' is "
+              "unwritten", type_name != NULL ? type_name : "?", rc,
+              (unsigned long long)seq, f->sid_path);
+    return rc;
+  }
+  f->seq = seq;
+  return 0;
+}
+
 /* remember = the state put + the state.remember event in ONE root batch.
    Failures happen BEFORE any write except the batch itself, so no effect
    half-applies. */
@@ -395,7 +491,8 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
   return 0;
 }
 
-/* msg.append = the conversation-turn event in ONE root batch. */
+/* msg.append = the conversation-turn event in ONE root batch (the general
+   event write, with the {role, content} payload). */
 static int _frame_append_msg(frame_t* f, const char* role, const char* content) {
   if (f == NULL || f->st == NULL) {
     log_error("frame: append_msg on a dead frame");
@@ -414,41 +511,76 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
   json_object_set(payload, "role", json_new_string(role));
   json_object_set(payload, "content", json_new_string(content));
 
-  uint64_t seq = f->seq + 1;
-  char* evkey = get_memory(sizeof("events/00000000000000000000"));
-  char* text = _frame_event_json(f, seq, "msg.append", payload);
-  if (evkey == NULL || text == NULL) {
-    free(evkey);
-    free(text);
-    log_error("frame: out of memory building msg.append batch");
+  return _frame_event_write(f, "msg.append", payload);
+}
+
+/* The TOP-frame report variant (documented loop decision: a report marks the
+   reporting frame done at EVERY depth; a child binds its report event into
+   the parent's log, a top frame has no parent log and reports into its OWN
+   log — payload shape unchanged, so child_sid carries the reportING frame's
+   own path). Own event + status done in ONE root batch. */
+static int _frame_report_top(frame_t* f, const char* text) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: report on a dead frame");
     return -1;
   }
-  snprintf(evkey, sizeof("events/00000000000000000000"), "events/%020llu",
-           (unsigned long long)seq);
+  if (text == NULL) {
+    log_error("frame_report: report text required");
+    return -1;
+  }
 
-  size_t text_len = strlen(text);
-  if (text_len > SA_FRAME_MAX_BATCH_BYTES) {
-    log_error("frame: event record %zu bytes exceeds the %d-byte WAL batch cap "
-              "— refusing, never truncating (split the message)",
-              text_len, (int)SA_FRAME_MAX_BATCH_BYTES);
-    free(evkey);
-    free(text);
+  uint64_t seq = f->seq + 1;
+  json_value_t* payload = json_new_object();   /* {child_sid, text} */
+  if (payload == NULL) {
+    log_error("frame: out of memory building report payload");
+    return -1;
+  }
+  json_object_set(payload, "child_sid", json_new_string(f->sid_path));
+  json_object_set(payload, "text", json_new_string(text));
+  char* event_text = _frame_event_json_full(f->sid_path, seq, "frame.report",
+                                            payload);
+  if (event_text == NULL) return -1;
+
+  char* k_ev = _frame_event_key(f->sid_path, seq);
+  char* k_status = _frame_subkey(f->sid_path, "meta/status");
+  if (k_ev == NULL || k_status == NULL) {
+    free(k_ev);
+    free(k_status);
+    free(event_text);
+    return -1;
+  }
+
+  raw_op_t ops[2];
+  ops[0].key = k_ev;
+  ops[0].key_len = strlen(k_ev);
+  ops[0].value = (const uint8_t*)event_text;
+  ops[0].value_len = strlen(event_text);
+  ops[0].type = 0;
+  ops[1].key = k_status;
+  ops[1].key_len = strlen(k_status);
+  ops[1].value = (const uint8_t*)SA_FRAME_STATUS_DONE;
+  ops[1].value_len = strlen(SA_FRAME_STATUS_DONE);
+  ops[1].type = 0;
+
+  size_t total_bytes = strlen(k_ev) + strlen(event_text) +
+                       strlen(k_status) + strlen(SA_FRAME_STATUS_DONE);
+  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame_report: top report batch for '%s' is %zu bytes, exceeding "
+              "the %d-byte WAL batch cap — refusing, never truncating",
+              f->sid_path, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(k_ev);
+    free(k_status);
+    free(event_text);
     return -3;
   }
 
-  raw_op_t ops[1];
-  ops[0].key = evkey;
-  ops[0].key_len = strlen(evkey);
-  ops[0].value = (const uint8_t*)text;
-  ops[0].value_len = text_len;
-  ops[0].type = 0;
-
-  int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 1);
-  free(evkey);
-  free(text);
+  int rc = database_batch_sync_raw(f->root->db, '/', ops, 2);
+  free(k_ev);
+  free(k_status);
+  free(event_text);
   if (rc != 0) {
-    log_error("frame: msg.append batch failed (%d); seq %llu of %s is unwritten",
-              rc, (unsigned long long)seq, f->sid_path);
+    log_error("frame_report: top report batch failed (%d) at '%s' — nothing "
+              "committed", rc, f->sid_path);
     return rc;
   }
   f->seq = seq;
@@ -467,10 +599,12 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
    makes both delivery paths (queue + actor_run, and the tests' direct
    frame_dispatch) work without claiming it twice. FRM_REPLY is the OUTGOING
    answer shape, so one arriving at a frame is a routing bug. The loop's
-   verbs (FRM_CELL_EXECUTE / FRM_STOP) and the cell-side spawn/report bridge
-   verbs (FRM_SPAWN / FRM_REPORT — posted by py_agent.c) stay mailbox-cleaned
-   until the slices that drive them claim them. Unknown types are ignored
-   likewise. */
+   verbs are claimed here (Task 10): FRM_CELL_EXECUTE boots/feeds the frame's
+   own pyrt, PYRT_RESULT completes the one pending-cell slot, FRM_STOP sets
+   the drain-then-stop flag the turn loop reads; FRM_SPAWN / FRM_REPORT (the
+   cell-side bridge verbs posted by py_agent.c) run the same store operations
+   the direct API uses and answer corr-matched through the hook. Unknown
+   types are ignored. */
 static void _frame_behavior(void* state, message_t* msg) {
   frame_t* f = (frame_t*)state;
   if (msg == NULL) return;
@@ -539,12 +673,200 @@ static void _frame_behavior(void* state, message_t* msg) {
       log_error("frame: FRM_REPLY received at '%s' — replies are bridge-hook "
                 "side effects, not queued messages; dropping", f->sid_path);
       break;
-    case FRM_CELL_EXECUTE:
-    case FRM_STOP:
-      /* The turn loop claims FRM_CELL_EXECUTE / FRM_STOP in Task 10. Until
-         then the frame ignores them and payload cleanup stays with the
-         mailbox per the style guide. */
+      /* Replies LEAVE frames through the bridge hook; a frame cannot wait on
+         one. This only happens from a routing bug: loud, dropped. */
+      log_error("frame: FRM_REPLY received at '%s' — replies are bridge-hook "
+                "side effects, not queued messages; dropping", f->sid_path);
       break;
+    case FRM_CELL_EXECUTE: {
+      /* The loop's verb (claimed in Task 10): boot the frame's OWN pyrt
+         lazily, run the cell, and let the PYRT_RESULT dispatch complete the
+         one pending-cell slot (the paired cell.result event is written by
+         that completion). Synchronous REFUSAL paths never set the pending
+         flag; they fill the status instead — the loop's wait reads the slot
+         state directly when it sees no pending cell. */
+      frm_cell_payload_t* cp = (frm_cell_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (cp == NULL) {
+        log_error("frame: FRM_CELL_EXECUTE with no payload at '%s'", f->sid_path);
+        break;
+      }
+      if (cp->corr == 0 || cp->code == NULL) {
+        log_error("frame: FRM_CELL_EXECUTE needs corr and code at '%s'",
+                  f->sid_path);
+        frm_cell_payload_destroy(cp);
+        break;
+      }
+      if (f->cell_pending) {
+        log_error("frame: FRM_CELL_EXECUTE corr %llu refused — a cell is "
+                  "already in flight at '%s' (the loop is strictly "
+                  "single-cell)",
+                  (unsigned long long)cp->corr, f->sid_path);
+        f->cell_status = 1;
+        frm_cell_payload_destroy(cp);
+        break;
+      }
+#ifdef SA_HAS_PYTHON
+      /* The frame's OWN runtime: owner = this frame's actor, so cells'
+         agent.* verbs arrive in the frame inbox (answered corr-matched by
+         the behaviors above) and results come back as PYRT_RESULT. */
+      if (f->pyrt == NULL) {
+        pyrt_config_t pc;
+        pc.backend = SA_PYRT_BACKEND_SUBINTERPRETER;
+        pc.pool_cap = 0;             /* the process-wide default (2x cores) */
+        pc.idle_evict_ms = 0;
+        f->pyrt = pyrt_create(&f->actor, &pc);
+        if (f->pyrt == NULL) {
+          log_error("frame: pyrt runtime boot failed at '%s' — cell corr %llu "
+                    "answered as a failed result",
+                    f->sid_path, (unsigned long long)cp->corr);
+          f->cell_status = 1;
+          frm_cell_payload_destroy(cp);
+          break;
+        }
+      }
+      f->cell_corr = cp->corr;
+      f->cell_status = 0;
+      f->cell_pyrt_corr = pyrt_execute(f->pyrt, strdup(cp->code));
+      if (f->cell_pyrt_corr == 0) {
+        /* pyrt's boot/execute refusal contract: the RESULT never arrives, so
+           the cell completes right here as a failure. */
+        log_error("frame: pyrt execute refused corr %llu at '%s'",
+                  (unsigned long long)cp->corr, f->sid_path);
+        f->cell_status = 1;
+        frm_cell_payload_destroy(cp);
+        break;
+      }
+      f->cell_pending = 1;
+#else
+      log_error("frame: FRM_CELL_EXECUTE at '%s' but this build has no python "
+                "runtime — answering as a failed cell (corr %llu)",
+                f->sid_path, (unsigned long long)cp->corr);
+      f->cell_status = 1;
+#endif
+      frm_cell_payload_destroy(cp);
+      break;
+    }
+#ifdef SA_HAS_PYTHON
+    case PYRT_RESULT: {
+      /* The cell finished. When it is the pending cell: write the paired
+         cell.result event AND complete the slot in the same dispatch —
+         audit and wait-state move together. An unmatched result (nothing
+         pending, or a stale corr) is dropped loud: nothing in this module
+         executes cells outside the loop's single-cell discipline. */
+      pyrt_result_payload_t* r = (pyrt_result_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (r == NULL) {
+        log_error("frame: PYRT_RESULT with no payload at '%s'", f->sid_path);
+        break;
+      }
+      if (f->cell_pending && r->corr != 0 && r->corr == f->cell_pyrt_corr) {
+        json_value_t* result_payload = json_new_object();
+        if (result_payload == NULL) {
+          log_error("frame: out of memory building cell.result payload at '%s'",
+                    f->sid_path);
+        } else {
+          json_object_set(result_payload, "corr",
+                          json_new_int((int64_t)f->cell_corr));
+          json_object_set(result_payload, "status",
+                          json_new_int((int64_t)r->status));
+          json_object_set(result_payload, "text",
+                          (r->text != NULL) ? json_new_string(r->text)
+                                            : json_new_null());
+          if (_frame_event_write(f, "cell.result", result_payload) != 0) {
+            log_error("frame: cell.result event refused for corr %llu at '%s'"
+                      " (the wait slot still completes)",
+                      (unsigned long long)f->cell_corr, f->sid_path);
+          }
+        }
+        f->cell_status = r->status;
+        f->cell_pending = 0;
+      } else {
+        log_error("frame: unclaimed PYRT_RESULT corr %llu at '%s' — no "
+                  "pending cell matches; dropping",
+                  (unsigned long long)r->corr, f->sid_path);
+      }
+      pyrt_result_payload_destroy(r);
+      break;
+    }
+#endif
+    case FRM_STOP:
+      /* Control, not interruption: a cell in flight runs to its boundary;
+         the loop (which pumps this inbox) drains and then stops. */
+      f->stop_requested = 1;
+      log_info("frame: stop requested at '%s'", f->sid_path);
+      break;
+    case FRM_SPAWN: {
+      /* The cell-side spawn verb, answered corr-matched: the admission-only
+         frame_spawn runs (birth batch + spawn event + lineage triple, one
+         root batch) and the reply text is the child's sid path. The child
+         frame_t is released immediately — the admission is DURABLE, not a
+         live process; driving a child (frame_resume + frame_run_loop) is the
+         tree-slices' job. */
+      frm_spawn_payload_t* sp = (frm_spawn_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (sp == NULL) {
+        log_error("frame: FRM_SPAWN with no payload at '%s'", f->sid_path);
+        break;
+      }
+      uint8_t status = 1;
+      char* sid_out = NULL;
+      if (sp->corr == 0) {
+        log_error("frame: FRM_SPAWN with corr 0 at '%s' — nothing to match",
+                  f->sid_path);
+      } else {
+        frame_t* child = frame_spawn(f, sp->goal, sp->context_json);
+        if (child != NULL) {
+          sid_out = strdup(child->sid_path);
+          if (sid_out != NULL) {
+            status = 0;
+          } else {
+            log_error("frame: out of memory copying the spawn reply");
+          }
+          frame_destroy(child);
+        } else {
+          log_error("frame: spawn refused from a cell at '%s' (corr %llu) — "
+                    "the child admission never happened", f->sid_path,
+                    (unsigned long long)sp->corr);
+        }
+      }
+      _frame_bridge_reply(sp->corr, status, sid_out);
+      free(sid_out);
+      frm_spawn_payload_destroy(sp);
+      break;
+    }
+    case FRM_REPORT: {
+      /* The cell-side report verb: the REPORTING frame ends here. Children
+         bind the report event into the parent's log (frame_report, one batch);
+         top frames report into their own log (_frame_report_top). Either way
+         the reporting frame's status flips to done. */
+      frm_report_payload_t* rp = (frm_report_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (rp == NULL) {
+        log_error("frame: FRM_REPORT with no payload at '%s'", f->sid_path);
+        break;
+      }
+      uint8_t status = 1;
+      if (rp->corr == 0) {
+        log_error("frame: FRM_REPORT with corr 0 at '%s' — nothing to match",
+                  f->sid_path);
+      } else if (f->parent != NULL) {
+        status = (frame_report(f, rp->text) == 0) ? 0 : 1;
+        if (status != 0) {
+          log_error("frame: report batch failed for '%s' (corr %llu)",
+                    f->sid_path, (unsigned long long)rp->corr);
+        }
+      } else {
+        status = (_frame_report_top(f, rp->text) == 0) ? 0 : 1;
+        if (status != 0) {
+          log_error("frame: top report batch failed for '%s' (corr %llu)",
+                    f->sid_path, (unsigned long long)rp->corr);
+        }
+      }
+      _frame_bridge_reply(rp->corr, status, NULL);
+      frm_report_payload_destroy(rp);
+      break;
+    }
     default:
       break;
   }
@@ -636,6 +958,116 @@ static uint64_t _frame_restore_seq(frame_t* f) {
   if (value != NULL) identifier_destroy(value);
   database_scan_end(iter);
   return largest;
+}
+
+/* --- loop plumbing (frame_internal.h contract) ---------------------------- */
+
+int _frame_set_status_done(frame_t* f) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: status->done on a dead frame");
+    return -1;
+  }
+  raw_op_t ops[1];
+  ops[0].key = "meta/status";
+  ops[0].key_len = strlen("meta/status");
+  ops[0].value = (const uint8_t*)SA_FRAME_STATUS_DONE;
+  ops[0].value_len = strlen(SA_FRAME_STATUS_DONE);
+  ops[0].type = 0;
+  int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 1);
+  if (rc != 0) {
+    log_error("frame: status->done batch failed (%d) at '%s'", rc, f->sid_path);
+    return rc;
+  }
+  return 0;
+}
+
+uint8_t _frame_is_child(const frame_t* f) {
+  return (f != NULL && f->parent != NULL) ? 1 : 0;
+}
+
+const char* _frame_goal(const frame_t* f) {
+  return (f != NULL) ? f->goal : NULL;
+}
+
+uint8_t _frame_is_live(const frame_t* f) {
+  return (f != NULL && f->st != NULL) ? 1 : 0;
+}
+
+uint8_t _frame_stop_requested(const frame_t* f) {
+  return (f != NULL) ? f->stop_requested : 1;
+}
+
+unsigned _frame_loop_turn_cap(const frame_t* f) {
+  return (f != NULL && f->loop_turn_cap > 0) ? f->loop_turn_cap
+                                             : SA_LOOP_MAX_TURNS;
+}
+
+/* Backend resolution: the injected override wins; the DEFAULT is built
+   EXACTLY ONCE at first use from the frame's own config and becomes
+   frame-owned (freed in frame_destroy). A set override short-circuits this
+   before any default construction fires — that is the documented discipline
+   (a scripted test backend must never trigger an http-backend build). */
+model_backend_t* _frame_backend_get(frame_t* f) {
+  if (f == NULL) return NULL;
+  if (f->backend != NULL) return f->backend;
+  if (f->owned_backend != NULL) return f->owned_backend;
+
+  frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.model_base_url = f->model_base_url;
+  cfg.model_api_key = f->model_api_key;
+  cfg.model_name = f->model_name;
+  cfg.max_depth = f->max_depth;
+  model_backend_t* mb = model_http_backend_create(&cfg);
+  if (mb == NULL) {
+    log_error("frame: no backend set and the default http backend cannot be "
+              "built from the config of '%s' (base_url/model missing)", f->sid_path);
+    return NULL;
+  }
+  f->owned_backend = mb;
+  return mb;
+}
+
+uint8_t _frame_cell_pending(const frame_t* f) {
+  return (f != NULL) ? f->cell_pending : 0;
+}
+
+int _frame_cell_wait(frame_t* f, unsigned timeout_ms, uint8_t* status_out) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: cell wait on a dead frame");
+    return -1;
+  }
+  if (status_out == NULL) {
+    log_error("frame: cell wait needs a status out-param");
+    return -1;
+  }
+  /* Synchronous completion path: the FRM_CELL_EXECUTE behavior refuses
+     (pending stayed 0, status filled) — nothing to pump. */
+  if (f->cell_pending == 0) {
+    *status_out = f->cell_status;
+    return 0;
+  }
+
+  uint64_t deadline = platform_monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
+  for (;;) {
+    /* The pump runs EVERYTHING the inbound inbox holds: the running cell's
+       bridge verbs (FRM_REMEMBER/FRM_RECALL/...) — each answering corr-matched
+       through the bridge hook and thereby waking the pyrt thread — then the
+       PYRT_RESULT completing the slot. */
+    actor_run(&f->actor, ACTOR_BATCH_SIZE);
+    if (f->cell_pending == 0) {
+      *status_out = f->cell_status;
+      return 0;
+    }
+    if (platform_monotonic_ns() >= deadline) {
+      log_error("frame: cell corr %llu still in flight after %u ms at '%s' — "
+                "the wait gives up (the cell itself is NOT abandoned; its own "
+                "result completes the slot whenever it lands)",
+                (unsigned long long)f->cell_corr, timeout_ms, f->sid_path);
+      return -1;
+    }
+    platform_sleep_ms(1);
+  }
 }
 
 /* --- lifecycle ----------------------------------------------------------- */
@@ -869,6 +1301,106 @@ frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
   return f;
 }
 
+/* Boot-time restore (frame.h contract): open the existing subtree, refuse
+   without ANY write when the birth record is missing, restore seq via the
+   same reverse scan frame_create boots with, read depth + parent path back.
+   No meta writes, no events, and the loop does NOT restart here. */
+frame_t* frame_resume(wave_database_root_t* db, const char* sid,
+                      const frame_config_t* cfg) {
+  if (db == NULL) {
+    log_error("frame_resume: NULL root");
+    return NULL;
+  }
+  if (sid == NULL || sid[0] == '\0') {
+    log_error("frame_resume: sid required");
+    return NULL;
+  }
+
+  frame_t* f = get_clear_memory(sizeof(frame_t));
+  if (f == NULL) return NULL;
+  f->root = db;
+  f->sid_path = strdup(sid);
+
+  if (f->sid_path == NULL) {
+    log_error("frame_resume: out of memory copying sid");
+    free(f);
+    return NULL;
+  }
+
+  f->st = database_subtree_open(db->db, f->sid_path, '/');
+  if (f->st == NULL) {
+    log_error("frame_resume: no subtree at '%s' — not a resumable frame",
+              f->sid_path);
+    goto fail;
+  }
+  /* The birth record is the resume gate: a path without meta/created is not
+     one of this process's frames (typo, foreign prefix, missing db). */
+  char* created = _frame_subtree_text(f->st, "meta/created");
+  if (created == NULL) {
+    log_error("frame_resume: '%s' has no birth record (meta/created) — "
+              "refusing", f->sid_path);
+    goto fail;
+  }
+  free(created);
+
+  f->seq = _frame_restore_seq(f);
+
+  char* depth = _frame_subtree_text(f->st, "meta/depth");
+  if (depth != NULL) {
+    f->depth = (uint32_t)strtoul(depth, NULL, 10);
+    free(depth);
+  }
+  /* Live parent linkage is NOT restored (the parent frame_t is a separate
+     process object); the PATH is — the tree slice re-links a resumed child. */
+  f->parent_path = _frame_subtree_text(f->st, "meta/parent");
+  /* Goal is not separately persisted; the post-restart config is copied in
+     (NULL cfg carries none). */
+  if (cfg != NULL) {
+    f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
+    if (cfg->model_base_url != NULL) {
+      f->model_base_url = strdup(cfg->model_base_url);
+      if (f->model_base_url == NULL) goto fail;
+    }
+    if (cfg->model_api_key != NULL) {
+      f->model_api_key = strdup(cfg->model_api_key);
+      if (f->model_api_key == NULL) goto fail;
+    }
+    if (cfg->model_name != NULL) {
+      f->model_name = strdup(cfg->model_name);
+      if (f->model_name == NULL) goto fail;
+    }
+  } else {
+    f->max_depth = 4;
+  }
+
+  actor_init(&f->actor, f, _frame_behavior, NULL);
+  return f;
+
+fail:
+  if (f->st != NULL) database_subtree_close(f->st);
+  free(f->sid_path);
+  free(f);
+  return NULL;
+}
+
+void frame_set_model_backend(frame_t* f, model_backend_t* backend) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: set_model_backend on a dead frame");
+    return;
+  }
+  /* BORROWED (see frame.h): the frame stores the pointer without owning it;
+     a NULL resets to default construction at first use. */
+  f->backend = backend;
+}
+
+void frame_set_loop_turn_cap(frame_t* f, unsigned cap) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: set_loop_turn_cap on a dead frame");
+    return;
+  }
+  f->loop_turn_cap = cap;   /* 0 = the SA_LOOP_MAX_TURNS default */
+}
+
 const char* frame_sid(const frame_t* f) {
   return f ? f->sid_path : NULL;
 }
@@ -884,6 +1416,13 @@ uint8_t frame_is_done(const frame_t* f) {
 
 void frame_destroy(frame_t* f) {
   if (f == NULL) return;
+#ifdef SA_HAS_PYTHON
+  /* The runtime must stop BEFORE the mailbox it posts into is drained (its
+     worker thread and TLS point at the frame actor; the join is bounded). A
+     cell blocked on the bridge registry unblocks within its bounded wait. */
+  if (f->pyrt != NULL) pyrt_destroy(f->pyrt);
+  f->pyrt = NULL;
+#endif
   /* Inline teardown: no pool owns this actor (frame_create uses pool=NULL),
      so the enclosing struct's lifetime is ours to end here. */
   atomic_fetch_or(&f->actor.flags, ACTOR_FLAG_DESTROY);
@@ -896,6 +1435,10 @@ void frame_destroy(frame_t* f) {
   free(f->model_base_url);
   free(f->model_api_key);
   free(f->model_name);
+  if (f->owned_backend != NULL) {
+    model_backend_destroy(f->owned_backend);
+    f->owned_backend = NULL;
+  }
   free(f);
 }
 

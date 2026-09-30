@@ -49,6 +49,10 @@ if (BUILD_TESTING)
     if(SA_HAS_WDB)
       target_sources(testsecretagent PRIVATE test_frame.cpp)
       target_sources(testsecretagent PRIVATE test_model_decode.cpp)
+      # The loop suite rides both gates internally: restart/replay and the
+      # content-only paths are WDB-only; the cell-running tests nest the
+      # real `#if defined(SA_HAS_WDB) && defined(SA_HAS_PYTHON)` form inside.
+      target_sources(testsecretagent PRIVATE test_loop.cpp)
     endif()
 
     if(SA_HAS_PYTHON)
@@ -136,7 +140,11 @@ if (BUILD_TESTING)
     if(SA_ENABLE_ASAN AND SA_HAS_PYTHON)
       set(_sa_lsan_supp "${CMAKE_CURRENT_SOURCE_DIR}/lsan-cpython.supp")
       foreach(_test_name ${test_list} ${test_list_poolcap})
-        if(_test_name MATCHES "^TestPyrt")
+        # TestLoop runs real cells (the loop drives the frame's own pyrt), and
+        # TestPyAgent's harness answers bridge requests by hand — both carry
+        # the same CPython-owned suppression classes (TestPyrt predates them).
+        if(_test_name MATCHES "^TestPyrt" OR _test_name MATCHES "^TestLoop" OR
+           _test_name MATCHES "^TestPyAgent")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()
       endforeach()

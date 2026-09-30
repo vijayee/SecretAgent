@@ -46,10 +46,15 @@ typedef struct frm_spawn_payload_t { uint64_t corr; char* goal; char* context_js
 typedef struct frm_report_payload_t { uint64_t corr; char* text; } frm_report_payload_t;
 /* reply: corr + status + heap text */
 typedef struct frm_reply_payload_t { uint64_t corr; uint8_t status; char* text; } frm_reply_payload_t;
+/* cell execute (loop -> frame): `corr` pairs the cell.run event with the
+   cell.result event on the audit trail (the LOOP's corr space — pyrt's
+   executor corr stays inside the runtime). Ownership of `code` transfers. */
+typedef struct frm_cell_payload_t { uint64_t corr; char* code; } frm_cell_payload_t;
 void frm_remember_payload_destroy(void* p);
 void frm_spawn_payload_destroy(void* p);
 void frm_report_payload_destroy(void* p);
 void frm_reply_payload_destroy(void* p);
+void frm_cell_payload_destroy(void* p);
 
 /* JSON event record shape (authoritative):
    {"seq":<int>,"type":"<event-name>","frame":"<sid-path>","corr":<int|null>,

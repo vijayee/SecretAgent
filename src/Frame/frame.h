@@ -26,12 +26,43 @@ void wave_db_close(wave_database_root_t* db);
 
 typedef struct frame_t frame_t;
 
+typedef struct model_backend_t model_backend_t;   /* defined by model.h (Task 9) */
+
 /* parent NULL = top-level session (sid generated); goal may be NULL. */
 frame_t* frame_create(wave_database_root_t* db, frame_t* parent,
                       const char* goal, const frame_config_t* cfg);
+/* Boot-time restore of a frame whose subtree already exists on disk (the
+   restart path): opens the subtree at `sid` (the full path, e.g.
+   "sessions/<hex>"), refuses loudly WITHOUT writes when the birth record
+   (meta/created) is missing, restores the seq counter past every persisted
+   event, and reads meta/depth + meta/parent back into the frame. It writes
+   NOTHING (no meta, no events — restart changes no durable state) and does
+   NOT start the turn loop (loop.h's frame_run_loop does).
+   `cfg` is the post-restart model config (copied in; NULL = none carried).
+   The goal is not separately persisted and comes back NULL; the lineage
+   parent is restored only as the parent PATH (meta/parent) — the live
+   parent frame_t is a separate process object, so a resumed child reports
+   loud refusal instead of a phantom link until the tree slice re-links it.
+   Status is whatever the store holds (a resumed "done" frame stays done). */
+frame_t* frame_resume(wave_database_root_t* db, const char* sid,
+                      const frame_config_t* cfg);
 const char* frame_sid(const frame_t* f);            /* full subtree path, e.g. sessions/<sid> */
 uint8_t frame_is_done(const frame_t* f);
 void frame_destroy(frame_t* f);
+
+/* Model backend for frame_run_loop: INJECTED, BORROWED — the frame stores
+   the pointer but does not own or destroy it (scripted test backends are
+   stack objects). When set, the loop uses it exclusively and never builds
+   the default. When NOT set, the first use constructs the default
+   model_http_backend_create (from the frame's config) ONCE, and THAT
+   instance is frame-owned (freed in frame_destroy). */
+void frame_set_model_backend(frame_t* f, model_backend_t* backend);
+
+/* Total model turns frame_run_loop may issue before failing loud with a
+   control "turn-limit" event. 0 = the loop's built-in default (64). The cap
+   is runtime state (not a compile-time constant) so a test can bound the
+   always-tool-calling model to a handful of turns. */
+void frame_set_loop_turn_cap(frame_t* f, unsigned cap);
 
 /* Store operations (called by frame behaviors; ONE root batch per effect). */
 int frame_remember_local(frame_t* f, const char* key, const char* json_value);   /* state/local/<key> */
