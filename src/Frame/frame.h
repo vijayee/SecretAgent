@@ -40,6 +40,20 @@ int frame_remember_ctx(frame_t* f, const char* key, const char* json_value);    
 char* frame_recall(frame_t* f, const char* key);        /* malloc'd JSON text; NULL if unresolvable */
 int frame_append_msg(frame_t* f, const char* role, const char* content);   /* msg.append event */
 
+/* Admission-only spawn (PA semantics): validates depth, creates the child
+   subtree, ONE root batch: child's birth batch (meta + status) + parent's
+   frame.spawn event + lineage triple ops. Returns the child immediately;
+   fails (NULL + log_error) when depth is exceeded — never substitutes.
+   context_json (nullable) is stored as the child's state/ctx/handoff key. */
+frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json);
+/* Child-side: frame.report event in the child + one event bound into the
+   parent's log; marks the child done. */
+int frame_report(frame_t* child, const char* text);
+int frame_join(frame_t* child);   /* frame.join event in the parent; child becomes joined */
+/* test/debug accessor: malloc'd JSON array of the frame's raw event records
+   (bounded to last 512, root-level absolute-bounds scan) */
+char* frame_debug_events(frame_t* f);
+
 #endif /* SA_HAS_WDB */
 
 #endif // SA_FRAME_H

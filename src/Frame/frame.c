@@ -33,6 +33,7 @@ void frm_reply_payload_destroy(void* p) {
 #include <Database/database_subtree.h>
 #include <Database/database_iterator.h>
 #include <HBTrie/path.h>
+#include <Layers/graph/graph.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -50,12 +51,28 @@ void frm_reply_payload_destroy(void* p) {
 #define SA_FRAME_SID_HEX_LEN 8
 
 /* Status key values (meta/status). frame_create stamps "running"; Task 5's
-   report/join and Task 10's loop mark "done". */
+   report marks "done" and join only logs (a joined child has already done-
+   reported). Task 10's loop marks "done" on end-turn. */
 static const char SA_FRAME_STATUS_RUNNING[] = "running";
 static const char SA_FRAME_STATUS_DONE[] = "done";
 
+/* Reserved subtree + graph layer that holds ONE lineage index per ROOT db:
+   triples (child_sid_path, "parent_of", parent_sid_path) as SPO/POS/OSP/PSO
+   presence keys (no schema → all four indices). The layer rides cross-subtree
+   via graph_triple_expand_ops: its index ops are FULL root-database paths, so
+   they merge into the very same one atomic root batch as the frame's own
+   event/meta/state writes (graph.h:71-86). Built eagerly at wave_db_open —
+   lazy init would race between scheduler-pooled frames. */
+#define SA_FRAME_LINEAGE_SUBTREE "lineage"
+#define SA_FRAME_LINEAGE_PREDICATE "parent_of"
+
+/* frame_debug_events materialization bound: newest 512 records max. */
+#define SA_FRAME_DEBUG_MAX_EVENTS 512
+
 struct wave_database_root_t {
   database_t* db;             /* the ONE root database */
+  graph_layer_t* lineage;     /* subtree-mode graph layer over lineage_st */
+  database_subtree_t* lineage_st;  /* reserved "lineage" subtree (open for life) */
   uint32_t rng;               /* xorshift32 state for sid randomness */
   ATOMIC(uint64_t) counter;   /* sid uniqueness counter */
 };
@@ -63,6 +80,7 @@ struct wave_database_root_t {
 struct frame_t {
   actor_t actor;              /* FIRST member (style guide) */
   wave_database_root_t* root;
+  frame_t* parent;            /* borrowed; NULL for top-level frames */
   database_subtree_t* st;     /* subtree prefix = sid_path (open for life) */
   char* sid_path;             /* full path from root, e.g. "sessions/<hex>" */
   char* parent_path;          /* parent's sid_path; NULL for root */
@@ -136,12 +154,15 @@ static char* _frame_subtree_text(database_subtree_t* st, const char* key) {
 }
 
 /* Event record JSON per the frozen shape: {"seq","type","frame","corr","at",
-   "cause","payload"}. Bridge events carry a corr (Tasks 5-6 will use it); a
+   "cause","payload"}. Bridge events carry a corr (Task 6 will use it); a
    direct store write has none, so "corr" is JSON null in this slice. "cause"
-   = the seq of this frame's PREVIOUS event (the audit chain); JSON null for
-   the frame's first event. Consumes `payload`. */
-static char* _frame_event_json(frame_t* f, uint64_t seq, const char* type_name,
-                               json_value_t* payload) {
+   = the seq of the RECORDING frame's PREVIOUS event (the audit chain); JSON
+   null only when seq <= 1. `frame_path` names the recording frame's subtree —
+   a report/bind writes the child's record with the child's path + seq and a
+   separate parent's record with the parent's, so the path is explicit.
+   Consumes `payload`. */
+static char* _frame_event_json_full(const char* frame_path, uint64_t seq,
+                                    const char* type_name, json_value_t* payload) {
   char iso[25];
   _frame_iso_now(iso);
   json_value_t* rec = json_new_object();
@@ -152,7 +173,7 @@ static char* _frame_event_json(frame_t* f, uint64_t seq, const char* type_name,
   }
   json_object_set(rec, "seq", json_new_int((int64_t)seq));
   json_object_set(rec, "type", json_new_string(type_name));
-  json_object_set(rec, "frame", json_new_string(f->sid_path));
+  json_object_set(rec, "frame", json_new_string(frame_path));
   json_object_set(rec, "corr", json_new_null());
   json_object_set(rec, "at", json_new_string(iso));
   if (seq <= 1) {
@@ -164,6 +185,32 @@ static char* _frame_event_json(frame_t* f, uint64_t seq, const char* type_name,
   char* text = json_serialize(rec);
   json_value_destroy(rec);
   return text;
+}
+
+/* Convenience for the recording frame itself. */
+static char* _frame_event_json(frame_t* f, uint64_t seq, const char* type_name,
+                               json_value_t* payload) {
+  return _frame_event_json_full(f->sid_path, seq, type_name, payload);
+}
+
+/* Compose "<sid_path>/<rel>" — a key whose FULL root-database path is usable
+   in a cross-subtree root batch (malloc'd, free() it). */
+static char* _frame_subkey(const char* sid_path, const char* rel) {
+  size_t len = strlen(sid_path) + 1 + strlen(rel);
+  char* out = get_memory(len + 1);
+  if (out == NULL) {
+    log_error("frame: out of memory composing '%s/%s'", sid_path, rel);
+    return NULL;
+  }
+  snprintf(out, len + 1, "%s/%s", sid_path, rel);
+  return out;
+}
+
+/* Compose "<sid_path>/events/<%020llu seq>" (malloc'd, free() it). */
+static char* _frame_event_key(const char* sid_path, uint64_t seq) {
+  char evkey[32];
+  snprintf(evkey, sizeof(evkey), "events/%020llu", (unsigned long long)seq);
+  return _frame_subkey(sid_path, evkey);
 }
 
 static int _frame_key_valid(const char* key, const char* op) {
@@ -366,27 +413,53 @@ static void frame_dispatch(void* state, message_t* msg) {
   }
 }
 
-/* Largest event seq ever written under events/ — 0 when fresh. Reverse scan
-   (root-level, absolute composed bounds — the subtree iterator strips result
-   paths but compares them against the FULL stored bound paths, so subtree-
-   relative bounds never match) over the frame's bounded events range takes
-   the first (largest) key; the seq counter continues past it. */
-static uint64_t _frame_restore_seq(frame_t* f) {
+/* Compose the frame's events-range bounds as ABSOLUTE root-database paths for
+   database_scan_start/_reverse. WaveDB's subtree bounded scans are broken in
+   BOTH directions (the subtree iterator compares STRIPPED result paths against
+   the FULL stored bound copies, so subtree-relative bounds never match) —
+   EVERY scan in this file is root-level with composed absolute bounds, the
+   canonical `_frame_restore_seq` pattern. On success the start/end outputs
+   are consumed by the subsequent database_scan_start/_reverse call (which owns
+   them); the caller therefore just passes them in and never destroys them.
+   Returns 0, or -1 on OOM (both paths freed, outputs NULLed). Consumed by the
+   subsequent database_scan_start/_reverse call, which owns the paths. */
+static int _frame_events_bounds(frame_t* f, path_t** start, path_t** end) {
   size_t base = strlen(f->sid_path);
   char* lo = get_memory(base + sizeof("/events"));
   char* hi = get_memory(base + sizeof("/events0"));
   if (lo == NULL || hi == NULL) {
     free(lo);
     free(hi);
-    log_error("frame: out of memory composing boot scan bounds");
-    return 0;
+    *start = NULL;
+    *end = NULL;
+    return -1;
   }
   snprintf(lo, base + sizeof("/events"), "%s/events", f->sid_path);
   snprintf(hi, base + sizeof("/events0"), "%s/events0", f->sid_path);
-  path_t* start = _frame_path_from(lo);
-  path_t* end = _frame_path_from(hi);
+  *start = _frame_path_from(lo);
+  *end = _frame_path_from(hi);
   free(lo);
   free(hi);
+  if (*start == NULL || *end == NULL) {
+    if (*start != NULL) path_destroy(*start);
+    if (*end != NULL) path_destroy(*end);
+    *start = NULL;
+    *end = NULL;
+    return -1;
+  }
+  return 0;
+}
+
+/* Largest event seq ever written under events/ — 0 when fresh. Reverse scan
+   (root-level, absolute composed bounds) over the frame's bounded events
+   range takes the first (largest) key; the seq counter continues past it. */
+static uint64_t _frame_restore_seq(frame_t* f) {
+  path_t* start = NULL;
+  path_t* end = NULL;
+  if (_frame_events_bounds(f, &start, &end) != 0) {
+    log_error("frame: out of memory composing boot scan bounds");
+    return 0;
+  }
   database_iterator_t* iter = database_scan_start_reverse(f->root->db, start, end);
   if (iter == NULL) {
     path_destroy(start);
@@ -448,20 +521,61 @@ wave_database_root_t* wave_db_open(const char* location) {
   root->rng = (uint32_t)((uintptr_t)db ^ (uint32_t)time(NULL) ^ 0x9e3779b9u);
   if (root->rng == 0) root->rng = 0x2545f491u;
   atomic_store(&root->counter, 0);
+
+  /* Lineage graph layer: ONE per root db, in the reserved "lineage" subtree.
+     Subtree mode keeps it namespace-isolated (no layer-type collision at root
+     scope) and makes graph_triple_expand_ops emit FULL root-database paths, so
+     triple index ops merge into the same one atomic root batch as the frame
+     writes. Created EAGERLY — a lazy init would race between frames pooled on
+     scheduler workers. Sub-optional layer availability is not fatal here
+     (nothing needs lineage until a spawn); frame_spawn fails loudly instead. */
+  root->lineage_st = database_subtree_open(root->db, SA_FRAME_LINEAGE_SUBTREE, '/');
+  if (root->lineage_st != NULL) {
+    int gerr = 0;
+    root->lineage = graph_layer_create(NULL, NULL, root->lineage_st, &gerr);
+    if (root->lineage == NULL) {
+      log_error("wave_db_open: lineage graph layer create failed (%d) — "
+                "spawns will be refused", gerr);
+      database_subtree_close(root->lineage_st);
+      root->lineage_st = NULL;
+    }
+  }
+
   return root;
 }
 
 void wave_db_close(wave_database_root_t* root) {
   if (root == NULL) return;
+  if (root->lineage != NULL) {
+    /* Layer teardown: schema snapshot + drop the layer's lineage-subtree
+       reference. It never destroys the shared database (subtree mode). */
+    graph_layer_destroy(root->lineage);
+    root->lineage = NULL;
+  }
+  if (root->lineage_st != NULL) {
+    /* Our own reference is the LAST subtree ref; closing it runs
+       database_destroy inside the subtree once — one deref of the shared db,
+       never a double free (database_destroy is refcount-aware). */
+    database_subtree_close(root->lineage_st);
+    root->lineage_st = NULL;
+  }
   database_destroy(root->db);
   root->db = NULL;
   free(root);
 }
 
-frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
-                      const char* goal, const frame_config_t* cfg) {
+/* Allocate and initialize a frame struct + its (unwritten) subtree:
+   sid generation, composed sid_path, parent linkage, config (explicit cfg
+   wins; otherwise inherit the parent's model config + depth budget),
+   subtree open, seq restore, inline actor. The BIRTH META BATCH is NOT
+   this function's business — frame_create writes it via the subtree
+   wrapper; frame_spawn folds it into the ONE root admission batch.
+   frame_spawn passes cfg=NULL to inherit; frame_create always passes the
+   caller's (possibly NULL) cfg. */
+static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
+                             const char* goal, const frame_config_t* cfg) {
   if (root == NULL) {
-    log_error("frame_create: NULL root");
+    log_error("frame: NULL root");
     return NULL;
   }
 
@@ -489,15 +603,12 @@ frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
     snprintf(f->sid_path, path_len + 1, "%s/frames/%s", parent->sid_path, hex);
     f->parent_path = strdup(parent->sid_path);
     if (f->parent_path == NULL) goto fail;
+    f->parent = parent;         /* borrowed: report/join bind via it */
     f->depth = parent->depth + 1;
   }
 
-  f->max_depth = (cfg != NULL && cfg->max_depth > 0) ? cfg->max_depth : 4;
-  if (goal != NULL) {
-    f->goal = strdup(goal);
-    if (f->goal == NULL) goto fail;
-  }
   if (cfg != NULL) {
+    f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
     if (cfg->model_base_url != NULL) {
       f->model_base_url = strdup(cfg->model_base_url);
       if (f->model_base_url == NULL) goto fail;
@@ -510,17 +621,60 @@ frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
       f->model_name = strdup(cfg->model_name);
       if (f->model_name == NULL) goto fail;
     }
+  } else if (parent != NULL) {
+    /* Spawned children inherit the parent's depth budget and model config. */
+    f->max_depth = parent->max_depth;
+    if (parent->model_base_url != NULL) {
+      f->model_base_url = strdup(parent->model_base_url);
+      if (f->model_base_url == NULL) goto fail;
+    }
+    if (parent->model_api_key != NULL) {
+      f->model_api_key = strdup(parent->model_api_key);
+      if (f->model_api_key == NULL) goto fail;
+    }
+    if (parent->model_name != NULL) {
+      f->model_name = strdup(parent->model_name);
+      if (f->model_name == NULL) goto fail;
+    }
+  } else {
+    f->max_depth = 4;
+  }
+
+  if (goal != NULL) {
+    f->goal = strdup(goal);
+    if (f->goal == NULL) goto fail;
   }
 
   f->st = database_subtree_open(root->db, f->sid_path, '/');
   if (f->st == NULL) {
-    log_error("frame_create: subtree open failed for '%s'", f->sid_path);
+    log_error("frame: subtree open failed for '%s'", f->sid_path);
     goto fail;
   }
 
   /* Boot: continue the seq counter past any persisted events (restart-safe).
      (No events in this task — Task 10's restart/replay test depends on this.) */
   f->seq = _frame_restore_seq(f);
+
+  /* Inline actor (pool NULL): tests/loop pump the mailbox by hand. */
+  actor_init(&f->actor, f, frame_dispatch, NULL);
+  return f;
+
+fail:
+  if (f->st != NULL) database_subtree_close(f->st);
+  free(f->sid_path);
+  free(f->parent_path);
+  free(f->goal);
+  free(f->model_base_url);
+  free(f->model_api_key);
+  free(f->model_name);
+  free(f);
+  return NULL;
+}
+
+frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
+                      const char* goal, const frame_config_t* cfg) {
+  frame_t* f = _frame_alloc(root, parent, goal, cfg);
+  if (f == NULL) return NULL;
 
   /* Birth batch: ONE atomic batch with the frame's meta keys. Loop-driven
      frames start "running"; they end via the loop (Task 10). */
@@ -560,24 +714,12 @@ frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
     int rc = database_subtree_batch_sync_raw(f->st, '/', ops, nops);
     if (rc != 0) {
       log_error("frame_create: meta batch failed (%d) for '%s'", rc, f->sid_path);
-      goto fail;
+      frame_destroy(f);
+      return NULL;
     }
   }
 
-  /* Inline actor (pool NULL): tests/loop pump the mailbox by hand. */
-  actor_init(&f->actor, f, frame_dispatch, NULL);
   return f;
-
-fail:
-  if (f->st != NULL) database_subtree_close(f->st);
-  free(f->sid_path);
-  free(f->parent_path);
-  free(f->goal);
-  free(f->model_base_url);
-  free(f->model_api_key);
-  free(f->model_name);
-  free(f);
-  return NULL;
 }
 
 const char* frame_sid(const frame_t* f) {
@@ -677,6 +819,459 @@ char* frame_recall(frame_t* f, const char* key) {
 
 int frame_append_msg(frame_t* f, const char* role, const char* content) {
   return _frame_append_msg(f, role, content);
+}
+
+/* --- spawn / report / join ----------------------------------------------- */
+
+/* Admission-only spawn. Nothing is written before the batch, and the batch
+   is ONE root `database_batch_sync_raw` combining three sources of keys:
+     - the child's birth meta (meta/created, meta/status, meta/depth,
+       meta/parent) — composed as full root paths,
+     - the child's ctx handoff key (state/ctx/handoff) when context_json is
+       non-NULL,
+     - the parent's frame.spawn event,
+     - the lineage triple index ops (graph_triple_expand_ops on the root's
+       reserved lineage layer — full root-database paths via the subtree
+       wrapper's prepend). All one transaction / one WAL record. */
+frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json) {
+  if (parent == NULL || parent->st == NULL) {
+    log_error("frame_spawn: no live parent frame");
+    return NULL;
+  }
+
+  /* Admission only: fail loud, never substitute. */
+  if (parent->depth + 1 > parent->max_depth) {
+    log_error("frame_spawn: depth %u would exceed max_depth %u of '%s' — "
+              "admission refused",
+              parent->depth + 1u, parent->max_depth, parent->sid_path);
+    return NULL;
+  }
+  if (context_json != NULL) {
+    json_value_t* parsed_ctx = _frame_parse_or_null(context_json);
+    if (parsed_ctx == NULL) {
+      log_error("frame_spawn: handoff context must be valid JSON");
+      return NULL;
+    }
+    json_value_destroy(parsed_ctx);   /* stored verbatim as raw text */
+  }
+
+  frame_t* child = _frame_alloc(parent->root, parent, goal, NULL);
+  if (child == NULL) return NULL;
+
+  uint64_t pseq = parent->seq + 1;
+
+  json_value_t* payload = json_new_object();
+  if (payload == NULL) {
+    log_error("frame_spawn: out of memory building spawn payload");
+    frame_destroy(child);
+    return NULL;
+  }
+  json_object_set(payload, "child_sid", json_new_string(child->sid_path));
+  json_object_set(payload, "goal",
+                  goal != NULL ? json_new_string(goal) : json_new_null());
+  json_object_set(payload, "depth", json_new_int((int64_t)child->depth));
+  char* event_text = _frame_event_json_full(parent->sid_path, pseq,
+                                            "frame.spawn", payload);
+  if (event_text == NULL) {
+    frame_destroy(child);
+    return NULL;
+  }
+
+  char iso[25];
+  _frame_iso_now(iso);
+  char depth_buf[11];
+  snprintf(depth_buf, sizeof(depth_buf), "%u", child->depth);
+
+  char* k_created = _frame_subkey(child->sid_path, "meta/created");
+  char* k_status = _frame_subkey(child->sid_path, "meta/status");
+  char* k_depth = _frame_subkey(child->sid_path, "meta/depth");
+  char* k_parent = _frame_subkey(child->sid_path, "meta/parent");
+  char* k_handoff = (context_json != NULL)
+                        ? _frame_subkey(child->sid_path, "state/ctx/handoff")
+                        : NULL;
+  char* k_event = _frame_event_key(parent->sid_path, pseq);
+  if (k_created == NULL || k_status == NULL || k_depth == NULL ||
+      k_parent == NULL || (context_json != NULL && k_handoff == NULL) ||
+      k_event == NULL) {
+    free(k_created);
+    free(k_status);
+    free(k_depth);
+    free(k_parent);
+    free(k_handoff);
+    free(k_event);
+    free(event_text);
+    frame_destroy(child);
+    return NULL;
+  }
+
+  size_t total_bytes = 0;
+  raw_op_t ops[10];   /* 5 meta/handoff + 1 event + 4 index ops, maxed out */
+  size_t nops = 0;
+  ops[nops].key = k_created;
+  ops[nops].key_len = strlen(k_created);
+  ops[nops].value = (const uint8_t*)iso;
+  ops[nops].value_len = strlen(iso);
+  ops[nops].type = 0;
+  total_bytes += ops[nops].key_len + ops[nops].value_len;
+  nops++;
+  ops[nops].key = k_status;
+  ops[nops].key_len = strlen(k_status);
+  ops[nops].value = (const uint8_t*)SA_FRAME_STATUS_RUNNING;
+  ops[nops].value_len = strlen(SA_FRAME_STATUS_RUNNING);
+  ops[nops].type = 0;
+  total_bytes += ops[nops].key_len + ops[nops].value_len;
+  nops++;
+  ops[nops].key = k_depth;
+  ops[nops].key_len = strlen(k_depth);
+  ops[nops].value = (const uint8_t*)depth_buf;
+  ops[nops].value_len = strlen(depth_buf);
+  ops[nops].type = 0;
+  total_bytes += ops[nops].key_len + ops[nops].value_len;
+  nops++;
+  ops[nops].key = k_parent;
+  ops[nops].key_len = strlen(k_parent);
+  ops[nops].value = (const uint8_t*)parent->sid_path;
+  ops[nops].value_len = strlen(parent->sid_path);
+  ops[nops].type = 0;
+  total_bytes += ops[nops].key_len + ops[nops].value_len;
+  nops++;
+  if (context_json != NULL) {
+    ops[nops].key = k_handoff;
+    ops[nops].key_len = strlen(k_handoff);
+    ops[nops].value = (const uint8_t*)context_json;
+    ops[nops].value_len = strlen(context_json);
+    ops[nops].type = 0;
+    total_bytes += ops[nops].key_len + ops[nops].value_len;
+    nops++;
+  }
+  ops[nops].key = k_event;
+  ops[nops].key_len = strlen(k_event);
+  ops[nops].value = (const uint8_t*)event_text;
+  ops[nops].value_len = strlen(event_text);
+  ops[nops].type = 0;
+  total_bytes += ops[nops].key_len + ops[nops].value_len;
+  nops++;
+
+  /* Fail loud before the write, never silent truncation. */
+  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame_spawn: admission batch for '%s' is %zu bytes, exceeding "
+              "the %d-byte WAL batch cap — refusing, never truncating "
+              "(trim the handoff context)",
+              child->sid_path, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(k_created);
+    free(k_status);
+    free(k_depth);
+    free(k_parent);
+    free(k_handoff);
+    free(k_event);
+    free(event_text);
+    frame_destroy(child);
+    return NULL;
+  }
+
+  /* Lineage triple (child_sid_path, "parent_of", parent_sid_path): expand the
+     index ops against the root's reserved lineage layer and merge them into
+     the same one batch. 1-4 ops per triple (schema-less default = all four). */
+  raw_op_t gops[4];
+  size_t ngo = graph_triple_expand_ops(parent->root->lineage,
+                                       child->sid_path,
+                                       SA_FRAME_LINEAGE_PREDICATE,
+                                       parent->sid_path, 0, gops, 4);
+  if (ngo == 0) {
+    log_error("frame_spawn: lineage triple expansion failed for '%s' — no "
+              "lineage index op was produced, refusing the admission",
+              child->sid_path);
+    free(k_created);
+    free(k_status);
+    free(k_depth);
+    free(k_parent);
+    free(k_handoff);
+    free(k_event);
+    free(event_text);
+    frame_destroy(child);
+    return NULL;
+  }
+  for (size_t i = 0; i < ngo; i++) {
+    total_bytes += gops[i].key_len;
+    ops[nops + i] = gops[i];
+  }
+
+  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame_spawn: admission batch for '%s' is %zu bytes, exceeding "
+              "the %d-byte WAL batch cap — refusing, never truncating",
+              child->sid_path, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
+    for (size_t i = 0; i < ngo; i++) free((void*)gops[i].key);
+    free(k_created);
+    free(k_status);
+    free(k_depth);
+    free(k_parent);
+    free(k_handoff);
+    free(k_event);
+    free(event_text);
+    frame_destroy(child);
+    return NULL;
+  }
+  nops += ngo;
+
+  int rc = database_batch_sync_raw(parent->root->db, '/', ops, nops);
+  for (size_t i = 0; i < nops; i++) free((void*)ops[i].key);
+  free(event_text);
+  if (rc != 0) {
+    log_error("frame_spawn: admission batch failed (%d) for '%s' under '%s' — "
+              "nothing committed", rc, child->sid_path, parent->sid_path);
+    frame_destroy(child);
+    return NULL;
+  }
+  parent->seq = pseq;
+  return child;
+}
+
+/* Report: the child's frame.report event, the parent's bound frame.report
+   event, and the child's status → done, in ONE root batch. Both events carry
+   payload {child_sid, text}; each keeps its own frame's seq cause chain. */
+int frame_report(frame_t* child, const char* text) {
+  if (child == NULL || child->st == NULL) {
+    log_error("frame_report: dead frame");
+    return -1;
+  }
+  if (text == NULL) {
+    log_error("frame_report: report text required");
+    return -1;
+  }
+  frame_t* parent = child->parent;
+  if (parent == NULL || parent->st == NULL) {
+    log_error("frame_report: no live parent log to bind '%s' into",
+              child->sid_path);
+    return -1;
+  }
+
+  uint64_t cseq = child->seq + 1;
+  uint64_t pseq = parent->seq + 1;
+
+  json_value_t* child_payload = json_new_object();
+  if (child_payload == NULL) {
+    log_error("frame_report: out of memory building report payload");
+    return -1;
+  }
+  json_object_set(child_payload, "child_sid", json_new_string(child->sid_path));
+  json_object_set(child_payload, "text", json_new_string(text));
+  char* child_text = _frame_event_json_full(child->sid_path, cseq,
+                                            "frame.report", child_payload);
+  if (child_text == NULL) return -1;
+
+  json_value_t* parent_payload = json_new_object();
+  if (parent_payload == NULL) {
+    log_error("frame_report: out of memory building bound report payload");
+    free(child_text);
+    return -1;
+  }
+  json_object_set(parent_payload, "child_sid", json_new_string(child->sid_path));
+  json_object_set(parent_payload, "text", json_new_string(text));
+  char* parent_text = _frame_event_json_full(parent->sid_path, pseq,
+                                             "frame.report", parent_payload);
+  if (parent_text == NULL) {
+    free(child_text);
+    return -1;
+  }
+
+  char* k_cev = _frame_event_key(child->sid_path, cseq);
+  char* k_pev = _frame_event_key(parent->sid_path, pseq);
+  char* k_status = _frame_subkey(child->sid_path, "meta/status");
+  if (k_cev == NULL || k_pev == NULL || k_status == NULL) {
+    free(k_cev);
+    free(k_pev);
+    free(k_status);
+    free(child_text);
+    free(parent_text);
+    return -1;
+  }
+
+  raw_op_t ops[3];
+  ops[0].key = k_cev;
+  ops[0].key_len = strlen(k_cev);
+  ops[0].value = (const uint8_t*)child_text;
+  ops[0].value_len = strlen(child_text);
+  ops[0].type = 0;
+  ops[1].key = k_pev;
+  ops[1].key_len = strlen(k_pev);
+  ops[1].value = (const uint8_t*)parent_text;
+  ops[1].value_len = strlen(parent_text);
+  ops[1].type = 0;
+  ops[2].key = k_status;
+  ops[2].key_len = strlen(k_status);
+  ops[2].value = (const uint8_t*)SA_FRAME_STATUS_DONE;
+  ops[2].value_len = strlen(SA_FRAME_STATUS_DONE);
+  ops[2].type = 0;
+
+  size_t total_bytes = strlen(k_cev) + strlen(child_text) +
+                       strlen(k_pev) + strlen(parent_text) +
+                       strlen(k_status) + strlen(SA_FRAME_STATUS_DONE);
+  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame_report: report batch from '%s' is %zu bytes, exceeding "
+              "the %d-byte WAL batch cap — refusing, never truncating",
+              child->sid_path, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(k_cev);
+    free(k_pev);
+    free(k_status);
+    free(child_text);
+    free(parent_text);
+    return -3;
+  }
+
+  int rc = database_batch_sync_raw(child->root->db, '/', ops, 3);
+  free(k_cev);
+  free(k_pev);
+  free(k_status);
+  free(child_text);
+  free(parent_text);
+  if (rc != 0) {
+    log_error("frame_report: report batch failed (%d) for '%s' into '%s' — "
+              "nothing committed", rc, child->sid_path, parent->sid_path);
+    return rc;
+  }
+  child->seq = cseq;
+  parent->seq = pseq;
+  return 0;
+}
+
+/* Join: ONE frame.join event in the parent's log {child_sid}; the child's
+   status stays "done" (report already marked it) and the frame_t destruction
+   remains the caller's job — join only logs the close in the parent. */
+int frame_join(frame_t* child) {
+  if (child == NULL || child->st == NULL) {
+    log_error("frame_join: dead frame");
+    return -1;
+  }
+  frame_t* parent = child->parent;
+  if (parent == NULL || parent->st == NULL) {
+    log_error("frame_join: no live parent log to join '%s' out of",
+              child->sid_path);
+    return -1;
+  }
+
+  uint64_t pseq = parent->seq + 1;
+  json_value_t* payload = json_new_object();
+  if (payload == NULL) {
+    log_error("frame_join: out of memory building join payload");
+    return -1;
+  }
+  json_object_set(payload, "child_sid", json_new_string(child->sid_path));
+  char* parent_text = _frame_event_json_full(parent->sid_path, pseq,
+                                             "frame.join", payload);
+  if (parent_text == NULL) return -1;
+
+  char* k_pev = _frame_event_key(parent->sid_path, pseq);
+  if (k_pev == NULL) {
+    free(parent_text);
+    return -1;
+  }
+
+  raw_op_t ops[1];
+  ops[0].key = k_pev;
+  ops[0].key_len = strlen(k_pev);
+  ops[0].value = (const uint8_t*)parent_text;
+  ops[0].value_len = strlen(parent_text);
+  ops[0].type = 0;
+
+  size_t total_bytes = strlen(k_pev) + strlen(parent_text);
+  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame_join: join batch for '%s' is %zu bytes, exceeding the "
+              "%d-byte WAL batch cap — refusing, never truncating",
+              child->sid_path, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(k_pev);
+    free(parent_text);
+    return -3;
+  }
+
+  int rc = database_batch_sync_raw(child->root->db, '/', ops, 1);
+  free(k_pev);
+  free(parent_text);
+  if (rc != 0) {
+    log_error("frame_join: join batch failed (%d) for '%s' out of '%s' — "
+              "nothing committed", rc, child->sid_path, parent->sid_path);
+    return rc;
+  }
+  parent->seq = pseq;
+  return 0;
+}
+
+/* Test/debug accessor: the frame's raw event records as a malloc'd JSON array.
+   Root-level REVERSE scan over the frame's events range with absolute composed
+   bounds (see _frame_events_bounds — subtree bounded scans are broken in both
+   directions), materializing at most the newest SA_FRAME_DEBUG_MAX_EVENTS
+   records, emitted in ascending seq order. */
+char* frame_debug_events(frame_t* f) {
+  if (f == NULL || f->st == NULL) return NULL;
+
+  path_t* start = NULL;
+  path_t* end = NULL;
+  if (_frame_events_bounds(f, &start, &end) != 0) {
+    log_error("frame_debug_events: out of memory composing scan bounds");
+    return NULL;
+  }
+  database_iterator_t* iter = database_scan_start_reverse(f->root->db, start, end);
+  if (iter == NULL) {
+    log_error("frame_debug_events: reverse scan failed on '%s'", f->sid_path);
+    return NULL;
+  }
+
+  char* texts[SA_FRAME_DEBUG_MAX_EVENTS];   /* newest-first (descending seq) */
+  size_t n = 0;
+  path_t* key = NULL;
+  identifier_t* value = NULL;
+  while (n < SA_FRAME_DEBUG_MAX_EVENTS) {
+    path_t* k = NULL;
+    identifier_t* v = NULL;
+    int rc = database_scan_prev(iter, &k, &v);
+    if (rc != 0) break;                    /* -1: out of records, -2: error */
+    size_t len = 0;
+    uint8_t* data = identifier_get_data_copy(v, &len);
+    if (data != NULL) {
+      char* text = get_memory(len + 1);
+      if (text == NULL) {
+        free(data);
+        log_error("frame_debug_events: out of memory materializing a record");
+      } else {
+        memcpy(text, data, len);
+        text[len] = '\0';
+        texts[n++] = text;
+      }
+      free(data);
+    } else {
+      log_error("frame_debug_events: record value copy failed on '%s'",
+                f->sid_path);
+    }
+    path_destroy(k);
+    identifier_destroy(v);
+  }
+  database_scan_end(iter);
+
+  /* Emit ascending: the caller reads the array oldest → newest. */
+  json_value_t* arr = json_new_array();
+  if (arr == NULL) {
+    log_error("frame_debug_events: out of memory building event array");
+    return NULL;
+  }
+  for (size_t i = n; i-- > 0;) {
+    char* err = NULL;
+    json_value_t* rec = json_parse(texts[i], strlen(texts[i]), &err);
+    if (err != NULL) {
+      free(err);
+    }
+    if (rec != NULL) {
+      json_array_append(arr, rec);
+    } else {
+      log_error("frame_debug_events: unparseable event record dropped "
+                "(%zu remaining of '%s')", i, f->sid_path);
+    }
+    free(texts[i]);
+  }
+  char* out = json_serialize(arr);
+  if (out == NULL) {
+    log_error("frame_debug_events: out of memory serializing event array");
+  }
+  json_value_destroy(arr);
+  return out;
 }
 
 #endif /* SA_HAS_WDB */
