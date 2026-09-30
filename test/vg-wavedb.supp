@@ -1,0 +1,25 @@
+# Valgrind suppressions for the WaveDB-backed frame suites (test_frame.cpp,
+# later test_loop.cpp).
+#
+# WaveDB (deps/wavedb, statically linked) launches its worker pool on every
+# concurrent-mode database open (sync_only=0 is the frame store's ground
+# state); database_destroy shuts down AND joins those threads cleanly. The
+# only blocks valgrind still attributes to them are glibc's nptl stack-cache
+# TLS bookkeeping (allocate_stack/_dl_allocate_tls) — a known glibc/valgrind
+# false-positive class for joined threads: the stack cache retains the TLS
+# blocks after pthread_join and valgrind misclassifies the cached blocks as
+# possibly-lost. No WaveDB- or SecretAgent-owned frame is in the lost part of
+# any of these stacks — the only named frame is the work_pool_launch call
+# site, matching the documented-external-owner precedent of vg-cpython.supp.
+#
+# One entry with an ellipsis covers all four observed contexts (the middle
+# glibc frames vary across record shapes: 1 block, 1 block, 2 blocks).
+{
+   glibc-nptl-stack-cache-tls-behind-wavedb-workers
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   ...
+   fun:work_pool_launch
+   ...
+}

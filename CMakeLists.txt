@@ -88,6 +88,65 @@ if(SA_ENABLE_WDB)
   # NOTE: bumping the deps/wavedb pin does not touch these ExternalProject
   # stamps — after a re-pin, remove the old build stamps or the whole
   # ${CMAKE_BINARY_DIR}/deps/wavedb tree to force a fresh configure+build.
+
+  # WaveDB descends from the same extracted-runtime family as this repo's
+  # src/Platform, src/Util, and src/RefCounter, and its archive bundles its own
+  # copies of those shared helpers (get_memory/get_clear_memory, log_*,
+  # refcounter_*, platform_barrier_*, platform_core_count). Linking both
+  # archives into one binary — every test binary, any embedder — fails with
+  # multiple-definition errors, and letting one side silently win would route
+  # cross-type calls over mismatched struct layouts (WaveDB's barriers are raw
+  # pthread_barrier_t; ours are opaque platform_barrier_t). The link-correct
+  # fix, without touching the pinned submodule: post-process a build-dir COPY
+  # of libwavedb.a with objcopy --redefine-syms, aliasing WaveDB's family
+  # copies under wavedb_-prefixed names. objcopy rewrites definitions AND
+  # internal references inside the archive, so WaveDB keeps running its own
+  # implementations unchanged and SecretAgent keeps running its own; the two
+  # symbol sets become provably disjoint (the list below is the exact nm(1)
+  # intersection of the two archives).
+  if(NOT WIN32)
+    set(_wdb_alias_dir ${CMAKE_BINARY_DIR}/deps/wavedb-alias)
+    set(_wdb_alias_syms ${_wdb_alias_dir}/family-shared.syms)
+    set(_wdb_alias_archive ${_wdb_alias_dir}/libwavedb-alias.a)
+    file(WRITE ${_wdb_alias_syms}
+"get_memory wavedb_get_memory
+get_clear_memory wavedb_get_clear_memory
+log_add_callback wavedb_log_add_callback
+log_add_fp wavedb_log_add_fp
+log_level_string wavedb_log_level_string
+log_log wavedb_log_log
+log_set_level wavedb_log_set_level
+log_set_lock wavedb_log_set_lock
+log_set_quiet wavedb_log_set_quiet
+platform_barrier_destroy wavedb_platform_barrier_destroy
+platform_barrier_wait wavedb_platform_barrier_wait
+platform_core_count wavedb_platform_core_count
+refcounter_consume wavedb_refcounter_consume
+refcounter_count wavedb_refcounter_count
+refcounter_dereference wavedb_refcounter_dereference
+refcounter_init wavedb_refcounter_init
+refcounter_reference wavedb_refcounter_reference
+refcounter_yield wavedb_refcounter_yield
+")
+    find_program(SA_OBJCOPY NAMES objcopy llvm-objcopy REQUIRED)
+    add_custom_command(OUTPUT ${_wdb_alias_archive}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${_wdb_alias_dir}
+      COMMAND ${SA_OBJCOPY} --redefine-syms=${_wdb_alias_syms}
+              ${WDB_BUILD}/libwavedb.a ${_wdb_alias_archive}
+      DEPENDS ${WDB_BUILD}/libwavedb.a
+      VERBATIM
+      COMMENT "Aliasing WaveDB's family-shared symbols (wavedb_ prefix)")
+    add_custom_target(wavedb-alias DEPENDS ${_wdb_alias_archive})
+    add_dependencies(wavedb-alias wavedb-ext)
+    set(WDB_LINK_ARCHIVE ${_wdb_alias_archive})
+    set(WDB_ALIAS_TARGET wavedb-alias)
+  else()
+    # MSVC has no objcopy in path; linking the raw archive would collide on the
+    # same symbols. Fail loudly rather than link a broken binary.
+    message(FATAL_ERROR
+      "SA_ENABLE_WDB needs objcopy (or llvm-objcopy) to alias WaveDB's "
+      "family-shared symbols; unavailable on this Windows toolchain")
+  endif()
 endif()
 
 add_library(secretagent STATIC ${C_SRC})
@@ -122,8 +181,33 @@ if(SA_ENABLE_WDB)
   set(SA_HAS_WDB ON)
   target_compile_definitions(secretagent PUBLIC SA_HAS_WDB=1)
   target_include_directories(secretagent PRIVATE ${WDB_ROOT}/src)
-  target_link_libraries(secretagent PUBLIC ${WDB_BUILD}/libwavedb.a)
-  add_dependencies(secretagent wavedb-ext)
+  target_link_libraries(secretagent PUBLIC ${WDB_LINK_ARCHIVE})
+  add_dependencies(secretagent wavedb-ext ${WDB_ALIAS_TARGET})
+  # WaveDB's public headers reach into its third-party deps, and its archive
+  # leaves some of those deps as undefined symbols (Task 1 review findings,
+  # verified on this host): <cbor.h> from libcbor, the generated + vendored
+  # libcbor trees, the hashmap include dir, and the xxhash/libcbor/libhashmap
+  # archives (plus pthread/m/atomic) must be present when the frame store
+  # pulls real WaveDB objects into the link. Order matters for archives:
+  # libwavedb.a first, then the archives it depends on.
+  target_include_directories(secretagent PRIVATE
+    ${WDB_ROOT}/deps/libcbor/src
+    ${WDB_BUILD}/deps/libcbor
+    ${WDB_BUILD}/deps/libcbor/src
+    ${WDB_ROOT}/deps/hashmap/include)
+  target_link_libraries(secretagent PUBLIC
+    ${WDB_BUILD}/libxxhash.a
+    ${WDB_BUILD}/deps/libcbor/src/libcbor.a
+    ${WDB_BUILD}/libhashmap.a
+    pthread m atomic)
+  # WaveDB's encryption.c calls the OpenSSL EVP_* API; with encryption code
+  # compiled in, the archive carries undefined EVP symbols and linkers reject
+  # the binary unless libcrypto follows. WaveDB's own CMake does the same
+  # find_package dance, so mirror it and link only when the host has Crypto.
+  find_package(OpenSSL COMPONENTS Crypto)
+  if(OpenSSL_FOUND)
+    target_link_libraries(secretagent PUBLIC OpenSSL::Crypto)
+  endif()
 endif()
 
 # Opt-in AddressSanitizer instrumentation of the secretagent library only (not

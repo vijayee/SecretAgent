@@ -41,6 +41,12 @@ if (BUILD_TESTING)
             test_json.cpp
             )
 
+    # Same CMake-level mirror idiom as the pyrt gate above: frame store tests
+    # only exist while the WaveDB-backed store is compiled in.
+    if(SA_HAS_WDB)
+      target_sources(testsecretagent PRIVATE test_frame.cpp)
+    endif()
+
     if(SA_HAS_PYTHON)
       target_sources(testsecretagent PRIVATE test_pyrt.cpp)
 
