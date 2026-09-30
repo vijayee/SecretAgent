@@ -161,6 +161,22 @@ TEST(TestPyrt, TestNamespacePersistsAcrossCells) {
   py_frame_free(self);
 }
 
+TEST(TestPyrt, TestActorPreloadedInCellNamespace) {
+  /* Live models emit bare `actor.*` calls (no `import actor`); the
+     interpreter boot must bind the injected module so cells never see
+     NameError: name 'actor' is not defined. */
+  py_frame_t* self = py_frame_create();
+
+  py_frame_execute(self, "actor.__name__");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  EXPECT_STREQ(self->results[0]->text, "'actor'");
+
+  py_frame_free(self);
+}
+
 TEST(TestPyrt, TestLogStreamsBeforeResult) {
   py_frame_t* self = py_frame_create();
   py_frame_execute(self, "for i in range(3):\n    import actor\n    actor.log('tick %d' % i)\n1 + 1");

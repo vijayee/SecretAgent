@@ -77,8 +77,11 @@ static size_t _pyrt_live = 0;
    fix; see _pyrt_slot_acquire). */
 #define _PYRT_SLOT_WAIT_MS 100
 
-/* Runs once per subinterpreter; defines the cell executor the thread calls. */
+/* Runs once per subinterpreter; defines the cell executor the thread calls.
+   `import actor` binds the injected module for the interp so a never-importing
+   cell still speaks the bridge — live models emit bare `actor.*` calls. */
 static const char _PYRT_HELPERS[] =
+    "import actor\n"
     "def __sa_exec_cell(code):\n"
     "    import traceback\n"
     "    try:\n"
