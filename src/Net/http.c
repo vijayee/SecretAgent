@@ -299,7 +299,9 @@ static char* _buf_grow(char* buf, size_t used, size_t need) {
    zero-size chunk are parsed past, contents discarded. Returns NULL on any
    malformed frame or overflow of _HTTP_BODY_MAX — same failure class as a
    short Content-Length body; on success *decoded_len carries the body
-   length (the NUL is not counted). */
+   length (the NUL is not counted). A frame with zero data chunks is a
+   success: the buffer is still allocated (1 byte for the NUL), so the
+   body is non-NULL and zero-length, not NULL. */
 static char* _decode_chunked(const char* src, size_t src_len, size_t* decoded_len) {
   const char* p = src;
   const char* end = src + src_len;
@@ -357,6 +359,11 @@ static char* _decode_chunked(const char* src, size_t src_len, size_t* decoded_le
     p = crlf + 2;
   }
 
+  if (decoded == NULL) {                         /* zero data chunks: still a
+                                                    non-NULL empty body */
+    decoded_cap = 1;
+    decoded = get_memory(decoded_cap);
+  }
   decoded[decoded_used] = '\0';
   *decoded_len = decoded_used;
   return decoded;

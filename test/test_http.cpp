@@ -383,3 +383,30 @@ TEST(TestHttp, TestChunkedTruncatedChunkFailsClean) {
   EXPECT_EQ(r->body_len, 0);
   http_response_destroy(r);
 }
+
+TEST(TestHttp, TestChunkedEmptyBodyZeroLengthNotNull) {
+  /* An empty completion comes back as headers + "0\r\n\r\n" — zero data
+     chunks. The reply is still a success: status 200 and a zero-length
+     (non-NULL, NUL-terminated) body, never a NULL store or a crash. */
+  http_response_t* r = post_against_canned(chunked_reply({}, false));
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, 200);
+  EXPECT_EQ(r->error, nullptr);
+  EXPECT_NE(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 0u);
+  EXPECT_STREQ(r->body, "");
+  http_response_destroy(r);
+}
+
+TEST(TestHttp, TestChunkedEmptyBodyWithTrailerZeroLengthNotNull) {
+  /* Same empty-body reply, but with a trailer field between the zero-size
+     chunk and the final CRLF: trailers must not change the success shape. */
+  http_response_t* r = post_against_canned(chunked_reply({}, true));
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, 200);
+  EXPECT_EQ(r->error, nullptr);
+  EXPECT_NE(r->body, nullptr);
+  EXPECT_EQ(r->body_len, 0u);
+  EXPECT_STREQ(r->body, "");
+  http_response_destroy(r);
+}
