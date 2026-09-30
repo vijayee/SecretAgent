@@ -320,7 +320,9 @@ http_response_t* http_post_json(const char* url,
      Content-Length, Connection: close, then Authorization when a key is
      given. The body follows in its own send so giant payloads never depend
      on the header buffer. */
+  /* every failure past _parse_url owns fd + path */
   if (_host_header(host, port, host_header, sizeof(host_header)) != 0) {
+    free(path);
     close(fd);
     return _http_error_response("http_post_json: host header for %s:%u overflows "
                                 "the header buffer", host, (unsigned)port);
@@ -333,6 +335,7 @@ http_response_t* http_post_json(const char* url,
                                  "Connection: close\r\n",
                                  path, host_header, body_len);
   if (header_used == 0 || header_used >= sizeof(header_block)) {
+    free(path);
     close(fd);
     return _http_error_response("http_post_json: request overflows the header buffer");
   }
@@ -342,6 +345,7 @@ http_response_t* http_post_json(const char* url,
     size_t key_len = strlen(api_key);
     size_t auth_len = strlen("Authorization: Bearer \r\n") - 1 + key_len;
     if (header_used + auth_len + 3 > sizeof(header_block)) {
+      free(path);
       close(fd);
       return _http_error_response("http_post_json: Authorization header overflows "
                                   "the header buffer");

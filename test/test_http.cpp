@@ -18,6 +18,7 @@ extern "C" {
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static void _serve_once(int client_fd);
@@ -109,11 +110,18 @@ static void fake_server_run(int listen_fd, std::string* seen_body, std::atomic<u
   int client_fd = accept(listen_fd, NULL, NULL);
   ASSERT_GT(client_fd, 0);
 
+  /* Bound the read: a client that fails past connect but before sending
+     (the leak pins close the fd during header build) closes the connection
+     with zero bytes read, and the server thread must still exit. */
+  struct timeval tv = {3, 0};
+  setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
   /* Read the request: headers first, then exactly Content-Length more bytes. */
   char buf[4096];
   size_t total = 0;
   size_t header_end = 0;
   while (header_end == 0) {
+    if (total + 1 >= sizeof(buf)) break;
     ssize_t n = recv(client_fd, buf + total, sizeof(buf) - total - 1, 0);
     if (n <= 0) break;
     total += (size_t)n;
@@ -126,7 +134,12 @@ static void fake_server_run(int listen_fd, std::string* seen_body, std::atomic<u
       }
     }
   }
-  ASSERT_GT(total, (size_t)0);
+  if (header_end == 0) {
+    /* No parseable request ever arrived: nothing to record, close and exit
+       so the test thread can join. */
+    close(client_fd);
+    return;
+  }
   *seen_body = buf;
 
   /* Drain the request body (Content-Length in seen_body), so the client's
@@ -152,4 +165,41 @@ static void fake_server_run(int listen_fd, std::string* seen_body, std::atomic<u
   seen->store(1);
 
   close(client_fd);
+}
+
+TEST(TestHttp, TestLongUrlAndKeyDoNotLeak) {
+  /* Pins the fix for the post-connect header-build failure branches: an
+     oversized path (request-line overflow) and an oversized bearer key
+     (auth-header overflow) must return a transport-error response with NO
+     leak of the parsed path (run under valgrind in CI). Connect a real
+     (fake) server so the header-build branches are actually reached. */
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  ASSERT_GE(listen_fd, 0);
+  std::string seen_body;
+  std::atomic<uint8_t> seen;
+  seen.store(0);
+  std::thread server(fake_server_run, listen_fd, &seen_body, &seen);
+
+  std::string giant_path(4096, 'a');
+  std::string url = "http://127.0.0.1:" + std::to_string(port) + "/" + giant_path;
+  http_response_t* r = http_post_json(url.c_str(), NULL, "{}", 1000);
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, -1);      /* request-line overflow is a transport error */
+  ASSERT_NE(r->error, nullptr);  /* the failure reason is set for the caller */
+  http_response_destroy(r);
+
+  std::string long_key(4050, 'k');
+  /* The auth branch sits between connect and send on the SAME connection as
+     the request-line check, so the key case needs a SHORT path to reach it. */
+  std::string short_url = "http://127.0.0.1:" + std::to_string(port) + "/";
+  r = http_post_json(short_url.c_str(), long_key.c_str(), "{}", 1000);
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->status, -1);      /* auth-header overflow is a transport error */
+  ASSERT_NE(r->error, nullptr);
+  http_response_destroy(r);
+
+  close(listen_fd);
+  server.join();   /* fake_server_run tolerates never receiving a request:
+                      bounded read, then it closes its accepted fd and exits */
 }
