@@ -43,9 +43,12 @@ if (BUILD_TESTING)
             )
 
     # Same CMake-level mirror idiom as the pyrt gate above: frame store tests
-    # only exist while the WaveDB-backed store is compiled in.
+    # only exist while the WaveDB-backed store is compiled in. The model
+    # client rides on frame_config_t (a WaveDB-era member of frame.h), so its
+    # tests share that gate.
     if(SA_HAS_WDB)
       target_sources(testsecretagent PRIVATE test_frame.cpp)
+      target_sources(testsecretagent PRIVATE test_model_decode.cpp)
     endif()
 
     if(SA_HAS_PYTHON)
