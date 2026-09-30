@@ -19,11 +19,12 @@ if(SA_ENABLE_STREAMS)
   set_property(TARGET http_parser PROPERTY POSITION_INDEPENDENT_CODE ON)
   target_include_directories(http_parser PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/http-parser)
 
-  # pcre2 (deps/pcre2 submodule, pinned): WIN32-only build path. The
-  # platform_regex_compat.h shim maps POSIX regex onto PCRE2's pcre2posix on
-  # Windows; Linux uses <regex.h>, so this host never needs pcre2 and the
-  # submodule is pinned without a build step. The wiring shape, when a
-  # Windows toolchain exists, is poll-dancer/liboffs's own: an ExternalProject
+  # pcre2 (deps/pcre2 submodule, pinned): WIN32-only build path. Task 2 ports
+  # platform_regex_compat.h, whose _WIN32 path maps POSIX regex onto PCRE2's
+  # pcre2posix; Linux uses <regex.h>, so this host never needs pcre2 and the
+  # submodule is pinned without a build step — pcre2's build is wired only
+  # then, when a Windows toolchain exists, in poll-dancer/liboffs's own shape:
+  # an ExternalProject
   # producing the pcre2-8 static archive plus pcre2-posix with
   # PCRE2_SUPPORT_JIT, consumed only inside if(WIN32). Kept as documented
   # shape only — no guarded code runs anywhere today:

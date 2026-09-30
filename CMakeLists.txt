@@ -253,22 +253,26 @@ if(SA_ENABLE_STREAMS)
   # NOTE: bumping the deps/poll-dancer pin does not touch these ExternalProject
   # stamps — after a re-pin, wipe ${CMAKE_BINARY_DIR}/deps/poll-dancer to
   # force a fresh configure+build.
-endif()
 
-if(SA_ENABLE_STREAMS)
+  # One gate for the whole streams surface: the library-side additions below
+  # consume the PD_ROOT/PD_BUILD set above, and a single if() block makes the
+  # pairing immune to reordering.
   # CMake-level mirror of the PUBLIC compile definition below; test sources
   # gate streams additions with a plain if(SA_HAS_STREAMS) check.
   set(SA_HAS_STREAMS ON)
   target_compile_definitions(secretagent PUBLIC SA_HAS_STREAMS=1)
-  target_include_directories(secretagent PRIVATE
-    ${PD_ROOT}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/deps/http-parser)
+  target_include_directories(secretagent PRIVATE ${PD_ROOT}/include)
   # The dep archives link now (an unused static archive pulls nothing, so the
   # link stays clean until src/Streams consumes them); the transport sources
   # ride this same gate from the port task on. http_parser is defined in
   # deps/CMakeLists.txt (plain static lib — upstream has no CMakeLists, gyp
-  # only).
+  # only); linking it transmits its PUBLIC include dir, so no extra include
+  # path is added here.
   target_link_libraries(secretagent PUBLIC ${PD_BUILD}/libpoll_dancer.a http_parser)
+  # poll_dancer is configured with THREAD_SAFE=ON, so its objects reference
+  # pthread; the link needs -lpthread exactly like the wavedb and python
+  # blocks above.
+  target_link_libraries(secretagent PUBLIC pthread)
   add_dependencies(secretagent poll-dancer-ext)
 endif()
 
