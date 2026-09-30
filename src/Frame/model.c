@@ -421,7 +421,7 @@ static int _model_http_complete(void* self, json_value_t* messages,
       *error_out = _model_error("model client: HTTP %d: %s", r->status, detail);
       free(excerpt);
     }
-    http_response_destroy(r);
+    net_http_response_destroy(r);
     return -1;
   }
 
@@ -429,13 +429,13 @@ static int _model_http_complete(void* self, json_value_t* messages,
   char* decode_err = NULL;
   if (_model_decode_body(r->body, r->body_len, &decoded, &decode_err) != 0) {
     if (error_out != NULL) *error_out = decode_err; else free(decode_err);
-    http_response_destroy(r);
+    net_http_response_destroy(r);
     return -1;
   }
   if (raw_out != NULL && r->body != NULL) {
     *raw_out = _model_heap_str(r->body);
   }
-  http_response_destroy(r);
+  net_http_response_destroy(r);
   *reply = decoded;
   return 0;
 }

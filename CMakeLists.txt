@@ -60,6 +60,17 @@ if(NOT SA_ENABLE_PYTHON)
   list(FILTER C_SRC EXCLUDE REGEX "src/Python/")
 endif()
 
+ # Streams/http transport family port (src/Streams + its src/Util, src/Buffer,
+ # src/Platform closure). The C_SRC glob above picks the ported sources up
+ # globally; when the gate is OFF they are excluded the same way the Python
+ # layer is, so an OFF build stays sans streams.
+if(NOT SA_ENABLE_STREAMS)
+  list(FILTER C_SRC EXCLUDE REGEX "src/Streams/|src/Buffer/")
+  list(FILTER C_SRC EXCLUDE REGEX "src/Util/(vec|validation|error|bcrypt)\\.c$")
+  list(FILTER C_SRC EXCLUDE
+    REGEX "src/Platform/(platform_random|platform_file|platform_socket)\\.c$")
+endif()
+
 # WaveDB: the durable floor (embedded HBTrie/MVCC/WAL/subtree store). Built
 # from the pinned submodule via ExternalProject (same pattern as cpython-ext).
 # OFF keeps the library wavedb-free for embedders that only need the actor
@@ -108,7 +119,11 @@ if(SA_ENABLE_WDB)
   # internal references inside the archive, so WaveDB keeps running its own
   # implementations unchanged and SecretAgent keeps running its own; the two
   # symbol sets become provably disjoint (the list below is the exact nm(1)
-  # intersection of the two archives).
+  # intersection of the two archives — grown when the streams port added the
+  # family vec/buffer members under src/Util and src/Buffer, whose liboffs
+  # revision carries a different buffer_t layout: a shared unaliased
+  # buffer_create would silently route WaveDB calls across mismatched
+  # struct layouts).
   # Probe for a usable objcopy BEFORE committing to the alias path: MSVC
   # toolchains may ship no objcopy at all, and linking the raw archive
   # would collide on the family-shared symbols — so such a build fails
@@ -147,6 +162,29 @@ refcounter_dereference wavedb_refcounter_dereference
 refcounter_init wavedb_refcounter_init
 refcounter_reference wavedb_refcounter_reference
 refcounter_yield wavedb_refcounter_yield
+vec_compact_ wavedb_vec_compact_
+vec_expand_ wavedb_vec_expand_
+vec_insert_ wavedb_vec_insert_
+vec_reserve_ wavedb_vec_reserve_
+vec_reserve_po2_ wavedb_vec_reserve_po2_
+vec_splice_ wavedb_vec_splice_
+vec_swap_ wavedb_vec_swap_
+vec_swapsplice_ wavedb_vec_swapsplice_
+buffer_and wavedb_buffer_and
+buffer_compare wavedb_buffer_compare
+buffer_concat wavedb_buffer_concat
+buffer_copy wavedb_buffer_copy
+buffer_copy_from_pointer wavedb_buffer_copy_from_pointer
+buffer_create wavedb_buffer_create
+buffer_create_from_existing_memory wavedb_buffer_create_from_existing_memory
+buffer_create_from_pointer_copy wavedb_buffer_create_from_pointer_copy
+buffer_destroy wavedb_buffer_destroy
+buffer_get_index wavedb_buffer_get_index
+buffer_not wavedb_buffer_not
+buffer_or wavedb_buffer_or
+buffer_set_index wavedb_buffer_set_index
+buffer_slice wavedb_buffer_slice
+buffer_xor wavedb_buffer_xor
 ")
   add_custom_command(OUTPUT ${_wdb_alias_archive}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${_wdb_alias_dir}
@@ -261,7 +299,10 @@ if(SA_ENABLE_STREAMS)
   # gate streams additions with a plain if(SA_HAS_STREAMS) check.
   set(SA_HAS_STREAMS ON)
   target_compile_definitions(secretagent PUBLIC SA_HAS_STREAMS=1)
-  target_include_directories(secretagent PRIVATE ${PD_ROOT}/include)
+  # PUBLIC: SA_HAS_STREAMS=1 propagates PUBLIC too, so consumers (test TUs)
+  # that include src/Platform/platform.h reach its gated platform_socket.h
+  # include, which in turn reaches <poll-dancer/poll-dancer.h>.
+  target_include_directories(secretagent PUBLIC ${PD_ROOT}/include)
   # The dep archives link now (an unused static archive pulls nothing, so the
   # link stays clean until src/Streams consumes them); the transport sources
   # ride this same gate from the port task on. http_parser is defined in
@@ -274,6 +315,70 @@ if(SA_ENABLE_STREAMS)
   # blocks above.
   target_link_libraries(secretagent PUBLIC pthread)
   add_dependencies(secretagent poll-dancer-ext)
+
+  # The ported streams/Buffer family files live in their own dirs; the
+  # C_SRC/C_INC glob already carries src/Buffer/buffer.h, and the HTTP core
+  # reaches it as "../Buffer/buffer.h", but make the Buffer include dir
+  # explicit here so the ported sources also compile against it directly.
+  target_include_directories(secretagent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/Buffer)
+
+  # Family API drift accommodation (recorded in the port commit): liboffs's
+  # streams.c / http_request.c / http_connection.c / http_server.c take their
+  # stream-actor and HTTP message-type constants (READABLE_*, STREAM_*,
+  # HTTP_CONNECTION_*, HTTP_SERVER_*) from liboffs's offs-domain
+  # src/Actor/message.h — one shared application enum catalog that also
+  # includes BlockCache/Network headers. Our frozen src/Actor is the generic
+  # per-module family style (see pyrt_messages.h), and the spec forbids
+  # porting offs domain code, so the 21 constants the ported core uses
+  # internally are supplied here as compile-time constants with the EXACT
+  # values liboffs's message_type_e assigns them (the gaps preserve the
+  # shared catalog's numbering). Only the ported .c files reference these
+  # names, so the scope stays inside this build and no header contract
+  # changes.
+  target_compile_definitions(secretagent PRIVATE
+    READABLE_PUSH=26
+    READABLE_READ=27
+    WRITEABLE_WRITE=29
+    CLOSE_STREAM=30
+    READABLE_PULL=31
+    DEFERRED_DEREF=32
+    STREAM_NOTIFY=47
+    HTTP_CONNECTION_DATA=61
+    HTTP_CONNECTION_READABLE=62
+    HTTP_CONNECTION_HANGUP=63
+    HTTP_CONNECTION_ERROR=64
+    HTTP_CONNECTION_WRITE=65
+    HTTP_CONNECTION_WRITABLE=66
+    HTTP_CONNECTION_CLOSE=67
+    HTTP_SERVER_UPDATE_WATCHER=68
+    HTTP_SERVER_STOP_WATCHER=69
+    STREAM_SUBSCRIBE=76
+    STREAM_UNSUBSCRIBE=77
+    STREAM_PIPE=79
+    STREAM_PIPED=80
+    STREAM_SET_PULLING=82)
+
+  # The ported http_connection/http_server include <openssl/ssl.h>
+  # unconditionally (TLS connections are part of the copied core), so the
+  # streams gate carries a hard OpenSSL requirement — liboffs does the same
+  # (find_package(OpenSSL REQUIRED)). OpenSSL::Crypto is linked alongside
+  # SSL to match liboffs's link set.
+  find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
+  target_link_libraries(secretagent PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+
+  # liboffs's vendored Solar Designer crypt_blowfish backs src/Util/bcrypt.c
+  # (bcrypt_check/bcrypt_generate call _crypt_blowfish_rn and
+  # _crypt_gensalt_blowfish_rn); the ported copy compiled from
+  # src/Streams/crypt_blowfish.c rides this same gate (glob-included).
+  # The ported Buffer/buffer.c also calls libcbor (buffer_to_cbor/
+  # cbor_to_buffer); libcbor's headers and archive reach it through the
+  # wavedb block's include dirs and target libraries above, so the streams
+  # gate requires SA_ENABLE_WDB. Fail loudly instead of a mid-link surprise.
+  if(NOT SA_ENABLE_WDB)
+    message(FATAL_ERROR
+      "SA_ENABLE_STREAMS requires SA_ENABLE_WDB: the ported Buffer closure "
+      "(buffer_to_cbor/cbor_to_buffer) consumes libcbor built by wavedb")
+  endif()
 endif()
 
 # Opt-in AddressSanitizer instrumentation of the secretagent library only (not

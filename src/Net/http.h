@@ -29,6 +29,10 @@ http_response_t* http_post_json(const char* url,        /* http://host:port/path
                                 const char* body_json,  /* NUL-terminated */
                                 uint32_t timeout_ms);
 
-void http_response_destroy(http_response_t* r);
+/* Transitional rename (streams port): the ported express core in
+   src/Streams/http_response.c is the future owner of the plain
+   http_response_destroy name; this legacy client lives only until the model
+   consumes the async client, so its symbol is prefixed here. */
+void net_http_response_destroy(http_response_t* r);
 
 #endif // SA_HTTP_H

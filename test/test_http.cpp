@@ -66,7 +66,7 @@ TEST(TestHttp, TestPostJsonRoundTrip) {
   EXPECT_NE(seen_body.find("chat/completions"), std::string::npos);   /* the path reached the server */
   EXPECT_NE(seen_body.find("Content-Length"), std::string::npos);
 
-  http_response_destroy(r);
+  net_http_response_destroy(r);
   server.join();
 }
 
@@ -75,7 +75,7 @@ TEST(TestHttp, TestTransportErrorIsReported) {
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(r->status, -1);
   ASSERT_NE(r->error, nullptr);
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 /* Fills in the canned 200 reply: a body containing "ok":true with an honest
@@ -206,7 +206,7 @@ TEST(TestHttp, TestLongUrlAndKeyDoNotLeak) {
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(r->status, -1);      /* request-line overflow is a transport error */
   ASSERT_NE(r->error, nullptr);  /* the failure reason is set for the caller */
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 
   std::string long_key(4050, 'k');
   /* The auth branch sits between connect and send on the SAME connection as
@@ -216,7 +216,7 @@ TEST(TestHttp, TestLongUrlAndKeyDoNotLeak) {
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(r->status, -1);      /* auth-header overflow is a transport error */
   ASSERT_NE(r->error, nullptr);
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 
   close(listen_fd);
   server.join();   /* fake_server_run tolerates never receiving a request:
@@ -289,7 +289,7 @@ TEST(TestHttp, TestChunkedMultiChunkBodyDecodes) {
   EXPECT_EQ(r->error, nullptr);
   EXPECT_EQ(r->body_len, original.size());          /* no trailing CRLF noise */
   EXPECT_STREQ(r->body, original.c_str());          /* decoded + NUL-terminated */
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedSizeLineDialects) {
@@ -322,7 +322,7 @@ TEST(TestHttp, TestChunkedSizeLineDialects) {
   EXPECT_EQ(r->error, nullptr);
   EXPECT_EQ(r->body_len, original.size());
   EXPECT_STREQ(r->body, original.c_str());
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedHeaderValueDialects) {
@@ -351,7 +351,7 @@ TEST(TestHttp, TestChunkedHeaderValueDialects) {
   EXPECT_EQ(r->error, nullptr);
   EXPECT_EQ(r->body_len, original.size());
   EXPECT_STREQ(r->body, original.c_str());
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedMalformedSizeLineFailsClean) {
@@ -366,7 +366,7 @@ TEST(TestHttp, TestChunkedMalformedSizeLineFailsClean) {
   EXPECT_NE(strstr(r->error, "chunked"), nullptr);
   EXPECT_EQ(r->body, nullptr);
   EXPECT_EQ(r->body_len, 0);
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedTruncatedChunkFailsClean) {
@@ -381,7 +381,7 @@ TEST(TestHttp, TestChunkedTruncatedChunkFailsClean) {
   ASSERT_NE(r->error, nullptr);
   EXPECT_EQ(r->body, nullptr);
   EXPECT_EQ(r->body_len, 0);
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedDeclaredOnRepeatedTransferEncodingLines) {
@@ -402,7 +402,7 @@ TEST(TestHttp, TestChunkedDeclaredOnRepeatedTransferEncodingLines) {
   ASSERT_NE(r->body, nullptr);
   EXPECT_EQ(r->body_len, 12u);
   EXPECT_STREQ(r->body, "{\"split\":tr}");
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedAbsurdSizeClaimRejected) {
@@ -419,7 +419,7 @@ TEST(TestHttp, TestChunkedAbsurdSizeClaimRejected) {
   EXPECT_NE(strstr(r->error, "chunked"), nullptr);
   EXPECT_EQ(r->body, nullptr);
   EXPECT_EQ(r->body_len, 0u);
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedMissingFinalCrlfFailsClean) {
@@ -436,7 +436,7 @@ TEST(TestHttp, TestChunkedMissingFinalCrlfFailsClean) {
   EXPECT_NE(strstr(r->error, "chunked"), nullptr);
   EXPECT_EQ(r->body, nullptr);
   EXPECT_EQ(r->body_len, 0u);
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestContentLengthOverBodyCapRejected) {
@@ -454,7 +454,7 @@ TEST(TestHttp, TestContentLengthOverBodyCapRejected) {
   EXPECT_NE(strstr(r->error, "cap"), nullptr);
   EXPECT_EQ(r->body, nullptr);
   EXPECT_EQ(r->body_len, 0u);
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedEmptyBodyZeroLengthNotNull) {
@@ -468,7 +468,7 @@ TEST(TestHttp, TestChunkedEmptyBodyZeroLengthNotNull) {
   EXPECT_NE(r->body, nullptr);
   EXPECT_EQ(r->body_len, 0u);
   EXPECT_STREQ(r->body, "");
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }
 
 TEST(TestHttp, TestChunkedEmptyBodyWithTrailerZeroLengthNotNull) {
@@ -481,5 +481,5 @@ TEST(TestHttp, TestChunkedEmptyBodyWithTrailerZeroLengthNotNull) {
   EXPECT_NE(r->body, nullptr);
   EXPECT_EQ(r->body_len, 0u);
   EXPECT_STREQ(r->body, "");
-  http_response_destroy(r);
+  net_http_response_destroy(r);
 }

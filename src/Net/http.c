@@ -94,7 +94,7 @@ static http_response_t* _http_error_response(const char* fmt, ...) {
   return r;
 }
 
-void http_response_destroy(http_response_t* r) {
+void net_http_response_destroy(http_response_t* r) {
   if (r == NULL) return;
   free(r->body);
   free(r->error);
