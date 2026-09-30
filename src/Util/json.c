@@ -116,7 +116,9 @@ static void _buffer_put_int(_buffer_t* b, int64_t i) {
 }
 
 static void _buffer_put_double(_buffer_t* b, double d) {
-  /* %.17g round-trips exactly, so re-parsing returns the same bits. */
+  /* 17 significant digits round-trip every finite binary64 double when
+     strtod is correctly rounded (C99, MSVC >= 2015). Type erasure: integral
+     doubles and -0.0 re-parse as JSON_INT — json_as_int/_double bridge types. */
   char tmp[64];
   int n = snprintf(tmp, sizeof(tmp), "%.17g", d);
   if (n > 0) _buffer_put(b, tmp, (size_t)n);
@@ -164,7 +166,9 @@ static void _pair_array_put(json_pair_t** arr, size_t* count, size_t* cap,
   if (*count == *cap) {
     size_t next_cap = (*cap == 0) ? 4 : *cap * 2;
     json_pair_t* next = (json_pair_t*)get_memory(next_cap * sizeof(json_pair_t));
-    memcpy(next, *arr, *count * sizeof(json_pair_t));
+    if (*count != 0) {
+      memcpy(next, *arr, *count * sizeof(json_pair_t));
+    }
     free(*arr);
     *arr = next;
     *cap = next_cap;
@@ -179,7 +183,9 @@ static void _value_array_put(json_value_t*** arr, size_t* count, size_t* cap,
     size_t next_cap = (*cap == 0) ? 4 : *cap * 2;
     json_value_t** next =
       (json_value_t**)get_memory(next_cap * sizeof(json_value_t*));
-    memcpy(next, *arr, *count * sizeof(json_value_t*));
+    if (*count != 0) {
+      memcpy(next, *arr, *count * sizeof(json_value_t*));
+    }
     free(*arr);
     *arr = next;
     *cap = next_cap;
@@ -723,6 +729,7 @@ json_value_t* json_new_array(void) {
   return v;
 }
 
+/* Returns 0 WITHOUT taking ownership on failure — caller still owns *value. */
 int json_object_set(json_value_t* obj, const char* key, json_value_t* value) {
   if (obj == NULL || obj->type != JSON_OBJECT || key == NULL || value == NULL) {
     return 0;
