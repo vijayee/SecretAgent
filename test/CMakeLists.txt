@@ -66,6 +66,9 @@ if (BUILD_TESTING)
     # poll-dancer + OpenSSL + libcbor, and libcbor arrives via SA_ENABLE_WDB).
     if(SA_HAS_STREAMS)
       target_sources(testsecretagent PRIVATE test_streams_server.cpp)
+      # The async client suite: real loop thread + real loopback fake servers
+      # (same house fixture the legacy sync-client tests use).
+      target_sources(testsecretagent PRIVATE test_streams_client.cpp)
       # The ported headers reach <cbor.h> through Buffer/buffer.h, whose
       # include dirs are PRIVATE on the library (same libcbor dirs the root's
       # WaveDB block gives secretagent); the test TU needs them directly.
