@@ -74,9 +74,14 @@ typedef void (*http_client_completion_fn)(void* ctx, int status,
   loop timer, not a socket timeout.
 - `http_client_submit` takes no locks it can't drop in µs, never blocks; the
   completion callback must also stay µs-scale (post a message, return).
-- The completion callback posting into the OWNING frame actor's mailbox is
-  loop_thread's job and the slice's key glue — corr-matched message like every
-  other frame message (FRM_MODEL_RESULT family naming decided in the plan).
+- The completion callback runs ON the loop thread; `loop_thread.{h,c}` owns
+  the submit side (marshalling watcher setup onto the loop thread) and the
+  callback dispatch. This slice's only consumer (model.c) waits synchronously
+  on a refcounted completion record — the caller's turn stays blocking at ONE
+  condvar instead of inside a `recv()`. Posting completions into an OWNER
+  ACTOR'S MAILBOX (corr-matched frame message) is the orchestration slice's
+  restructure — the mailbox glue is this module's documented extension point,
+  deliberately NOT built here (YAGNI).
 
 ### What is retired
 
@@ -131,8 +136,10 @@ link a test binary WITHOUT the aliases and show the failure, then with them.
 ## Evidence bar (slice completion)
 
 1. **Live model turn through the ported async client** — the opt-in
-   integration gate (`TestLiveLoop`) passes against local Ollama with the loop
-   submitting the completion and yielding.
+   integration gate (`TestLiveLoop`) passes against local Ollama with the
+   completion round-tripping through the loop thread. (The loop yields its
+   worker for the model call in the ORCHESTRATION slice — this slice proves
+   the transport and its submit/callback contract.)
 2. **Server loopback test** — ported core binds, one route matches, request
    parses, response writes; cors middleware demonstrably engages.
 3. **Framing hardening survives the port** — chunked/malformed/size-cap/
@@ -155,7 +162,6 @@ link a test binary WITHOUT the aliases and show the failure, then with them.
 
 - Whether `http_server`'s threaded/accept model from liboffs needs adaptation
   to one-loop-thread (expected: liboffs server already runs on the loop).
-- Exact `FRM_*` message name for the completion (plan decision).
 - Whether poll-dancer/http-parser prefer their own CMake targets consumed as
   ExternalProjects or a combined build (mirror wavedb's choice, adapt if their
   option names differ).
