@@ -53,6 +53,12 @@ if (BUILD_TESTING)
       # content-only paths are WDB-only; the cell-running tests nest the
       # real `#if defined(SA_HAS_WDB) && defined(SA_HAS_PYTHON)` form inside.
       target_sources(testsecretagent PRIVATE test_loop.cpp)
+      # The live integration gate (Task 12): registered unconditionally, but
+      # the test body GTEST_SKIPs unless SA_TEST_OLLAMA_URL names an
+      # OpenAI-compatible endpoint — no network in a default run. It shares
+      # the same store gate as test_loop.cpp, and its real test rides the
+      # python gate in-file (it drives actual cells).
+      target_sources(testsecretagent PRIVATE test_live_loop.cpp)
     endif()
 
     if(SA_HAS_PYTHON)
@@ -143,8 +149,10 @@ if (BUILD_TESTING)
         # TestLoop runs real cells (the loop drives the frame's own pyrt), and
         # TestPyAgent's harness answers bridge requests by hand — both carry
         # the same CPython-owned suppression classes (TestPyrt predates them).
+        # TestLiveLoop runs the opt-in live gate (real cells through the
+        # frame's own pyrt) when SA_TEST_OLLAMA_URL is set — same classes.
         if(_test_name MATCHES "^TestPyrt" OR _test_name MATCHES "^TestLoop" OR
-           _test_name MATCHES "^TestPyAgent")
+           _test_name MATCHES "^TestLiveLoop" OR _test_name MATCHES "^TestPyAgent")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()
       endforeach()
