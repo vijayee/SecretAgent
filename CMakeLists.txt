@@ -86,8 +86,8 @@ if(SA_ENABLE_WDB)
     BINARY_DIR ${WDB_BUILD}
   )
   # NOTE: bumping the deps/wavedb pin does not touch these ExternalProject
-  # stamps — after a re-pin, remove the old build stamps or the whole
-  # ${CMAKE_BINARY_DIR}/deps/wavedb tree to force a fresh configure+build.
+  # stamps — if configure does not re-run after a re-pin, wipe
+  # ${CMAKE_BINARY_DIR}/deps/wavedb to force a fresh configure+build.
 
   # WaveDB descends from the same extracted-runtime family as this repo's
   # src/Platform, src/Util, and src/RefCounter, and its archive bundles its own
@@ -104,11 +104,26 @@ if(SA_ENABLE_WDB)
   # implementations unchanged and SecretAgent keeps running its own; the two
   # symbol sets become provably disjoint (the list below is the exact nm(1)
   # intersection of the two archives).
-  if(NOT WIN32)
-    set(_wdb_alias_dir ${CMAKE_BINARY_DIR}/deps/wavedb-alias)
-    set(_wdb_alias_syms ${_wdb_alias_dir}/family-shared.syms)
-    set(_wdb_alias_archive ${_wdb_alias_dir}/libwavedb-alias.a)
-    file(WRITE ${_wdb_alias_syms}
+  # Probe for a usable objcopy BEFORE committing to the alias path: MSVC
+  # toolchains may ship no objcopy at all, and linking the raw archive
+  # would collide on the family-shared symbols — so such a build fails
+  # loudly HERE with a real message instead of a missing-tool error some
+  # custom-command stage in. Toolchains that always carry objcopy (Linux,
+  # macOS) take the REQUIRED form.
+  if(WIN32)
+    find_program(SA_OBJCOPY NAMES objcopy llvm-objcopy)
+    if(NOT SA_OBJCOPY)
+      message(FATAL_ERROR
+        "SA_ENABLE_WDB needs objcopy (or llvm-objcopy) to alias WaveDB's "
+        "family-shared symbols; unavailable on this Windows toolchain")
+    endif()
+  else()
+    find_program(SA_OBJCOPY NAMES objcopy llvm-objcopy REQUIRED)
+  endif()
+  set(_wdb_alias_dir ${CMAKE_BINARY_DIR}/deps/wavedb-alias)
+  set(_wdb_alias_syms ${_wdb_alias_dir}/family-shared.syms)
+  set(_wdb_alias_archive ${_wdb_alias_dir}/libwavedb-alias.a)
+  file(WRITE ${_wdb_alias_syms}
 "get_memory wavedb_get_memory
 get_clear_memory wavedb_get_clear_memory
 log_add_callback wavedb_log_add_callback
@@ -128,25 +143,17 @@ refcounter_init wavedb_refcounter_init
 refcounter_reference wavedb_refcounter_reference
 refcounter_yield wavedb_refcounter_yield
 ")
-    find_program(SA_OBJCOPY NAMES objcopy llvm-objcopy REQUIRED)
-    add_custom_command(OUTPUT ${_wdb_alias_archive}
-      COMMAND ${CMAKE_COMMAND} -E make_directory ${_wdb_alias_dir}
-      COMMAND ${SA_OBJCOPY} --redefine-syms=${_wdb_alias_syms}
-              ${WDB_BUILD}/libwavedb.a ${_wdb_alias_archive}
-      DEPENDS ${WDB_BUILD}/libwavedb.a
-      VERBATIM
-      COMMENT "Aliasing WaveDB's family-shared symbols (wavedb_ prefix)")
-    add_custom_target(wavedb-alias DEPENDS ${_wdb_alias_archive})
-    add_dependencies(wavedb-alias wavedb-ext)
-    set(WDB_LINK_ARCHIVE ${_wdb_alias_archive})
-    set(WDB_ALIAS_TARGET wavedb-alias)
-  else()
-    # MSVC has no objcopy in path; linking the raw archive would collide on the
-    # same symbols. Fail loudly rather than link a broken binary.
-    message(FATAL_ERROR
-      "SA_ENABLE_WDB needs objcopy (or llvm-objcopy) to alias WaveDB's "
-      "family-shared symbols; unavailable on this Windows toolchain")
-  endif()
+  add_custom_command(OUTPUT ${_wdb_alias_archive}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${_wdb_alias_dir}
+    COMMAND ${SA_OBJCOPY} --redefine-syms=${_wdb_alias_syms}
+            ${WDB_BUILD}/libwavedb.a ${_wdb_alias_archive}
+    DEPENDS ${_wdb_alias_syms} ${WDB_BUILD}/libwavedb.a
+    VERBATIM
+    COMMENT "Aliasing WaveDB's family-shared symbols (wavedb_ prefix)")
+  add_custom_target(wavedb-alias DEPENDS ${_wdb_alias_archive})
+  add_dependencies(wavedb-alias wavedb-ext)
+  set(WDB_LINK_ARCHIVE ${_wdb_alias_archive})
+  set(WDB_ALIAS_TARGET wavedb-alias)
 endif()
 
 add_library(secretagent STATIC ${C_SRC})
