@@ -248,6 +248,22 @@ if(SA_ENABLE_TSAN AND NOT MSVC)
   target_link_options(secretagent INTERFACE -fsanitize=thread)
 endif()
 
+# frame-demo (Task 11): the demo CLI. One executable, no tests: it needs the
+# frame store (WaveDB gate — frame.h's whole surface rides SA_HAS_WDB) and
+# the model client; the python bridge arrives through the same library link.
+# SA_HAS_WDB/SA_HAS_PYTHON propagate from the PUBLIC compile definitions of
+# secretagent; the executable's main.c reaches py_agent_init through the
+# bare-extern idiom so it needs no CPython include dirs.
+if(SA_ENABLE_WDB)
+  add_executable(frame-demo tools/frame-demo/main.c)
+  target_link_libraries(frame-demo PRIVATE secretagent)
+  if(NOT WIN32)
+    target_link_libraries(frame-demo PRIVATE pthread)
+  endif()
+  target_include_directories(frame-demo PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+endif()
+
 if(SA_BUILD_TESTS)
   add_subdirectory(test)
 endif()
