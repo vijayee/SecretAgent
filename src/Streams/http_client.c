@@ -27,9 +27,11 @@
 //     request's transport state (fd, watcher, timer, buffers) — only the
 //     loop thread touches them, in message order.
 //   - client->dead under c->lock: the one cross-thread fact, written by
-//     destroy, read at the completion claim. The completion itself fires
-//     while the lock is held (µs-scale) so a concurrent destroy either
-//     blocks for it or cancels it — never both.
+//     destroy, read at the completion claim. The claim is a snapshot under
+//     the lock; the callback itself fires UNLOCKED (a callback that reenter
+//     the client — submit/destroy — must not deadlock on its own guard). A
+//     concurrent destroy either observes the completion's claim or cancels
+//     the request before it fires — never both.
 //
 // pd-object lifetime follows the http_server.c destroy-stack idiom: a
 // completion STOPS the watcher/timer (idempotent, safe mid-batch) but the
@@ -147,18 +149,23 @@ typedef struct client_destroy_joiner_t {
 /* ---------------- moved helpers (src/Net/http.c) ---------------- */
 
 /* Heap-allocated transport reason; truncated reason strings are safe — never
-   let a va_args snprintf failure null out an error the caller frees blindly. */
-static char* _error_string(const char* fmt, ...) {
+   let a va_args snprintf failure null out an error the caller frees blindly.
+   (The variadic wrapper and the in-place va_list builder share this one
+   truncation discipline.) */
+static char* _error_vstring(const char* fmt, va_list args) {
   char* err = get_memory(_HTTP_HEADER_BLOCK_MAX);
-  va_list args;
-  int written;
-
-  va_start(args, fmt);
-  written = vsnprintf(err, _HTTP_HEADER_BLOCK_MAX, fmt, args);
-  va_end(args);
+  int written = vsnprintf(err, _HTTP_HEADER_BLOCK_MAX, fmt, args);
   if (written < 0 || written >= (int)_HTTP_HEADER_BLOCK_MAX) {
     err[_HTTP_HEADER_BLOCK_MAX - 1] = '\0';
   }
+  return err;
+}
+
+static char* _error_string(const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  char* err = _error_vstring(fmt, args);
+  va_end(args);
   return err;
 }
 
@@ -363,13 +370,20 @@ static void _req_complete(http_client_req_t* req, int status, char* body,
   _req_free_request_side(req);
 
   platform_mutex_lock(c->lock);
-  if (c->dead) {
+  int dead = c->dead;
+  platform_mutex_unlock(c->lock);
+  /* Fire UNLOCKED: the callback is the caller's code and must not call back
+     into this same client (submit/destroy would deadlock on the very guard
+     it fired under). The snapshot still serializes the fire-vs-cancel — a
+     destroy that wins the claim is either queued after this fire (loop
+     thread is serial, the request record outlives the batch) or cancelled
+     the request before it could ever get here. */
+  if (dead) {
     free(body);
     free(error);
   } else {
     req->on_done(req->ctx, status, body, body_len, error);
   }
-  platform_mutex_unlock(c->lock);
 }
 
 /* ---------------- response accumulation (loop thread) ---------------- */
@@ -407,6 +421,11 @@ static int _on_headers_complete(http_parser* parser) {
   req->saw_chunked = (parser->flags & F_CHUNKED) ? 1 : 0;
   req->has_cl = (parser->flags & F_CONTENTLENGTH) ? 1 : 0;
   req->cl = req->has_cl ? parser->content_length : 0;
+  /* NEITHER framing is a valid framing of its own: the third HTTP close-vs-
+     truncate case — the body runs to connection close (HTTP/1.0 responses).
+     The retired sync client read that as a SUCCESS; without this flag the
+     EOF handler would misreport it as a short-body transport failure. */
+  req->close_delimited = !(req->saw_chunked || req->has_cl);
   if (req->has_cl && parser->content_length > _HTTP_BODY_MAX) {
     req->cap_error = 1;   /* absurd length promise: reject before any read */
     return 1;
@@ -466,15 +485,9 @@ static void _req_finalize(http_client_req_t* req) {
 
 static void _req_complete_transport_error(http_client_req_t* req, const char* fmt, ...) {
   va_list args;
-  char* error = get_memory(_HTTP_HEADER_BLOCK_MAX);
-  int written;
-
   va_start(args, fmt);
-  written = vsnprintf(error, _HTTP_HEADER_BLOCK_MAX, fmt, args);
+  char* error = _error_vstring(fmt, args);
   va_end(args);
-  if (written < 0 || written >= (int)_HTTP_HEADER_BLOCK_MAX) {
-    error[_HTTP_HEADER_BLOCK_MAX - 1] = '\0';
-  }
   _req_complete(req, -1, NULL, 0, error);
 }
 
@@ -487,8 +500,11 @@ static void _req_eof(http_client_req_t* req) {
       "http client: no complete header block from %s:%u (connection closed)",
       req->host, (unsigned)req->port);
   } else if (req->close_delimited) {
-    /* No framing declared: the body ran to connection close, which the
-       retired client read as a success. */
+    /* No framing declared: the body ran to connection close. Feed the
+       parser's EOF so on_message_complete marks the true message end (the
+       raw tail was accumulated outside the parser), then finalize — the
+       retired client read a close-delimited response as a success. */
+    (void)http_parser_execute(&req->parser, &_parser_settings, NULL, 0);
     _req_finalize(req);
   } else if (req->saw_chunked) {
     _req_complete_transport_error(req,
@@ -609,7 +625,8 @@ static void _req_watcher(pd_loop_t* loop, pd_watcher_t* watcher,
     req->raw_total += (size_t)n;
     if (req->raw_total > _HTTP_READ_MAX) {
       _req_complete_transport_error(req,
-        "http client: response from %s:%u exceeds the 64 MiB body cap",
+        "http client: response from %s:%u exceeds the wire read cap "
+        "(header block + framing + body)",
         req->host, (unsigned)req->port);
       return;
     }
@@ -739,8 +756,10 @@ static void _op_start(void* p) {
 /* Destroy op: runs on the loop thread AFTER every other op this client ever
    enqueued (FIFO) and after every watcher/timer callback of this client —
    the loop thread is serial. Cancels anything still in flight, drains the
-   deferred teardowns, frees the client, and only then releases the waiting
-   destroy caller. */
+   deferred teardowns, and only then releases the waiting destroy caller.
+   The client's lock and record are NOT touched here: a submit thread may
+   still be inside (or blocked on) that mutex right now — http_client_destroy
+   tears them down only after this op has run and the joiner confirmed it. */
 static void _op_client_destroy(void* p) {
   http_client_t* c = (http_client_t*)p;
   client_destroy_joiner_t* joiner = (client_destroy_joiner_t*)c->destroy_joiner;
@@ -757,9 +776,6 @@ static void _op_client_destroy(void* p) {
     req = next;
   }
   _op_drain(c);
-
-  platform_mutex_destroy(c->lock);
-  free(c);
 
   platform_mutex_lock(joiner->mutex);
   joiner->done = 1;
@@ -943,6 +959,10 @@ void http_client_destroy(http_client_t* c) {
     http_client_req_t* req = c->inflight;
     while (req != NULL) {
       http_client_req_t* next = req->next;
+      if (req->fd >= 0) {
+        close(req->fd);   /* the loop died without stopping this transport */
+        req->fd = -1;
+      }
       _req_free_request_side(req);
       free(req);
       req = next;
@@ -973,6 +993,11 @@ void http_client_destroy(http_client_t* c) {
       }
     }
     platform_mutex_unlock(joiner.mutex);
+    /* The destroy op has run: no loop-thread work touches c anymore, and any
+       submit that claimed the lock is past it — the lock and the record can
+       die here, never while a submit thread still holds or waits on them. */
+    platform_mutex_destroy(c->lock);
+    free(c);
   }
   platform_mutex_destroy(joiner.mutex);
   platform_condvar_destroy(joiner.cv);

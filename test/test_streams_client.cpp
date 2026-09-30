@@ -301,6 +301,46 @@ TEST(TestStreamsClient, TestDestroyCancelsInflight) {
   streams_loop_destroy(lt);
 }
 
+/* Both framings the retired sync client's rules survive for, live against a
+   canned server: an HTTP/1.0 close-delimited response (no Content-Length, no
+   Transfer-Encoding — the body runs to connection close) still completes as
+   a 200 SUCCESS with the full body, not a "short body" transport failure. */
+TEST(TestStreamsClient, TestChunkedAndHttp10BothLive) {
+  streams_loop_thread_t* lt = streams_loop_create();
+  ASSERT_NE(lt, nullptr);
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  ASSERT_GE(listen_fd, 0);
+  std::string seen_body;
+  std::atomic<uint8_t> seen;
+  seen.store(0);
+  const char* canned =
+    "HTTP/1.0 200 OK\r\n"
+    "Content-Type: text/plain\r\n"
+    "\r\n"
+    "close-delimited success";
+  std::thread server(fake_server_run, listen_fd, &seen_body, &seen, canned);
+
+  http_client_t* c = http_client_create(lt);
+  ASSERT_NE(c, nullptr);
+  completion_record rec;
+  std::string url = "http://127.0.0.1:" + std::to_string(port) + "/v1/x";
+  int rc = http_client_submit(c, url.c_str(), NULL, "{}", 3000,
+                              completion_record_on, &rec);
+  ASSERT_EQ(rc, 0);
+  ASSERT_TRUE(wait_completion(&rec, 5000));
+
+  EXPECT_EQ(rec.status, 200);            /* read-to-close is a success */
+  EXPECT_FALSE(rec.body_null);
+  EXPECT_EQ(rec.body, "close-delimited success");
+  EXPECT_TRUE(rec.error_null);
+  EXPECT_EQ(rec.fire_count, 1);
+
+  server.join();
+  http_client_destroy(c);
+  streams_loop_destroy(lt);
+}
+
 /* -------- helpers -------- */
 
 static void _serve_once(int client_fd, const char* canned) {

@@ -6,10 +6,12 @@
 /* Async HTTP/1.1 client on poll-dancer: ONE POST, one response — the async
    twin of the retired src/Net/http contract. Non-blocking connect/send/recv
    on watchers; the timeout is a loop timer. The completion runs ON THE LOOP
-   THREAD and MUST be µs-scale. Ownership: body and error are heap; the
-   CALLBACK owns them (free() or stash). status: HTTP code, or -1 for
-   transport errors (error set, body NULL). Connection closed and request-side
-   memory freed inside the client before the callback fires. */
+   THREAD and MUST be µs-scale. The callback MUST NOT call back into the same
+   client (submit/destroy from inside on_done deadlocks). Ownership: body and
+   error are heap; the CALLBACK owns them (free() or stash). status: HTTP
+   code, or -1 for transport errors (error set, body NULL). Connection closed
+   and request-side memory freed inside the client before the callback
+   fires. */
 typedef void (*http_client_completion_fn)(void* ctx, int status, char* body,
                                           size_t body_len, char* error);
 typedef struct http_client_t http_client_t;
