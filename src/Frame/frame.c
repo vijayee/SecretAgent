@@ -43,9 +43,10 @@ void frm_reply_payload_destroy(void* p) {
    approaching that limit up front so rejection is loud and early. */
 #define SA_FRAME_MAX_BATCH_BYTES (120 * 1024)
 
-/* sid layout: 8 hex chars = 20 random bits (top) | 12 counter bits (low).
-   The counter makes intra-root sids collision-free for the first 4096 frames
-   of a root's life; the random top bits keep sibling roots' spaces disjoint. */
+/* sid layout: 8 hex chars = 20 random bits (top) | 10 counter bits (bits
+   2-11; the 0xFFC mask forces the low 2 bits to 0). That leaves ~1024
+   distinct counter slots per root, so uniqueness rests on the random top
+   bits — the counter merely staggers siblings born between rng draws. */
 #define SA_FRAME_SID_HEX_LEN 8
 
 /* Status key values (meta/status). frame_create stamps "running"; Task 5's
@@ -217,10 +218,12 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
   uint64_t seq = f->seq + 1;
   size_t state_len = strlen(state_prefix) + strlen(key);
   if (state_len > SA_FRAME_MAX_BATCH_BYTES) {
-    log_error("frame: state key '%s' (%zu bytes) exceeds the %d-byte WAL batch "
-              "cap — refusing, never truncating",
-              key, state_len + (size_t)strlen(json_value),
+    log_error("frame: remember '%s' — prefixed state key %zu chars + %zu-byte "
+              "value exceeds the %d-byte WAL batch cap — refusing, never "
+              "truncating",
+              key, state_len, (size_t)strlen(json_value),
               (int)SA_FRAME_MAX_BATCH_BYTES);
+    json_value_destroy(parsed);
     return -3;
   }
 
@@ -270,7 +273,6 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
   ops[1].value_len = strlen(json_value);
   ops[1].type = 0;
 
-  f->seq = seq;
   int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 2);
   free(text);
   free(state_key);
@@ -280,6 +282,7 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
               rc, key, f->sid_path);
     return rc;
   }
+  f->seq = seq;
   return 0;
 }
 
@@ -331,7 +334,6 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
   ops[0].value_len = text_len;
   ops[0].type = 0;
 
-  f->seq = seq;
   int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 1);
   free(evkey);
   free(text);
@@ -340,6 +342,7 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
               rc, (unsigned long long)seq, f->sid_path);
     return rc;
   }
+  f->seq = seq;
   return 0;
 }
 
