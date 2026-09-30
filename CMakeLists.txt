@@ -55,6 +55,41 @@ if(NOT SA_ENABLE_PYTHON)
   list(FILTER C_SRC EXCLUDE REGEX "src/Python/")
 endif()
 
+# WaveDB: the durable floor (embedded HBTrie/MVCC/WAL/subtree store). Built
+# from the pinned submodule via ExternalProject (same pattern as cpython-ext).
+# OFF keeps the library wavedb-free for embedders that only need the actor
+# runtime.
+option(SA_ENABLE_WDB "Build the WaveDB-backed frame store (requires deps/wavedb)" ON)
+if(SA_ENABLE_WDB)
+  if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/wavedb/CMakeLists.txt)
+    message(FATAL_ERROR "deps/wavedb submodule missing. Run: git submodule update --init --recursive")
+  endif()
+  include(ExternalProject)
+  set(WDB_ROOT    ${CMAKE_CURRENT_SOURCE_DIR}/deps/wavedb)
+  set(WDB_BUILD   ${CMAKE_BINARY_DIR}/deps/wavedb)
+  # WaveDB's REAL option names (grep CMakeLists.txt): BUILD_TESTS (default ON)
+  # plus BUILD_EXAMPLES/BUILD_STRESS_TESTS/BUILD_BENCHMARKS and the
+  # BUILD_NODEJS_/BUILD_DART_/BUILD_PYTHON_BINDINGS shared-FFI toggles. We are
+  # C-side only, so every one of them stays off.
+  set(WDB_CONFIGURE ${CMAKE_COMMAND} -S ${WDB_ROOT} -B ${WDB_BUILD}
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_STRESS_TESTS=OFF
+      -DBUILD_BENCHMARKS=OFF -DBUILD_NODEJS_BINDINGS=OFF
+      -DBUILD_DART_BINDINGS=OFF -DBUILD_PYTHON_BINDINGS=OFF)
+  set(WDB_INSTALL ${CMAKE_COMMAND} -E echo "Skipping install; consuming build-dir artifacts directly")
+  ExternalProject_Add(wavedb-ext
+    SOURCE_DIR ${WDB_ROOT}
+    CONFIGURE_COMMAND ${WDB_CONFIGURE}
+    BUILD_COMMAND ${CMAKE_COMMAND} --build ${WDB_BUILD} --target wavedb
+    INSTALL_COMMAND ${WDB_INSTALL}
+    BUILD_BYPRODUCTS ${WDB_BUILD}/libwavedb.a
+    BINARY_DIR ${WDB_BUILD}
+  )
+  # NOTE: bumping the deps/wavedb pin does not touch these ExternalProject
+  # stamps — after a re-pin, remove the old build stamps or the whole
+  # ${CMAKE_BINARY_DIR}/deps/wavedb tree to force a fresh configure+build.
+endif()
+
 add_library(secretagent STATIC ${C_SRC})
 target_include_directories(secretagent PRIVATE ${C_INC})
 
@@ -79,6 +114,16 @@ if(SA_ENABLE_PYTHON)
   target_link_libraries(secretagent PUBLIC crypt dl m)
   target_link_libraries(secretagent PUBLIC pthread)
   add_dependencies(secretagent cpython-ext)
+endif()
+
+if(SA_ENABLE_WDB)
+  # CMake-level mirror of the PUBLIC compile definition below; the test
+  # subdirectory gates frame sources with a plain if(SA_HAS_WDB) check.
+  set(SA_HAS_WDB ON)
+  target_compile_definitions(secretagent PUBLIC SA_HAS_WDB=1)
+  target_include_directories(secretagent PRIVATE ${WDB_ROOT}/src)
+  target_link_libraries(secretagent PUBLIC ${WDB_BUILD}/libwavedb.a)
+  add_dependencies(secretagent wavedb-ext)
 endif()
 
 # Opt-in AddressSanitizer instrumentation of the secretagent library only (not
