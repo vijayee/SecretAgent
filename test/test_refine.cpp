@@ -2745,6 +2745,121 @@ TEST(TestRefine, TestRollbackAfterLaterEditRejectsStaleInverse) {
   wave_db_close(db);
 }
 
+TEST(TestRefine, TestRollbackRefusesCorruptInverseAndCommitsTheRest) {
+  /* The corrupt-snapshot shape (the inverse-edit teardown contract): a
+     seeded record whose APPLIED delete element carries a NULL before
+     snapshot — the inverse create cannot compose from it, so the rollback
+     refuses that inverse LOUD (the log's edit-contract line), still
+     commits its OTHER inverse edits, and the summary's denominator counts
+     the shape-skipped element beside the rendered lines. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string root = frame_sid(f) + std::string("/harness");
+
+  for (int i = 1; i <= 2; i++) {
+    std::string content = "turn " + std::to_string(i) + " text";
+    ASSERT_EQ(frame_append_msg(f, "user", content.c_str()), 0);
+  }
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  /* Run 1: create the memory (record seq 1, entry v1). */
+  char* summary = NULL;
+  sm.content =
+      "{\"summary\":\"s1\",\"rationale\":\"r1\",\"edits\":["
+      "{\"action\":\"create\",\"kind\":\"memory\",\"id\":\"kept_memory\","
+      "\"title\":\"Kept\",\"content\":\"one\","
+      "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+      "\"reason\":\"create\"}]}";
+  ASSERT_EQ(refine_run(f, NULL, 0, &summary), 0);
+  free(summary);
+
+  /* The crafted target (seq 2), seeded DIRECTLY through the store batch
+     (an externally seeded record the runners never composed): an applied
+     prompt create (its inverse composes) and an applied memory delete
+     whose before snapshot is NULL (its inverse create cannot). The
+     elements carry after-"version" like every applied record element. */
+  std::string prompt_create =
+      "{\"action\":\"create\",\"kind\":\"prompt\",\"id\":\"other_prompt\","
+      "\"title\":\"Other\",\"content\":\"the other lesson\","
+      "\"path\":\"general\",\"version\":1,"
+      "\"evidence\":{\"first_seq\":3,\"last_seq\":4,\"summary\":\"why\"},"
+      "\"before\":null,\"applied\":true,\"error\":null}";
+  std::string corrupt_delete =
+      "{\"action\":\"delete\",\"kind\":\"memory\",\"id\":\"kept_memory\","
+      "\"expect\":{\"version\":1},\"version\":1,"
+      "\"evidence\":{\"first_seq\":3,\"last_seq\":4,\"summary\":\"why\"},"
+      "\"before\":null,\"applied\":true,\"error\":null}";
+  std::string crafted = refi_seed_record(
+      2, "refine_corrupt_target", "the corrupt snapshot",
+      (prompt_create + "," + corrupt_delete).c_str());
+  /* The batch's ownership is TRUE: the round trip destroys the ops ARRAY
+     and every op's heap fields on every path — so the seed rides a HEAP
+     array the test never frees. */
+  frm_store_op_t* seed = (frm_store_op_t*) get_clear_memory(sizeof(*seed));
+  seed->key = refi_dup(refi_log_key(root, 2).c_str());
+  seed->value = (uint8_t*) refi_dup(crafted.c_str());
+  seed->value_len = crafted.size();
+  ASSERT_EQ(_frame_sync_batch(f, seed, 1, "test corrupt seed"), 0);
+  ASSERT_EQ(refi_scan_values(f, root + "/log", root + "/log0", 0).size(), 2u);
+
+  char* rollback_summary = NULL;
+  int rc = refine_rollback(f, 2, 0, &rollback_summary);
+  ASSERT_EQ(rc, 0) << "the rollback still commits its OTHER inverse";
+  ASSERT_NE(rollback_summary, nullptr);
+  std::string sum(rollback_summary);
+  free(rollback_summary);
+
+  /* The denominator counts the shape-skipped element beside the line the
+     prompt's inverse composed (1 applied / 2 carried). */
+  EXPECT_NE(sum.find(" committed (1/2 edits applied)"), std::string::npos)
+      << sum;
+  EXPECT_NE(sum.find("  apply prompt local:other_prompt v1: Rollback "
+                     "refine_corrupt_target"),
+            std::string::npos)
+      << sum;
+  EXPECT_EQ(sum.find("refuse "), std::string::npos)
+      << "the shape refusal is the loud log, not an apply line: " << sum;
+  EXPECT_NE(sum.find("digest changed: "), std::string::npos) << sum;
+
+  /* The corrupt inverse never touched the memory entry (still the run-1
+     materialization), and the prompt's inverse applied (its put gone). */
+  {
+    auto memories =
+        refi_scan_values(f, root + "/entry/memory", root + "/entry/memory0", 0);
+    ASSERT_EQ(memories.size(), 1u);
+    json_value_t* entry = refi_parse_record(memories[0]);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(json_as_int(json_get(entry, "version")), (int64_t)1);
+    EXPECT_EQ(refi_str(entry, "content"), "one");
+    json_value_destroy(entry);
+    auto prompts =
+        refi_scan_values(f, root + "/entry/prompt", root + "/entry/prompt0", 0);
+    ASSERT_EQ(prompts.size(), 0u) << "the other inverse applied";
+  }
+  /* The rollback record committed with ONLY the composable inverse. */
+  {
+    auto records = refi_scan_values(f, root + "/log", root + "/log0", 0);
+    ASSERT_EQ(records.size(), 3u);
+    json_value_t* rb = refi_parse_record(records[2]);
+    ASSERT_NE(rb, nullptr) << records[2];
+    EXPECT_EQ(json_as_int(json_get(rb, "rollbackOf")), (int64_t)2);
+    json_value_t* rb_edits = json_get(rb, "edits");
+    ASSERT_NE(rb_edits, nullptr);
+    ASSERT_EQ(json_size(rb_edits), 1u) << "the corrupt inverse rode no element";
+    json_value_destroy(rb);
+  }
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestRefine, TestRefineBatchOverBudgetRefusesNothingCommitted) {
   /* The refuse-loud batch math (spec §5): a proposal whose entry value
      exceeds the per-entry cap refuses BEFORE the post — nothing is

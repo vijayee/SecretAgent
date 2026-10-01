@@ -1724,7 +1724,7 @@ static void _refine_push_record_line(refine_fold_t* fold, uint64_t seq,
                                      const char* trigger) {
   if (fold == NULL) return;
   char* compacted = _refine_compact(trigger, SA_REFINE_DIGEST_CONTENT_CHARS);
-  if (compacted == NULL) return;
+  /* never NULL: get_memory aborts on OOM (the empty render is fine) */
   char line[512];
   snprintf(line, sizeof(line), "%llu;%.360s;",
            (unsigned long long) seq, compacted);
@@ -1751,14 +1751,16 @@ static int _refine_log_key(const char* root, uint64_t seq, char* out,
 
 /* "<root>/<sub>" .. "<root>/<sub>0" — the two ABSOLUTE ROOT-LEVEL scan
    bounds for one range below a scope root (the log ranges' shape; the
-   meta reads compose their keys directly). */
+   meta reads compose their keys directly). Joins the subtree path and
+   rides _refine_range_bounds's bounds composition. */
 static int _refine_sub_bounds(const char* root, const char* sub, char* lo,
                               size_t lo_size, char* hi, size_t hi_size) {
-  if (snprintf(lo, lo_size, "%s/%s", root, sub) >= (int) lo_size ||
-      snprintf(hi, hi_size, "%s/%s0", root, sub) >= (int) hi_size) {
-    return -1;
-  }
-  return 0;
+  char* joined = get_memory(lo_size);   /* never NULL: get_memory aborts */
+  int rc = (snprintf(joined, lo_size, "%s/%s", root, sub) >= (int) lo_size)
+               ? -1
+               : _refine_range_bounds(joined, lo, lo_size, hi, hi_size);
+  free(joined);
+  return rc;
 }
 
 /* One stored key's value text (the scan replies in raw record texts):
@@ -2077,10 +2079,10 @@ static int _refine_commit(frame_t* f, const char* scope_root,
   }
   size_t total = 0;
   int failed = 0;
-  ops[0].key = _refine_dup(key_log);
+  ops[0].key = _refine_dup(key_log);   /* never NULL: get_memory aborts */
   ops[0].value = (uint8_t*) record_text;   /* OWNED by the round trip */
   ops[0].value_len = record_len;
-  if (ops[0].key != NULL) total += strlen(key_log);
+  total += strlen(key_log);
   for (size_t i = 0; i < n_writes && !failed; i++) {
     if (_refine_entry_op(&ops[1 + i], scope_root, fold, writes[i].kind,
                          writes[i].id, writes[i].withdraw, &total) != 0) {
@@ -2094,15 +2096,8 @@ static int _refine_commit(frame_t* f, const char* scope_root,
     ops[1 + n_writes + 1].key = _refine_dup(key_digest);
     ops[1 + n_writes + 1].value = (uint8_t*) _refine_dup(digest);
     ops[1 + n_writes + 1].value_len = strlen(digest);
-    if (ops[1 + n_writes].key == NULL || ops[1 + n_writes].value == NULL ||
-        ops[1 + n_writes + 1].key == NULL ||
-        ops[1 + n_writes + 1].value == NULL) {
-      log_error("refine: out of memory composing the meta pair");
-      failed = 1;
-    } else {
-      total += strlen(key_fp) + strlen(fingerprint);
-      total += strlen(key_digest) + strlen(digest);
-    }
+    total += strlen(key_fp) + strlen(fingerprint);
+    total += strlen(key_digest) + strlen(digest);
   }
   if (!failed && total > (size_t) SA_REFINE_BATCH_BYTES) {
     log_error("refine: the batch at '%s' is %zu bytes, exceeding the "
@@ -2167,6 +2162,7 @@ int refine_run(frame_t* f, const char* instructions, uint8_t shared_scope,
   _refine_write_t writes[SA_REFINE_MAX_EDITS];
   size_t n_applied = 0;
   size_t n_lines = 0;
+  char* result_summary = NULL;
   int rc = -1;
 
   memset(&fold, 0, sizeof(fold));
@@ -2272,9 +2268,7 @@ int refine_run(frame_t* f, const char* instructions, uint8_t shared_scope,
                                    edits_arr, &line, &element);
     /* element only needed as the out target: the element rides inside
        edits_arr from the helper's append. */
-    if (lines != NULL) {
-      lines[n_lines++] = line;   /* line NULL = an unresolved id's slot */
-    }
+    lines[n_lines++] = line;   /* line NULL = an unresolved id's slot */
     if (applied) {
       /* The dups ride BEFORE the slug's free (the create's resolved id IS
          the slug). */
@@ -2296,6 +2290,7 @@ int refine_run(frame_t* f, const char* instructions, uint8_t shared_scope,
      record (spec §4's record-skip gate). */
   if (n_applied == 0) {
     rc = 1;
+    result_summary = _refine_dup(REFINE_NOOP_BANNER);
     goto out;
   }
 
@@ -2331,7 +2326,11 @@ int refine_run(frame_t* f, const char* instructions, uint8_t shared_scope,
   if (_refine_commit(f, scope_root, &fold, record_seq, record_dom,
                      fingerprint, digest, writes, n_applied,
                      "refine commit") != 0) {
-    goto out;   /* nothing reached the store (the batch is atomic) */
+    /* The batch is compose-refused, or unresolved on the store's deadline
+       (it may still commit later — frame.c's recorded consequence). Either
+       way the store actor commits nothing half-way, and the log counter's
+       next-call restore self-heals over however it lands. */
+    goto out;
   }
   rc = 0;
   _refine_buf_add(&sum, "refine: %s committed (%zu/%zu edits applied)\n",
@@ -2364,7 +2363,7 @@ out:
   json_value_destroy(evidence);
   if (have_shared) refine_fold_destroy(&shared_fold);
   refine_fold_destroy(&fold);
-  if (rc == 1) *summary_out = _refine_dup(REFINE_NOOP_BANNER);
+  if (result_summary != NULL) *summary_out = result_summary;
   return rc;
 }
 
@@ -2399,6 +2398,7 @@ int refine_rollback(frame_t* f, uint64_t seq, uint8_t shared_scope,
   size_t inv_slots = 0;
   size_t n_applied = 0;
   size_t n_lines = 0;
+  size_t n_skipped = 0;
   char* result_summary = NULL;
   int rc = -1;
 
@@ -2489,6 +2489,11 @@ int refine_rollback(frame_t* f, uint64_t seq, uint8_t shared_scope,
     if (_refine_inverse_edit(el, seq, target_id, &inv) != 0) {
       log_error("refine_rollback: record %llu's edit %zu violates the edit "
                 "contract — skipped loud", (unsigned long long) seq, i);
+      /* The shape refusal can fire AFTER the fields rode in (the corrupt
+         before snapshot's return) — the same destroy-on-failure teardown
+         the fold-parse's decode refuses ride. */
+      refine_edit_destroy(&inv);
+      n_skipped++;
       continue;   /* render-not-crash (refinement.ts:479-483's rule) */
     }
     char* line = NULL;
@@ -2559,9 +2564,11 @@ int refine_rollback(frame_t* f, uint64_t seq, uint8_t shared_scope,
   }
   rc = 0;
 
-  /* THE SUMMARY (the frozen shape). */
+  /* THE SUMMARY (the frozen shape): the denominator counts every inverse
+     edit the target record carried — the shape-refused ones (no report
+     line, only the loud log) ride the count beside the rendered lines. */
   _refine_buf_add(&sum, "refine: %s committed (%zu/%zu edits applied)\n",
-                  record_id, n_applied, n_lines);
+                  record_id, n_applied, n_lines + n_skipped);
   for (size_t i = 0; i < n_lines; i++) {
     _refine_buf_add(&sum, "  %s\n", lines[i] != NULL ? lines[i] : "");
   }
