@@ -186,8 +186,11 @@ typedef struct frm_spawn_pending_t {
 typedef struct frame_bind_slot_t {
   uint8_t in_use, done;
   uint64_t corr, bridge_corr;
-  uint8_t engine_driven;   /* 1 = post FRM_CHILD_REPORT on the reply (Task
-                              6's terminate wires its own binds with this) */
+  uint8_t engine_driven;   /* 1 = post FRM_CHILD_REPORT on the reply (the
+                              terminate wires its own binds with this) */
+  uint8_t failed;          /* engine_driven only: the terminate's outcome
+                              flag — the FRM_CHILD_REPORT resumes the parent
+                              with failed = 0 (quiet) or 1 (failure) */
   int rc;                  /* the store's refusal code (0 = committed) */
   uint64_t own_seq;        /* the child's pre-allocated seq */
 } frame_bind_slot_t;
@@ -432,8 +435,8 @@ static char* _frame_subtree_text(database_subtree_t* st, const char* key) {
 }
 
 /* Event record JSON per the frozen shape: {"seq","type","frame","corr","at",
-   "cause","payload"}. Bridge events carry a corr (Task 6 will use it); a
-   direct store write has none, so "corr" is JSON null in this slice. "cause"
+   "cause","payload"}. "corr" is JSON null in this slice — the bridge verb
+   corrs route through the reply registry, never into the records. "cause"
    = the seq of the RECORDING frame's PREVIOUS event (the audit chain); JSON
    null only when seq <= 1. `frame_path` names the recording frame's subtree —
    a report/bind writes the child's record with the child's path + seq and a
@@ -1665,15 +1668,16 @@ static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
     /* engine_driven == 1: the parent's resume posts FROM THE CONFIRMED COMMIT
        — and from a refusal too (a parent must never hang because a WAL write
        failed; the seq rollback above ran best-effort and the refusal is
-       logged). Task 6's terminate carries its own failed flag through the
-       bind slot; a quiet-completion bind resumes with failed = 0. */
+       logged). The bind slot carries the terminate's own failed flag: a
+       quiet-completion bind resumes with failed = 0, the failure binds
+       resume with failed = 1 (the parent's log_error names the child). */
     if (f->bind_slot.engine_driven != 0) {
       if (r->rc != 0) {
         log_error("frame: the engine-driven report bind from '%s' was refused "
                   "(%d) — the parent still resumes (never hang on a WAL "
                   "failure)", f->sid_path, r->rc);
       }
-      _frame_child_notify_post(f, 0);
+      _frame_child_notify_post(f, f->bind_slot.failed);
     }
     f->bind_slot.in_use = 0;
     frm_store_reply_payload_destroy(r);
@@ -2003,7 +2007,7 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         log_error("frame: FRM_REPORT with corr 0 at '%s' — nothing to match",
                   f->sid_path);
       } else if (f->parent != NULL) {
-        if (_frame_report_bind_post(f, rp->corr, 0, rp->text) != 0) {
+        if (_frame_report_bind_post(f, rp->corr, 0, 0, rp->text) != 0) {
           log_error("frame: report batch failed for '%s' (corr %llu) — "
                     "answered as a refusal before any post", f->sid_path,
                     (unsigned long long)rp->corr);
@@ -3394,11 +3398,13 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
    frame.report event at the parent's own pre-allocated seq — and the store
    actor executes it as ONE atomic commit, corr-matched back to the CHILD.
    Both events keep payload {child_sid, text}; each keeps its own frame's seq
-   cause chain. engine_driven (Task 6's terminate path) posts FRM_CHILD_REPORT
-   from the same reply route; a cell-verb report or a direct sync-API report
-   only binds. */
+   cause chain. engine_driven (the terminal step) posts FRM_CHILD_REPORT from
+   the same reply route, carrying `failed` through the bind slot (the parent
+   resumes loud on a failed child); a cell-verb report or a direct sync-API
+   report only binds (failed is meaningless there). */
 int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
-                            uint8_t engine_driven, const char* text) {
+                            uint8_t engine_driven, uint8_t failed,
+                            const char* text) {
   if (child == NULL || child->st == NULL) {
     log_error("frame_report: dead frame");
     return -1;
@@ -3462,6 +3468,7 @@ int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
   child->bind_slot.corr = corr;
   child->bind_slot.bridge_corr = bridge_corr;
   child->bind_slot.engine_driven = engine_driven;
+  child->bind_slot.failed = failed;
   child->bind_slot.own_seq = cseq;
   _frame_post(&parent->actor, (uint32_t)FRM_REPORT_BIND, b,
               frm_report_bind_payload_destroy, "report bind");
@@ -3714,7 +3721,7 @@ int frame_report(frame_t* child, const char* text) {
               "cannot be awaited from inside the frame's own dispatch");
     return -1;
   }
-  int rc = _frame_report_bind_post(child, 0, 0, text);
+  int rc = _frame_report_bind_post(child, 0, 0, 0, text);
   if (rc != 0) {
     child->bind_slot.in_use = 0;
     return rc;

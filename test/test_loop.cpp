@@ -407,6 +407,111 @@ TEST(TestLoop, TestTurnLimitFailsLoud) {
   wave_db_close(db);
 }
 
+TEST(TestLoop, TestChildTurnLimitFailsIntoTheParent) {
+  /* Task 6: the CHILD engine hits its own turn cap — control "turn-limit"
+     stays in the child's log with the exact kind; the child's status lands
+     DONE (no parent ever awaits a zombie); ONE frame.report whose text
+     carries the failure binds into the parent's log; the bind reply posts
+     FRM_CHILD_REPORT{failed=1} and the parent's bookkeeping (live_children
+     --, the folded join) drains. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* parent = frame_create(db, NULL, "parent of failures", &cfg);
+  ASSERT_NE(parent, nullptr);
+  /* The parent's engine never starts — the spawn here is the admission-only
+     shape (the START branch needs a live parent engine), so this test holds
+     and drives the child itself. */
+  frame_t* child = frame_spawn(parent, "spiral forever", NULL);
+  ASSERT_NE(child, nullptr);
+
+  /* Always a tool call — the fallback answers every turn; the cap ends the
+     child after its first full turn. */
+  std::string always_tool_body =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"pass\"}"}}]}}]})json";
+  std::vector<std::string> replies = {};
+  scripted_model_t am = {};
+  am.base.complete = scripted_complete;
+  am.replies = &replies;
+  am.steer_frame = NULL;
+  am.steer_text = NULL;
+  am.steer_on = 0;
+  am.fallback = &always_tool_body;
+  frame_set_model_backend(child, &am.base);   /* BEFORE the child's turn 1 */
+  frame_set_loop_turn_cap(child, 1);
+
+  EXPECT_EQ(frame_run_loop(child), 1) << "the engine failed, loudly";
+  EXPECT_EQ(frame_is_done(child), 1)
+      << "a failed CHILD is done — never a zombie a parent awaits";
+  EXPECT_EQ(frame_is_done(parent), 0)
+      << "the parent is a separate engine; unbuilt here";
+
+  /* The binding rode the store inside the driver's pumps (the terminate
+     composed the bind; the parent's actor committed it; the reply routed
+     back). The RESIDUAL child-notify → parent-bookkeeping chain drains in
+     the Task-2 pump order — frame, ancestors, inline store. */
+  wave_db_pump(db);
+  actor_run(_frame_actor(child), ACTOR_BATCH_SIZE);   /* the bind reply routes */
+  actor_run(_frame_actor(parent), ACTOR_BATCH_SIZE);  /* the parent's bookkeeping:
+                                        live_children (loud zero-count — the
+                                        engine-less caller never counted this
+                                        spawn), the folded join, resume check */
+  wave_db_pump(db);              /* the folded join commits */
+  actor_run(_frame_actor(parent), ACTOR_BATCH_SIZE);  /* nothing left (the join
+                                        is fire-and-post) */
+
+  /* The parent's log holds ONE frame.report whose text is the failure. */
+  json_value_t* events = load_events(parent);
+  ASSERT_NE(events, nullptr);
+  size_t n_report = 0, n_join = 0;
+  std::string report_text;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "frame.report")) {
+      n_report++;
+      report_text = json_as_string(json_get(json_get(rec, "payload"), "text"));
+    }
+    if (event_is(rec, "frame.join")) n_join++;
+  }
+  EXPECT_EQ(n_report, 1u) << "ONE failure report per child, not one per turn";
+  EXPECT_NE(report_text.find("turn-limit"), std::string::npos)
+      << "the bound report's text carries the failure kind";
+  EXPECT_EQ(n_join, 1u) << "the failure ALSO folds the join into the resume";
+  json_value_destroy(events);
+
+  /* The child's own log keeps the control event with the exact kind (+
+     its composed frame.report record, which rode the same bind batch). */
+  json_value_t* child_events = load_events(child);
+  ASSERT_NE(child_events, nullptr);
+  bool saw_turn_limit = false;
+  bool saw_child_report = false;
+  for (size_t i = 0; i < json_size(child_events); i++) {
+    json_value_t* rec = json_at(child_events, i);
+    if (event_is(rec, "control")) {
+      json_value_t* p = json_get(rec, "payload");
+      if (p != NULL && json_get(p, "kind") != NULL &&
+          strcmp(json_as_string(json_get(p, "kind")), "turn-limit") == 0) {
+        saw_turn_limit = true;
+      }
+    }
+    if (event_is(rec, "frame.report")) {
+      saw_child_report = true;
+      EXPECT_STREQ(json_as_string(json_get(json_get(rec, "payload"), "text")),
+                   "turn-limit: model turn budget exhausted");
+    }
+  }
+  EXPECT_TRUE(saw_turn_limit) << "the child's own log keeps the exact kind";
+  EXPECT_TRUE(saw_child_report) << "the child composed its own report record";
+  json_value_destroy(child_events);
+
+  frame_destroy(child);
+  frame_destroy(parent);
+  wave_db_close(db);
+}
+
 TEST(TestLoop, TestSilentEmptyTurnLeavesControlTrail) {
   /* A reply with neither a tool call nor content (reasoning models stop
      like this) must NOT vanish: the turn still lands in the audit trail

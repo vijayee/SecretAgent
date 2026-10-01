@@ -372,17 +372,19 @@ int _frame_event_post_fire(frame_t* f, const char* type_name,
 /* Best-effort seq roll-back of an abandoned pre-allocation (§5). */
 void _frame_seq_rollback(frame_t* f, uint64_t abandoned);
 
-/* The terminal step's cross-subtree report bind (Task 5's quiet-completion
-   path already uses it; Task 6's failure terminate keeps the shape): the
-   CHILD composes only its own frame.report record (its pre-allocated seq)
-   and posts FRM_REPORT_BIND{engine_driven = 1} to the parent's actor — the
+/* The terminal step's cross-subtree report bind (the quiet-completion and
+   failure terminates both use it): the CHILD composes only its own
+   frame.report record (its pre-allocated seq) and posts
+   FRM_REPORT_BIND{engine_driven, failed} to the parent's actor — the
    parent composes the whole three-op batch, the store executes it as ONE
    atomic commit, and its corr-matched reply routes back to the child's
-   actor, whose router posts ONE FRM_CHILD_REPORT to the parent. Returns 0
-   once POSTED; nonzero on the pre-post refusals (already logged; nothing
-   was posted — the caller still notifies the parent directly, never hang). */
+   actor, whose router posts ONE FRM_CHILD_REPORT{child_sid, failed} to the
+   parent. Returns 0 once POSTED; nonzero on the pre-post refusals (already
+   logged; nothing was posted — the caller still notifies the parent
+   directly, never hang). */
 int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
-                            uint8_t engine_driven, const char* text);
+                            uint8_t engine_driven, uint8_t failed,
+                            const char* text);
 
 /* The resume path's folded frame.join (spec §4): ONE frame.join event in the
    parent's log {child_sid}, FIRE-AND-POST (corr 0, reply_to NULL — it runs

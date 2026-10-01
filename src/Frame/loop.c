@@ -485,6 +485,45 @@ static void _loop_control(frame_t* f, const char* kind, const char* text) {
   }
 }
 
+/* The terminal step (defined below the turn engine's handlers; declared
+   early — the failure surfaces of this file run ahead of its definition). */
+static void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text);
+
+/* The failure surface (spec §4): the control event — kind + text, when the
+   path carries one — stays in THIS frame's log (fire-and-post; the store's
+   FIFO commits it ahead of the terminate's bind), and the engine terminates
+   FAILED: a CHILD binds ONE failure report whose text is "<control kind>:
+   <control text>" (the accountability surface — the parent's derive shows
+   it), and the bind's confirmed commit resumes the parent; a TOP frame's
+   engine just ends failed (the pinned cap-is-a-failure shape, no status
+   change). kind NULL = a plain-text failure at a path that never carried a
+   control kind (the OOM/lost-reply shapes — semantics kept byte-for-byte);
+   text NULL = the kind alone. Never silent. */
+static void _loop_fail(frame_t* f, frame_engine_state_t* e, const char* kind,
+                       const char* text) {
+  if (kind != NULL) _loop_control(f, kind, text);
+  if (kind == NULL) {
+    _frame_engine_terminate(f, 0,
+                            (text != NULL) ? text : "engine failed");
+    return;
+  }
+  if (text == NULL) {
+    _frame_engine_terminate(f, 0, kind);
+    return;
+  }
+  char* joined = get_memory(strlen(kind) + strlen(text) + 4);
+  if (joined == NULL) {
+    log_error("loop: out of memory composing the failure text at '%s' — "
+              "the bound report carries the kind alone", frame_sid(f));
+    _frame_engine_terminate(f, 0, kind);
+    return;
+  }
+  snprintf(joined, strlen(kind) + strlen(text) + 4, "%s: %s", kind, text);
+  _frame_engine_terminate(f, 0, joined);
+  free(joined);   /* the terminate consumed the text synchronously (the bind
+                     payload owns its own copy) */
+}
+
 /* The python availability gate: a WDB-only build has no runtime, so a tool
    call can NEVER execute. The check is lazy (at the first tool call) rather
    than at run_loop entry — a content-only scripted loop stays runnable, and
@@ -496,10 +535,12 @@ static void _loop_control(frame_t* f, const char* kind, const char* text) {
 #define _loop_python_ready() 1
 #endif
 
-/* The terminal step: end the live engine. `failed` is frame_run_loop's rc
-   (engine_failed); a TOP frame failure makes NO status change (the pinned
-   cap-is-a-failure shape). Task 6's _frame_engine_terminate grows the
-   child-side notify branch (the failure text bound into the parent's log). */
+/* End the live engine WITHOUT notifying anyone (the engine-side bookkeeping
+   only). `_loop_fail`/`_frame_engine_terminate` are the failure and terminal
+   surfaces (a child's outcome binds into the parent); this one serves the
+   DESTROY-race shapes — the turn continuation refused by a dying mailbox,
+   a queued turn arriving at a gone subtree — where no engine could notify
+   anyone, and the clean stop/end paths. Keep a genuine failure OUT of it. */
 static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed) {
   if (e == NULL) {
     log_error("loop: the engine ended at an unusable frame (already logged)");
@@ -628,8 +669,7 @@ static void _loop_post_derive(frame_t* f, frame_engine_state_t* e) {
     free(lo);
     free(hi);
     free(sp);
-    _loop_control(f, "derive-error", NULL);
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "derive-error", NULL);
     return;
   }
   snprintf(lo, base + strlen("/events") + 1, "%s/events", sid);
@@ -659,7 +699,7 @@ static void _loop_post_cell_run(frame_t* f, frame_engine_state_t* e,
     log_error("loop: out of memory building the cell.run payload at '%s'",
               frame_sid(f));
     model_reply_destroy(reply);
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, NULL, "out of memory building the cell.run payload");
     return;
   }
   json_object_set(run_payload, "code", json_new_string(reply->tool_code));
@@ -680,9 +720,8 @@ static void _loop_post_cell_run(frame_t* f, frame_engine_state_t* e,
     e->store_corr = 0;
     _frame_seq_rollback(f, seq);
     log_error("loop: cell.run event refused at '%s'", frame_sid(f));
-    _loop_control(f, "audit-error", "cell.run event refused");
     model_reply_destroy(reply);
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "audit-error", "cell.run event refused");
     return;
   }
   /* The model reply rides the engine state to the CELL_RUN reply (which
@@ -696,9 +735,8 @@ static void _loop_tool_path(frame_t* f, frame_engine_state_t* e,
   if (!_loop_python_ready()) {
     log_error("loop: tool call at '%s' but this build has no python "
               "runtime — no cell can execute", frame_sid(f));
-    _loop_control(f, "python-missing", "no python runtime in this build");
     model_reply_destroy(reply);
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "python-missing", "no python runtime in this build");
     return;
   }
   _loop_post_cell_run(f, e, reply);
@@ -734,8 +772,7 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
   if (frc != 0) {
     /* Pre-post refusal (already logged loud; the seq rolled back): the
        turn's message + completion never committed. */
-    _loop_control(f, "commit-error", "turn finish batch refused");
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "commit-error", "turn finish batch refused");
     return;
   }
   e->phase = FRAME_PHASE_STORE;
@@ -762,10 +799,9 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
       (void)_loop_post_turn(f);
       return;
     }
-    _loop_control(f, "model-error-final", detail);
+    _loop_fail(f, e, "model-error-final", detail);
     free(err);
     if (reply != NULL) model_reply_destroy(reply);
-    _loop_engine_end(f, e, 1);
     return;
   }
   free(err);
@@ -787,16 +823,14 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
   if (r->rc != 0) {
     log_error("loop: the derive scan at '%s' was refused by the store (%d) — "
               "nothing can be derived", frame_sid(f), r->rc);
-    _loop_control(f, "derive-error", NULL);
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "derive-error", NULL);
     return;
   }
   json_value_t* events = json_new_array();
   if (events == NULL) {
     log_error("loop: out of memory building the derive DOM at '%s'",
               frame_sid(f));
-    _loop_control(f, "derive-error", NULL);
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "derive-error", NULL);
     return;
   }
   for (size_t i = 0; i < r->n; i++) {
@@ -812,17 +846,15 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
   json_value_t* messages = _loop_project(f, events);   /* consumes the DOM */
   if (messages == NULL) {
     log_error("loop: the projection failed at '%s'", frame_sid(f));
-    _loop_control(f, "derive-error", NULL);
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "derive-error", NULL);
     return;
   }
 
   model_backend_t* mb = _frame_backend_get(f);
   if (mb == NULL) {
     log_error("loop: '%s' has no usable model backend", frame_sid(f));
-    _loop_control(f, "model-missing", NULL);
+    _loop_fail(f, e, "model-missing", NULL);
     json_value_destroy(messages);
-    _loop_engine_end(f, e, 1);
     return;
   }
 
@@ -852,8 +884,7 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
       if (_frame_engine_submit_release(f) != 0) return;
       log_error("loop: the model submit was rejected (the sink will never "
                 "fire) at '%s'", frame_sid(f));
-      _loop_control(f, "submit-failed", NULL);
-      _loop_engine_end(f, e, 1);
+      _loop_fail(f, e, "submit-failed", NULL);
       return;
     }
     e->phase = FRAME_PHASE_MODEL;
@@ -887,14 +918,13 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
       e->turn_reply = NULL;
     }
     log_error("loop: cell.run event refused at '%s'", frame_sid(f));
-    _loop_control(f, "audit-error", "cell.run event refused");
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "audit-error", "cell.run event refused");
     return;
   }
   if (e->turn_reply == NULL || e->turn_reply->tool_code == NULL) {
     log_error("loop: the cell.run round trip lost the model reply at '%s' — "
               "failing loud", frame_sid(f));
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, NULL, "the cell.run round trip lost the model reply");
     return;
   }
 
@@ -904,7 +934,8 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
               "'%s'", frame_sid(f));
     model_reply_destroy(e->turn_reply);
     e->turn_reply = NULL;
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, NULL,
+               "out of memory building the cell execute payload");
     return;
   }
   cp->corr = e->turn_cell_corr;
@@ -914,7 +945,7 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
     frm_cell_payload_destroy(cp);
     model_reply_destroy(e->turn_reply);
     e->turn_reply = NULL;
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, NULL, "out of memory copying the cell code");
     return;
   }
   message_t m;
@@ -986,7 +1017,8 @@ static void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text) {
        report event) and the store executes it as ONE atomic commit; the
        reply routes back to THIS child, whose router posts FRM_CHILD_REPORT
        to the parent. */
-    if (_frame_report_bind_post(f, 0, 1, (text != NULL) ? text : "") != 0) {
+    if (_frame_report_bind_post(f, 0, 1, ok ? 0 : 1,
+                                (text != NULL) ? text : "") != 0) {
       /* The compose refused loud (nothing was posted) — the resume still
          fires: a parent must never hang because a WAL write failed. */
       log_error("loop: the terminal report bind for '%s' refused pre-post — "
@@ -1011,8 +1043,7 @@ static void _loop_engine_on_finish(frame_t* f, frame_engine_state_t* e, int rc) 
   if (rc != 0) {
     log_error("loop: the turn finish batch was refused (%d) at '%s'",
               rc, frame_sid(f));
-    _loop_control(f, "commit-error", "turn finish batch refused");
-    _loop_engine_end(f, e, 1);
+    _loop_fail(f, e, "commit-error", "turn finish batch refused");
     return;
   }
   /* The turn's outcome text (consumed by every branch below). */
@@ -1141,15 +1172,13 @@ void _frame_engine_turn(frame_t* f) {
     if (e->turns_issued == cap) {
       log_error("loop: turn limit %u reached at '%s' — failing loud",
                 cap, frame_sid(f));
-      _loop_control(f, "turn-limit", "model turn budget exhausted");
-      _loop_engine_end(f, e, 1);
+      _loop_fail(f, e, "turn-limit", "model turn budget exhausted");
       return;
     }
     model_backend_t* mb = _frame_backend_get(f);
     if (mb == NULL) {
       log_error("loop: '%s' has no usable model backend", frame_sid(f));
-      _loop_control(f, "model-missing", NULL);
-      _loop_engine_end(f, e, 1);
+      _loop_fail(f, e, "model-missing", NULL);
       return;
     }
     e->turns_issued++;
@@ -1377,8 +1406,7 @@ int frame_run_loop(frame_t* f) {
       log_error("loop: the engine at '%s' awaited phase %u past its %u ms "
                 "deadline — the engine ends failed loud", frame_sid(f),
                 (unsigned)e->phase, _loop_phase_deadline_ms(e->phase));
-      _loop_control(f, kind, NULL);
-      _loop_engine_end(f, e, 1);
+      _loop_fail(f, e, kind, NULL);
       break;
     }
     platform_sleep_ms(1);

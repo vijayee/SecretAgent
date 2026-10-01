@@ -1123,6 +1123,122 @@ TEST(TestFrameTree, TestPooledParentSpawnsChildAndResumesOnReport) {
   scheduler_pool_destroy(pool);
 }
 
+TEST(TestFrameTree, TestPooledChildFailureResumesParentWithTheFailure) {
+  /* The pooled shape end to end: parent turn 1 spawns (its engine is live,
+     so the spawn reply STARTS the child and counts it); the child — cap
+     inherited via frame_set_loop_turn_cap on the PARENT, with an
+     always-tool sticky reply keyed to its own goal — hits its turn cap and
+     fails loud; the parent RESUMES (the confirmed bind commit's
+     FRM_CHILD_REPORT{failed=1}) and its next turn's derive shows the
+     failure line; the parent answers content and completes done.
+     Assertions: child done; parent done; the parent's log has exactly ONE
+     report for the child whose text carries the failure kind. All
+     actor-driven (no pumps, no joins — the pool runs everything; poll
+     frame_is_done). */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  cfg.pool = pool;
+
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_t* parent = frame_create(db, NULL, "parent of failures", &cfg);
+  ASSERT_NE(parent, nullptr);
+
+  /* The cap lands on the CHILD through the START branch's inheritance
+     (child->loop_turn_cap = parent->loop_turn_cap) — set BEFORE the spawn
+     turn. Parent budget (3): turn 1 = spawn cell, turn 2 = content while
+     the child runs (the CHILDREN yield), turn 3 = the post-report resume's
+     content (done). The child (same inherited cap 3) runs tool cells on
+     turns 1..3, so its turn 4 hits the cap → control turn-limit → the
+     terminate binds "turn-limit: model turn budget exhausted" into the
+     parent. (A parent cap of 2 cannot survive the resume turn — the
+     failing parent then is a different, wrong shape.) */
+  goal_keyed_model_t gk = {};
+  gk.base.complete = goal_keyed_complete;
+  gk.queues["parent of failures"].push_back(canned_cell_body(
+      "import actor\nactor.spawn('spiral forever', None)\nprint('spawned')"));
+  gk.queues["parent of failures"].push_back(
+      canned_content_body("parent observed the failure"));
+  gk.queues["spiral forever"].push_back(canned_cell_body("pass"));
+  frame_set_loop_turn_cap(parent, 3);
+  frame_set_model_backend(parent, &gk.base);
+
+  ASSERT_EQ(frame_start(parent), 0);
+  EXPECT_TRUE(wait_frame_done(parent, 6000))
+      << "the parent resumed on the FAILED child's report and completed";
+
+  json_value_t* events = load_events(parent);
+  ASSERT_NE(events, nullptr);
+  size_t n_spawn = 0, n_report = 0, n_join = 0;
+  std::string child_sid;
+  std::string report_text;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    json_value_t* payload = json_get(rec, "payload");
+    if (event_is(rec, "frame.spawn")) {
+      n_spawn++;
+      child_sid = json_as_string(json_get(payload, "child_sid"));
+    } else if (event_is(rec, "frame.report")) {
+      n_report++;
+      report_text = json_as_string(json_get(payload, "text"));
+    } else if (event_is(rec, "frame.join")) {
+      n_join++;
+    }
+  }
+  EXPECT_EQ(n_spawn, 1u);
+  EXPECT_EQ(n_report, 1u) << "ONE failure report bound for the failed child";
+  EXPECT_NE(report_text.find("turn-limit"), std::string::npos)
+      << "the bound report's text carries the failure kind";
+  EXPECT_EQ(n_join, 1u);
+  EXPECT_FALSE(child_sid.empty());
+  json_value_destroy(events);
+
+  /* The child is done, its own log keeps the exact control kind, and its
+     composed frame.report record rides its own subtree (read through the
+     engine-less resumed handle, like the quiet-completion shape above). */
+  {
+    frame_config_t plain = test_config();
+    frame_t* resumed = frame_resume(db, child_sid.c_str(), &plain);
+    ASSERT_NE(resumed, nullptr);
+    EXPECT_EQ(frame_is_done(resumed), 1u)
+        << "a failed CHILD is done — never a zombie a parent awaits";
+    json_value_t* child_events = load_events(resumed);
+    ASSERT_NE(child_events, nullptr);
+    bool saw_turn_limit = false, saw_report = false;
+    for (size_t i = 0; i < json_size(child_events); i++) {
+      json_value_t* rec = json_at(child_events, i);
+      json_value_t* payload = json_get(rec, "payload");
+      if (event_is(rec, "control")) {
+        json_value_t* k = (payload != NULL) ? json_get(payload, "kind") : NULL;
+        if (k != NULL && strcmp(json_as_string(k), "turn-limit") == 0) {
+          saw_turn_limit = true;
+        }
+      } else if (event_is(rec, "frame.report")) {
+        saw_report = true;
+        EXPECT_STREQ(
+            json_as_string(json_get(payload, "text")),
+            "turn-limit: model turn budget exhausted");
+      }
+    }
+    EXPECT_TRUE(saw_turn_limit);
+    EXPECT_TRUE(saw_report);
+    json_value_destroy(child_events);
+    frame_destroy(resumed);
+  }
+
+  frame_destroy(parent);
+  scheduler_pool_stop(pool);
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
+}
+
 TEST(TestFrameTree, TestPooledTreeKeepsOneReportPerChildWithContiguousSeq) {
   /* The accountability storm: N children spawned from one parent cell, each
      content-quitting; the parent's log holds N bound reports in a CONTIGUOUS

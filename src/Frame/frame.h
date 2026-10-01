@@ -105,9 +105,11 @@ void frame_set_loop_turn_cap(frame_t* f, unsigned cap);
    turn-step continuation is queued on the frame's actor; from there the
    actor yields to its scheduler pool between turn phases and re-runs on
    every arrival (model completion, cell result, child report). Returns 0,
-   or nonzero with a loud log_error when the frame is dead, already done
-   (an ended frame re-runs nothing), or an engine is already live on it
-   (one engine per frame). */
+   or nonzero with a loud log_error when the frame is dead or an engine is
+   already live on it (one engine per frame). Starting an ALREADY-DONE frame
+   also returns 0: the done check lives in the first turn dispatch, which
+   then terminates the engine cleanly (a CHILD posts its parent's resume; a
+   top frame just ends — an ended frame re-runs nothing). */
 int frame_start(frame_t* f);
 
 /* Test/debug + embedding accessor: the pool the frame's actor is attached
