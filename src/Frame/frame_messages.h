@@ -132,7 +132,8 @@ typedef struct frm_store_batch_payload_t {
 typedef struct frm_store_scan_payload_t {
   char* start;          /* OWNED; e.g. "sessions/<sid>/events" */
   char* end;            /* OWNED; e.g. "sessions/<sid>/events0" */
-  size_t limit;         /* newest-record cap (SA_FRAME_DEBUG_MAX_EVENTS) */
+  size_t limit;         /* newest-record cap; 0 or > the store's window max
+                           clamps to the store's max window */
   actor_t* reply_to;    /* BORROWED; never NULL */
   uint64_t corr;
 } frm_store_scan_payload_t;

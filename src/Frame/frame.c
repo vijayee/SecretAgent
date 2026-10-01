@@ -827,12 +827,19 @@ static void _store_behavior(void* state, message_t* msg) {
           log_error("store: reverse scan failed — refusing the scan reply");
           rc = -1;
         } else {
+          /* The scan honors the payload's declared limit: a scan asking for
+             MORE than the store's materialization window (or limit 0) gets
+             the window max — clamped, never extended further. */
+          size_t cap = sp->limit;
+          if (cap == 0 || cap > SA_FRAME_DEBUG_MAX_EVENTS) {
+            cap = SA_FRAME_DEBUG_MAX_EVENTS;
+          }
           char* texts[SA_FRAME_DEBUG_MAX_EVENTS];   /* newest-first (descending seq) */
           n = 0;
           int oom = 0;
           path_t* key = NULL;
           identifier_t* value = NULL;
-          while (n < SA_FRAME_DEBUG_MAX_EVENTS) {
+          while (n < cap) {
             path_t* k = NULL;
             identifier_t* v = NULL;
             int src = database_scan_prev(iter, &k, &v);
@@ -849,6 +856,7 @@ static void _store_behavior(void* state, message_t* msg) {
                 text[len] = '\0';
                 texts[n++] = text;
               }
+              free(data);
             } else {
               log_error("store: scan record value copy failed");
               oom = 1;
@@ -863,10 +871,15 @@ static void _store_behavior(void* state, message_t* msg) {
             log_error("store: scan materialization hit a bound — the reply "
                       "carries the %zu records it got", n);
           }
-          /* Emit ascending (the caller reads oldest -> newest). */
+          /* Emit ascending (the caller reads oldest -> newest). The mid-
+             loop materialization refusals keep the reply's partial shape
+             clean (a skipped record never leaves a NULL slot). */
           if (n > 0) {
             records = (char**)get_clear_memory(n * sizeof(char*));
             if (records == NULL) {
+              /* The array failed: the materialized texts have no reply to
+                 ride — freed here, same discipline as the refusal path. */
+              for (size_t i = 0; i < n; i++) free(texts[i]);
               rc = -1;
             } else {
               for (size_t i = 0; i < n; i++) records[i] = texts[n - 1 - i];
@@ -2238,7 +2251,9 @@ frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
   if (f == NULL) return NULL;
 
   /* Birth batch: ONE atomic batch with the frame's meta keys. Loop-driven
-     frames start "running"; they end via the loop (Task 10). */
+     frames start "running"; they end via the loop (Task 10). The direct
+     write (not a store post) is the birth-batch carve-out — pre-announcement:
+     fresh subtree, single writer, direct write. */
   {
     char iso[25];
     _frame_iso_now(iso);

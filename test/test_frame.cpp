@@ -643,6 +643,88 @@ TEST(TestStore, TestStoreRecallWalkRidesTheStoreActor) {
   wave_db_close(db);
 }
 
+/* A scan-reply capture: the store actor answers a RAW FRM_STORE_SCAN at the
+   requester actor directly, and the frame router's corr slots do not cover a
+   raw scan probe (an unrelated corr drops loud — the router's contract), so
+   the test plays its own reply target and consumes the reply payload here. */
+typedef struct scan_capture_t {
+  actor_t actor;
+  std::vector<int64_t> rcs;
+  std::vector<size_t> counts;
+  std::vector<std::vector<std::string>> records_per_reply;
+} scan_capture_t;
+
+static void scan_capture_dispatch(void* state, message_t* msg) {
+  scan_capture_t* cap = (scan_capture_t*)state;
+  if (msg->type != (uint32_t)FRM_STORE_REPLY) return;
+  frm_store_reply_payload_t* r = (frm_store_reply_payload_t*)msg->payload;
+  msg->payload = NULL;   /* consumed — payload_destroy must not free it twice */
+  if (r == NULL) return;
+  cap->rcs.push_back(r->rc);
+  cap->counts.push_back(r->n);
+  std::vector<std::string> recs;
+  for (size_t i = 0; i < r->n; i++)
+    recs.emplace_back(r->records[i] != NULL ? r->records[i] : "");
+  cap->records_per_reply.push_back(recs);
+  frm_store_reply_payload_destroy(r);
+}
+
+TEST(TestStore, TestStoreScanHonorsRequestedLimit) {
+  /* A scan posted at the store actor carries its own newest-record limit and
+     the reply carries EXACTLY that many records — the newest window of the
+     range, emitted ascending — even when the range holds more. The store
+     never invents behavior beyond the declared cap (window clamp only). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  actor_t* store = wave_db_store_actor(db);
+  ASSERT_NE(store, nullptr);
+  frame_config_t cfg = test_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* Six remember events land in the frame's events range (one record each);
+     seqs 1..6. */
+  for (int i = 1; i <= 6; i++)
+    EXPECT_EQ(frame_remember_local(f, ("k" + std::to_string(i)).c_str(), "\"v\""), 0);
+
+  scan_capture_t cap;
+  actor_init(&cap.actor, &cap, scan_capture_dispatch, NULL);   /* inline: the test drains */
+
+  frm_store_scan_payload_t* sp =
+      (frm_store_scan_payload_t*)get_clear_memory(sizeof(*sp));
+  sp->start = strdup((std::string(frame_sid(f)) + "/events").c_str());
+  sp->end = strdup((std::string(frame_sid(f)) + "/events0").c_str());
+  sp->limit = 3;
+  sp->reply_to = &cap.actor;
+  sp->corr = 77;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_SCAN;
+  m.payload = sp;
+  m.payload_destroy = frm_store_scan_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &m));
+  wave_db_pump(db);                     /* the store actor runs the scan */
+
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);   /* the test's reply target drains */
+  ASSERT_EQ(cap.counts.size(), 1u) << "one corr-matched scan reply";
+  ASSERT_EQ(cap.rcs[0], 0);
+  ASSERT_EQ(cap.counts[0], 3u) << "the reply carries EXACTLY the requested limit";
+  ASSERT_EQ(cap.records_per_reply[0].size(), 3u);
+
+  /* Ascending: the newest three OF the six (seqs 4, 5, 6), oldest first. */
+  for (size_t i = 0; i < 3; i++) {
+    json_value_t* rec = json_parse(cap.records_per_reply[0][i].c_str(),
+                                   cap.records_per_reply[0][i].size(), NULL);
+    ASSERT_NE(rec, nullptr) << "record " << i << " is the composed event JSON";
+    EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)(4 + i));
+    json_value_destroy(rec);
+  }
+
+  /* actor_destroy drains + frees the mailbox (the delivered reply node). */
+  actor_destroy(&cap.actor);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestFrame, TestReportBindIsOneCrossSubtreeBatch) {
   /* The cross-frame effect is ONE atomic batch, composed at the PARENT's
      actor with the parent's PRE-ALLOCATED seq; the child only ever allocated
