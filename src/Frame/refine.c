@@ -866,7 +866,8 @@ static json_value_t* _refine_parse_text(const char* text) {
 
 /* Decodes ONE record edit element into a refine_edit_t. The struct is
    zeroed first, so a partial decode stays destroy-safe. Returns 0, or
-   -1 on shape malformation (the caller logs + skips). */
+   -1 on shape malformation (the fold's caller logs + skips; the proposal
+   decode refuses loud). */
 static int _refine_edit_decode(json_value_t* el, refine_edit_t* e) {
   memset(e, 0, sizeof(*e));
   json_value_t* v;
@@ -1144,7 +1145,7 @@ static int _refine_json_is_incomplete(const char* text) {
     }
     if (c == '"') in_string = 1;
     else if (c == '{' || c == '[') depth++;
-    else if (c == '}' || c == ']') depth--;
+    else if (c == '}' || c == ']') depth = depth > 0 ? depth - 1 : 0;
   }
   return in_string || depth > 0;
 }
@@ -1471,17 +1472,25 @@ static int _refine_decode_edits(json_value_t* proposal, refine_edit_t** edits_ou
     refine_edit_t e;
     memset(&e, 0, sizeof(e));
     int rc = _refine_edit_decode(el, &e);
-    if (rc == 0) {
-      /* The proposal's own top-level reason wins over the evidence line's
-         summary (both feeds the record's evidence summary, Task 5's compose). */
-      json_value_t* reason = json_get(el, "reason");
-      if (reason != NULL && json_type(reason) == JSON_STRING) {
-        free(e.reason);
-        e.reason = _refine_dup(json_as_string(reason));
-      }
+    if (rc != 0) {
+      /* The decode's own failure is a refusal IN ITS OWN RIGHT — never a
+         fall-through to refine_edit_validate, whose only catch here is the
+         partial struct's NULL action/kind (an invariant two functions away). */
+      refine_edit_destroy(&e);
+      for (size_t j = 0; j < n; j++) refine_edit_destroy(&out[j]);
+      free(out);
+      *error_out = _refine_error("edit element is malformed");
+      return -1;
     }
-    /* The DECODE's field fence: the validateEdit strings refuse the whole
-       reply (apply-stage gates — evidence, versions — stay per-edit). */
+    /* The proposal's own top-level reason wins over the evidence line's
+       summary (both feeds the record's evidence summary, Task 5's compose). */
+    json_value_t* reason = json_get(el, "reason");
+    if (reason != NULL && json_type(reason) == JSON_STRING) {
+      free(e.reason);
+      e.reason = _refine_dup(json_as_string(reason));
+    }
+    /* The validateEdit strings refuse the whole reply (apply-stage gates —
+       evidence, versions — stay per-edit). */
     char* verdict = refine_edit_validate(&e);
     if (verdict != NULL) {
       refine_edit_destroy(&e);

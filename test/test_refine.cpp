@@ -1389,7 +1389,10 @@ TEST(TestRefine, TestReviewTrajectoryTailSliceDropsWholeOldestRecords) {
    trim; > SA_REFINE_MAX_EDITS edits refuse with the PA truncation wording
    (kTruncatedJson — refinement.ts:199's shape; the cap is the refuse-loud
    stand-in for the output reserve, spec §4); a non-JSON reply refuses loud;
-   edits missing required fields refuse with the validateEdit strings. */
+   a closer-heavy reply names the valid-JSON cause, never the truncation one;
+   edits missing required fields refuse with the validateEdit strings while
+   edits missing/wrong-typing the decode's own fields refuse with the decode
+   shape's own line; non-object top-level fields fall to the defaults. */
 TEST(TestRefine, TestProposalDecodeCapsAndFences) {
   wave_database_root_t* db = wave_db_open(NULL);
   ASSERT_NE(db, nullptr);
@@ -1520,6 +1523,32 @@ TEST(TestRefine, TestProposalDecodeCapsAndFences) {
     EXPECT_EQ(rationale, nullptr);
   }
 
+  /* 3c. A closer-heavy reply (more closers than openers) is never
+         misdiagnosed as truncated: the scan's depth floor keeps the
+         balanced-shape answer, and the valid-JSON cause rides. */
+  {
+    sm.content =
+        "{\"summary\":\"s\",\"edits\":[]}]}";
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_NE(refusal, nullptr);
+    EXPECT_NE(strstr(refusal, "the model did not return valid JSON: "), nullptr)
+        << refusal;
+    EXPECT_EQ(strstr(refusal, kTruncatedJson), nullptr)
+        << "a closer-heavy reply is NOT named truncated";
+    free(refusal);
+    EXPECT_EQ(traj, nullptr);
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_EQ(summary, nullptr);
+    EXPECT_EQ(rationale, nullptr);
+  }
+
   /* 4. A truncated fence — no closing ``` — whose JSON never completes
         names the PA truncation cause (the incomplete-JSON diagnosis). */
   {
@@ -1591,6 +1620,43 @@ TEST(TestRefine, TestProposalDecodeCapsAndFences) {
     free(rationale);
   }
 
+  /* 5b. THE DECODE'S OWN SHAPE REFUSALS (missing or wrong-typed action /
+         kind) refuse loud with the decode's own line — never the implicit
+         fall-through to refine_edit_validate's internal "(null)" catch. */
+  const struct {
+    const char* what;
+    const char* edit_json;
+  } shapes[] = {
+      {"missing action",
+       "{\"kind\":\"memory\",\"title\":\"t\",\"content\":\"c\","
+       "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}"},
+      {"wrong-typed kind",
+       "{\"action\":\"create\",\"kind\":5,\"title\":\"t\",\"content\":\"c\","
+       "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}"},
+  };
+  for (const auto& shape : shapes) {
+    SCOPED_TRACE(shape.what);
+    std::string proposal =
+        std::string("{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":[") +
+        shape.edit_json + "]}";
+    sm.content = proposal;
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_NE(refusal, nullptr) << "a decode-shape refusal refuses the decode";
+    EXPECT_STREQ(refusal, "edit element is malformed");
+    free(refusal);
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_EQ(traj, nullptr);
+    free(summary);
+    free(rationale);
+  }
+
   /* 6. The EMPTY edits proposal is a VALID decode (zero edits — the no-op
         proposal PA's contract asks for; Task 5's no-op rule consumes it). */
   {
@@ -1610,6 +1676,33 @@ TEST(TestRefine, TestProposalDecodeCapsAndFences) {
     EXPECT_EQ(edits, nullptr);
     EXPECT_STREQ(summary, "nothing to persist");
     EXPECT_STREQ(rationale, "no evidence-backed lessons in the trajectory");
+    free(traj);
+    free(summary);
+    free(rationale);
+  }
+
+  /* 7. The decode defaults: a NON-OBJECT summary and rationale fall to PA's
+        normalize defaults, and a JSON-NULL edits field is the valid
+        zero-edit proposal (the same shape a missing edits field carries). */
+  {
+    sm.content = "{\"summary\":5,\"rationale\":[\"no\"],\"edits\":null}";
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_EQ(refusal, nullptr)
+        << "a null edits proposal is a valid decode: "
+        << (refusal != NULL ? refusal : "(none)");
+    EXPECT_EQ(nedits, 0u);
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_STREQ(summary, "Refined continual harness state")
+        << "a non-object summary falls to the PA default";
+    EXPECT_STREQ(rationale, "")
+        << "a non-object rationale falls to the PA default";
     free(traj);
     free(summary);
     free(rationale);

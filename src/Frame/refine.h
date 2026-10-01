@@ -205,9 +205,9 @@ json_value_t* refine_record_edit_json(const refine_edit_t* e,
    Returns NULL with the proposal decoded: *edits (a malloc'd refine_edit_t
    array the caller destroys per element and frees), *nedits (0 = the valid
    empty proposal), *summary and *rationale (heap, the caller's). Non-NULL
-   return = a malloc'd refusal string (validateEdit strings, the output-cap
-   truncation wording, the model error) and EVERY out-slot NULL/0 — the
-   decode refuses loud, no partial decode. */
+   return = a malloc'd refusal string (validateEdit strings, the decode's own
+   malformation line, the output-cap truncation wording, the model error) and
+   EVERY out-slot NULL/0 — the decode refuses loud, no partial decode. */
 char* refine_review_call(frame_t* f, const refine_fold_t* fold,
                          const char* scope_root, const char* instructions,
                          char** trajectory_json,

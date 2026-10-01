@@ -556,7 +556,16 @@ int _model_request_body(const char* model_name, json_value_t* messages,
   } else if (tools != NULL && json_type(tools) == JSON_NULL) {
     /* Explicitly no tools: both keys stay out of the request document. */
   } else {
+    /* The NULL POINTER is the turn loop's unchanged execute-tool shape: a
+       NULL-pointer tools request must never silently degrade to a no-tools
+       request, so the composed execute tool is checked like any other. */
     owned_tools = _model_execute_tool();
+    if (owned_tools == NULL) {
+      json_value_destroy(owned_messages);
+      *error_out = _model_error("model client: request build: the execute "
+                                "tool is required");
+      return -1;
+    }
   }
 
   json_value_t* req = json_new_object();
