@@ -279,6 +279,37 @@ int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload)
    their own report batches. */
 int _frame_set_status_done(frame_t* f);
 
+/* --- the refine slice's sync store helpers (the direct-sync rule) ---------
+
+   Identical discipline to every other direct sync store call (the
+   frame.c family `_frame_remember_sync` / `_frame_set_status_done` /
+   frame_remember_local): refused LOUD on a POOLED store
+   (_frame_sync_store_refused) — production reaches these effects through
+   the actor paths; the single-flight sync slot carries the round trip;
+   _frame_slot_wait pumps until the corr-matched reply or the
+   SA_FRAME_STORE_WAIT_MS deadline. */
+
+/* ONE FRM_STORE_SCAN round trip with the given ABSOLUTE ROOT-LEVEL composed
+   bounds (never relative — the subtree-scan breakage) and the newest-records
+   cap (0 = the store's window max; > the window max clamps). The reply's
+   materialized records (ascending; the store worker's REVERSE-to-ascending
+   shape) ride back as ONE malloc'd JSON-ARRAY text of the RAW record texts
+   joined ("[]" when the range is empty) — the caller parses it whole.
+   Returns 0 with *text_out set, nonzero loud otherwise (the store keeps the
+   batch on a deadline: the same recorded consequence as the other syncs). */
+int _frame_sync_scan(frame_t* f, const char* start, const char* end,
+                     size_t cap, char** text_out);
+
+/* ONE atomic root batch (refine.c composes; this owns the round trip).
+   op ownership TRANSFERS: the ops array and every op's heap fields are all
+   freed here on the success AND the refusal path — the composer never
+   frees them itself. `op_name` is BORROWED (a literal or caller-owned
+   string the round trip only logs). Returns 0 committed, the refusal code
+   otherwise (loud either way; nothing half-committed — the store's ONE
+   atomic batch). */
+int _frame_sync_batch(frame_t* f, frm_store_op_t* ops, size_t nops,
+                      const char* op_name);
+
 /* 1 when the frame has a parent frame (i.e. is a spawned child). */
 uint8_t _frame_is_child(const frame_t* f);
 

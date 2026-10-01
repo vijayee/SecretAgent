@@ -158,6 +158,10 @@ typedef struct frame_sync_slot_t {
   uint64_t corr;           /* the awaited corr */
   int rc;                  /* the store's refusal code (0 = committed) */
   char* text;              /* a recall reply's resolved text (transfer) */
+  char** records;          /* a scan reply's materialized raw record texts
+                              (transfer, ascending; the sync scan joins them
+                              into its array reply and frees) */
+  size_t n;                /* the records count */
 } frame_sync_slot_t;
 
 /* The spawn admissions IN FLIGHT (a corr-keyed list, not one slot): the
@@ -699,6 +703,13 @@ static void _store_reply_send(actor_t* reply_to, uint64_t corr, int rc,
    reply its own dispatch has to return first. The sync write paths respond
    with fire-and-post (the store's FIFO commits the batch ahead of the
    engine's next awaited trip) and the result-returning reads refuse loud. */
+/* 1 when the frame's OWN behavior is on the call stack (a NESTED sync
+   caller): such a caller must never pump this frame's mailbox — a nested
+   actor_run's pop frees the outer run's node (the sentinel queue's design;
+   the ASan-proven reentrancy hazard) and a nested await would deadlock on a
+   reply its own dispatch has to return first. The sync write paths respond
+   with fire-and-post (the store's FIFO commits the batch ahead of the
+   engine's next awaited trip) and the result-returning reads refuse loud. */
 static uint8_t _frame_nested_sync(const frame_t* f) {
   return (f != NULL && f->dispatch_depth > 0) ? 1 : 0;
 }
@@ -718,6 +729,22 @@ static int _frame_sync_store_refused(frame_t* f, const char* op) {
     return 1;
   }
   return 0;
+}
+
+/* The sync slot's owned leftovers die here (the recall's transferred text, a
+   deadline's late reply's records): every sync compose begins with this reset
+   and the frame teardown ends with it. */
+static void _frame_sync_slot_reset(frame_t* f) {
+  if (f == NULL) return;
+  free(f->sync.text);
+  f->sync.text = NULL;
+  if (f->sync.records != NULL) {
+    for (size_t i = 0; i < f->sync.n; i++) free(f->sync.records[i]);
+    free(f->sync.records);
+    f->sync.records = NULL;
+  }
+  f->sync.n = 0;
+  memset(&f->sync, 0, sizeof(f->sync));
 }
 
 /* ONE pump cycle over an inline frame's whole round-trip surface
@@ -787,7 +814,8 @@ int _frame_engine_finish_post(frame_t* f, const char* append_text,
   if (status_val != NULL) {
     memcpy(status_val, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
   }
-  frm_store_op_t put_ops[2];
+  frm_store_op_t put_ops[2];   /* zeroed: is_delete is not a composer's field */
+  memset(put_ops, 0, sizeof(put_ops));
   size_t nops = 0;
   put_ops[nops].key = evkey;                    /* OWNED by the round trip */
   put_ops[nops].value = (uint8_t*)text;         /* OWNED */
@@ -915,6 +943,25 @@ static void _store_behavior(void* state, message_t* msg) {
                     bp->op_name != NULL ? bp->op_name : "?", i);
           rc = -1;
           break;
+        }
+        if (bp->ops[i].is_delete) {
+          /* The DELETE op (WaveDB raw_op_t.type 1): a deletion never
+             smuggles bytes — a delete carrying a value or a length refuses
+             LOUD and the whole batch with it. */
+          if (bp->ops[i].value != NULL || bp->ops[i].value_len != 0) {
+            log_error("store: batch '%s' op %zu is a DELETE carrying a "
+                      "value — refused loud",
+                      bp->op_name != NULL ? bp->op_name : "?", i);
+            rc = -1;
+            break;
+          }
+          ops[i].key = bp->ops[i].key;
+          ops[i].key_len = strlen(bp->ops[i].key);
+          ops[i].value = NULL;
+          ops[i].value_len = 0;
+          ops[i].type = 1;   /* WaveDB: 0 = put, 1 = delete */
+          total += ops[i].key_len;
+          continue;
         }
         if (bp->ops[i].value_len > SA_FRAME_MAX_BATCH_BYTES) {
           log_error("store: batch '%s' op %zu's value is %zu bytes, exceeding "
@@ -1222,8 +1269,7 @@ int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload)
     return _frame_event_post_fire(f, type_name, payload);
   }
   uint64_t seq = 0;
-  free(f->sync.text);
-  memset(&f->sync, 0, sizeof(f->sync));
+  _frame_sync_slot_reset(f);
   f->sync.in_use = 1;
   f->sync.corr = ++f->store_corr_seq;
   int rc = _frame_event_post(f, type_name, payload, f->sync.corr,
@@ -1369,8 +1415,7 @@ static int _frame_remember_sync(frame_t* f, const char* key, const char* json_va
     return (nrc == 0) ? 0 : nrc;
   }
   uint64_t seq = 0;
-  free(f->sync.text);
-  memset(&f->sync, 0, sizeof(f->sync));
+  _frame_sync_slot_reset(f);
   f->sync.in_use = 1;
   f->sync.corr = ++f->store_corr_seq;
   int rc = _frame_remember_post(f, key, json_value, state_prefix,
@@ -1688,10 +1733,15 @@ static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
   if (f->sync.in_use && r->corr == f->sync.corr) {
     f->sync.done = 1;
     f->sync.rc = r->rc;
-    free(f->sync.text);
-    f->sync.text = NULL;
-    if (r->rc == 0 && r->n >= 1 && r->records != NULL && r->records[0] != NULL) {
-      f->sync.text = strdup(r->records[0]);   /* the recall's resolution */
+    if (r->rc == 0) {
+      /* The reply's raw records transfer WHOLE (the sync scan joins them
+         into its array text; the recall's resolution is records[0]). */
+      f->sync.records = r->records;
+      f->sync.n = r->n;
+      r->records = NULL;
+      r->n = 0;
+      f->sync.text = (f->sync.n >= 1 && f->sync.records[0] != NULL)
+          ? strdup(f->sync.records[0]) : NULL;   /* the recall's resolution */
     }
     frm_store_reply_payload_destroy(r);
     return;
@@ -2177,8 +2227,7 @@ int _frame_set_status_done(frame_t* f) {
   memcpy(bp->ops[0].value, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
   bp->ops[0].value_len = strlen(SA_FRAME_STATUS_DONE);
   bp->op_name = "status->done"; /* BORROWED literal */
-  free(f->sync.text);
-  memset(&f->sync, 0, sizeof(f->sync));
+  _frame_sync_slot_reset(f);
   f->sync.in_use = 1;
   f->sync.corr = ++f->store_corr_seq;
   bp->reply_to = &f->actor;
@@ -2194,6 +2243,131 @@ int _frame_set_status_done(frame_t* f) {
     return rc;
   }
   return 0;
+}
+
+/* --- the refine slice's sync store helpers (frame_internal.h's contract) --- */
+
+/* The ops array's teardown (the sync batch's ownership contract): every op's
+   heap fields plus the array itself. */
+static void _frame_ops_destroy(frm_store_op_t* ops, size_t nops) {
+  if (ops == NULL) return;
+  for (size_t i = 0; i < nops; i++) {
+    free(ops[i].key);
+    free(ops[i].value);
+  }
+  free(ops);
+}
+
+int _frame_sync_scan(frame_t* f, const char* start, const char* end,
+                     size_t cap, char** text_out) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: sync scan on a dead frame");
+    return -1;
+  }
+  if (start == NULL || end == NULL || text_out == NULL) {
+    log_error("frame: sync scan at '%s' needs composed bounds and an output",
+              f->sid_path != NULL ? f->sid_path : "?");
+    return -1;
+  }
+  *text_out = NULL;
+  if (_frame_sync_store_refused(f, "sync scan")) return -1;
+  if (_frame_nested_sync(f)) {
+    log_error("frame: nested sync scan at '%s' refuses loud — a read can "
+              "never return from inside the frame's own dispatch",
+              f->sid_path);
+    return -1;
+  }
+  frm_store_scan_payload_t* sp =
+      (frm_store_scan_payload_t*)get_clear_memory(sizeof(frm_store_scan_payload_t));
+  sp->start = strdup(start);   /* OWNED; rides the payload */
+  sp->end = strdup(end);
+  if (sp->start == NULL || sp->end == NULL) {
+    frm_store_scan_payload_destroy(sp);
+    return -1;
+  }
+  sp->limit = cap;
+  _frame_sync_slot_reset(f);
+  f->sync.in_use = 1;
+  f->sync.corr = ++f->store_corr_seq;
+  sp->reply_to = &f->actor;
+  sp->corr = f->sync.corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_SCAN, sp,
+              frm_store_scan_payload_destroy, "sync scan");
+  int wait_rc = _frame_slot_wait(f, &f->sync.done, SA_FRAME_STORE_WAIT_MS);
+  f->sync.in_use = 0;
+  if (wait_rc != 0) return -1;   /* deadline: the scan reply routes late */
+  int rc = f->sync.rc;
+  if (rc != 0) return rc;        /* the store logged its scan refusal loud */
+  /* Join the reply's materialized raw record texts (ascending) as ONE
+     JSON-ARRAY text — each record a quoted string element; "[]" when the
+     range is empty. The caller parses the array whole. */
+  json_value_t* arr = json_new_array();
+  for (size_t i = 0; i < f->sync.n; i++) {
+    if (f->sync.records[i] == NULL) continue;   /* never happens today */
+    json_array_append(arr, json_new_string(f->sync.records[i]));
+  }
+  char* text = json_serialize(arr);
+  json_value_destroy(arr);
+  _frame_sync_slot_reset(f);   /* the join copied the texts; the ride dies */
+  if (text == NULL) {
+    log_error("frame: sync scan at '%s' — the records join failed",
+              f->sid_path);
+    return -1;
+  }
+  *text_out = text;
+  return 0;
+}
+
+int _frame_sync_batch(frame_t* f, frm_store_op_t* ops, size_t nops,
+                      const char* op_name) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: sync batch '%s' on a dead frame",
+              op_name != NULL ? op_name : "?");
+    _frame_ops_destroy(ops, nops);
+    return -1;
+  }
+  if (ops == NULL || nops == 0) {
+    log_error("frame: sync batch '%s' at '%s' carries no ops — refused loud",
+              op_name != NULL ? op_name : "?", f->sid_path);
+    _frame_ops_destroy(ops, nops);
+    return -1;
+  }
+  if (_frame_sync_store_refused(f, "sync batch")) {
+    _frame_ops_destroy(ops, nops);
+    return -1;
+  }
+  if (_frame_nested_sync(f)) {
+    log_error("frame: nested sync batch '%s' at '%s' refuses loud — a batch "
+              "whose committed/failed answer is required never posts "
+              "unawaited", op_name != NULL ? op_name : "?", f->sid_path);
+    _frame_ops_destroy(ops, nops);
+    return -1;
+  }
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  /* The ops ownership TRANSFERS into the payload: its destroyer frees the
+     array and every op's heap fields on every round-trip path (success,
+     store refusal, deadline, late routing) — this helper never frees an op
+     once composed. */
+  bp->ops = ops;
+  bp->nops = nops;
+  bp->op_name = op_name;        /* BORROWED */
+  _frame_sync_slot_reset(f);
+  f->sync.in_use = 1;
+  f->sync.corr = ++f->store_corr_seq;
+  bp->reply_to = &f->actor;
+  bp->corr = f->sync.corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "sync batch");
+  int wait_rc = _frame_slot_wait(f, &f->sync.done, SA_FRAME_STORE_WAIT_MS);
+  f->sync.in_use = 0;
+  if (wait_rc != 0) return -1;   /* deadline: the batch may still commit */
+  int rc = f->sync.rc;
+  if (rc != 0) {
+    log_error("frame: sync batch '%s' failed (%d) at '%s' — nothing committed",
+              op_name != NULL ? op_name : "?", rc, f->sid_path);
+  }
+  return rc;
 }
 
 uint8_t _frame_is_child(const frame_t* f) {
@@ -2812,8 +2986,7 @@ static void _frame_destroy_run(frame_t* f) {
     }
     f->bridge_pending = NULL;
   }
-  free(f->sync.text);
-  f->sync.text = NULL;
+  _frame_sync_slot_reset(f);
   free(f->engine.finish_text);
   f->engine.finish_text = NULL;
   if (f->engine.turn_reply != NULL) {
@@ -3057,8 +3230,7 @@ char* frame_recall(frame_t* f, const char* key) {
               key, f->sid_path);
     return NULL;
   }
-  free(f->sync.text);
-  memset(&f->sync, 0, sizeof(f->sync));
+  _frame_sync_slot_reset(f);
   f->sync.in_use = 1;
   f->sync.corr = ++f->store_corr_seq;
   int rc = _frame_recall_post(f, key, f->sync.corr, &f->actor);

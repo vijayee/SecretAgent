@@ -13,6 +13,7 @@
 extern "C" {
 #include "../src/Util/allocator.h"
 #include "../src/Frame/refine.h"
+#include "../src/Frame/frame_internal.h"   /* Task 3's _frame_sync_* helpers */
 }
 
 #include <string>
@@ -923,4 +924,121 @@ TEST(TestRefine, TestFingerprintSaltedVersionString) {
   EXPECT_NE(fingerprint, hex_v2);
 
   refine_fold_destroy(&fold);
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 3: the store round trips the fold's log reads ride             */
+/* ------------------------------------------------------------------ */
+
+static frame_config_t refi_frame_config(void) {
+  frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));   /* additive fields default sensibly */
+  cfg.model_base_url = NULL;
+  cfg.model_api_key = NULL;
+  cfg.model_name = "unused";
+  cfg.max_depth = 4;
+  return cfg;
+}
+
+TEST(TestRefine, TestSyncScanReturnsNewestAscendingAsJointArray) {
+  /* The store-actor path the fold's parse rides: a scratch in-memory store
+     is seeded with record texts under a COMPOSED ABSOLUTE range (never
+     relative — the subtree-scan breakage), then _frame_sync_scan runs its
+     FRM_STORE_SCAN round trip through the store actor (the single-flight
+     sync slot pumps it — the frame.c family's one pump order). The reply is
+     ONE malloc'd JSON-ARRAY text of the raw record texts, ascending, exactly
+     the seeded count. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+
+  /* Seed three refine record docs at <sid>/refine/records/<seq> — via the
+     sync batch itself (the seed rides the OTHER new helper; the ops'
+     ownership transfers into the round trip). */
+  frm_store_op_t* ops = (frm_store_op_t*)get_clear_memory(3 * sizeof(frm_store_op_t));
+  for (uint64_t s = 1; s <= 3; s++) {
+    std::string rec = "{\"seq\":" + std::to_string(s) + ",\"id\":\"r" +
+                      std::to_string(s) + "\",\"trigger\":\"trigger " +
+                      std::to_string(s) + "\",\"edits\":[]}";
+    ops[s - 1].key =
+        strdup((sid + "/refine/records/" + std::to_string(s)).c_str());
+    ops[s - 1].value = (uint8_t*)strdup(rec.c_str());
+    ops[s - 1].value_len = rec.size();
+  }
+  EXPECT_EQ(_frame_sync_batch(f, ops, 3, "refine seed test"), 0)
+      << "the seed batch committed atomically";
+
+  std::string start = sid + "/refine/records";
+  std::string end = sid + "/refine/records0";
+
+  /* One round trip, one joint array text. */
+  char* text = NULL;
+  ASSERT_EQ(_frame_sync_scan(f, start.c_str(), end.c_str(), 0, &text), 0);
+  ASSERT_NE(text, nullptr);
+  char* err = NULL;
+  json_value_t* arr = json_parse(text, strlen(text), &err);
+  if (err != NULL) free(err);
+  ASSERT_NE(arr, nullptr) << "raw: " << text;
+  ASSERT_EQ(json_type(arr), JSON_ARRAY);
+  ASSERT_EQ(json_size(arr), 3u) << "exactly the seeded count: " << text;
+
+  /* Ascending: the seeded record texts ride oldest first, each as a quoted
+     string element the fold's parse consumes whole. */
+  for (size_t i = 0; i < 3; i++) {
+    json_value_t* el = json_at(arr, i);
+    ASSERT_NE(el, nullptr);
+    ASSERT_EQ(json_type(el), JSON_STRING);
+    const char* rec_text = json_as_string(el);
+    ASSERT_NE(rec_text, nullptr);
+    json_value_t* rec = json_parse(rec_text, strlen(rec_text), NULL);
+    ASSERT_NE(rec, nullptr) << "element " << i << " is the raw record text";
+    EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)(1 + i));
+    json_value_destroy(rec);
+  }
+  json_value_destroy(arr);
+
+  /* And the joint text IS the fold's parse input (Task 5's path): */
+  refine_fold_t fold;
+  memset(&fold, 0, sizeof(fold));
+  EXPECT_EQ(refine_fold_parse(text, &fold), 0);
+  EXPECT_EQ(fold.nrecords, 3u);
+  refine_fold_destroy(&fold);
+  free(text);
+
+  /* The newest-records cap: cap 2 returns the NEWEST two (seqs 2, 3), still
+     ascending — never the oldest two. */
+  char* newest = NULL;
+  ASSERT_EQ(_frame_sync_scan(f, start.c_str(), end.c_str(), 2, &newest), 0);
+  ASSERT_NE(newest, nullptr);
+  err = NULL;
+  arr = json_parse(newest, strlen(newest), &err);
+  if (err != NULL) free(err);
+  ASSERT_NE(arr, nullptr) << "raw: " << newest;
+  ASSERT_EQ(json_type(arr), JSON_ARRAY);
+  ASSERT_EQ(json_size(arr), 2u);
+  for (size_t i = 0; i < 2; i++) {
+    json_value_t* el = json_at(arr, i);
+    ASSERT_EQ(json_type(el), JSON_STRING);
+    json_value_t* rec = json_parse(json_as_string(el), strlen(json_as_string(el)), NULL);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)(2 + i));
+    json_value_destroy(rec);
+  }
+  json_value_destroy(arr);
+  free(newest);
+
+  /* An EMPTY range is exactly "[]" (one array text, zero elements). */
+  std::string none_start = sid + "/refine/none";
+  std::string none_end = sid + "/refine/none0";
+  char* empty = NULL;
+  ASSERT_EQ(_frame_sync_scan(f, none_start.c_str(), none_end.c_str(), 8, &empty), 0);
+  ASSERT_NE(empty, nullptr);
+  EXPECT_STREQ(empty, "[]");
+  free(empty);
+
+  frame_destroy(f);
+  wave_db_close(db);
 }

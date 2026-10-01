@@ -110,9 +110,13 @@ void frm_child_report_payload_destroy(void* p);
 /* --- the store vocabulary payloads (all owned by the store round trip;
    ownership of heap fields transfers with the message) --------------------- */
 
-/* One put op (all frame-layer writes are puts). Ownership of key and value
-   transfers with the payload; the store behavior frees them after it acts. */
-typedef struct frm_store_op_t { char* key; uint8_t* value; size_t value_len; } frm_store_op_t;
+/* One op. Ownership of key and value transfers with the payload; the store
+   behavior frees them after it acts. is_delete = DELETE op (WaveDB
+   raw_op_t.type 1): value/value_len are IGNORED and a delete op carrying
+   either is refused loud (a deletion never smuggles bytes). The harness
+   entry-withdrawal is the first user (the LOG never deletes — frame layer
+   events stay puts). */
+typedef struct frm_store_op_t { char* key; uint8_t* value; size_t value_len; uint8_t is_delete; } frm_store_op_t;
 
 /* A batch = ONE atomic root database_batch_sync_raw across every touched
    subtree (the composed full-root-path keys — the existing spawn/report/

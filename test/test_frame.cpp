@@ -771,6 +771,126 @@ TEST(TestStore, TestStoreScanHonorsRequestedLimit) {
   wave_db_close(db);
 }
 
+TEST(TestFrame, TestStoreBatchCarriesDeleteOpsAtomic) {
+  /* The delete op (frm_store_op_t.is_delete = WaveDB raw_op_t.type 1) rides
+     the store batch: a batch of [put entry, delete entry] in ONE round trip
+     leaves the put ABSENT, and a batch that REFUSES — here a delete op
+     carrying a value (a deletion never smuggles bytes) — commits NOTHING of
+     its put sibling. The reply capture reuses the scan-capture responder
+     (the test plays its own reply target and consumes the payloads). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  actor_t* store = wave_db_store_actor(db);
+  ASSERT_NE(store, nullptr);
+  frame_config_t cfg = test_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  scan_capture_t cap;
+  actor_init(&cap.actor, &cap, scan_capture_dispatch, NULL);
+
+  /* Committed: put + delete of the SAME key in ONE batch — the end state is
+     the DELETE's (the entry absent), the put never outlives its batch. */
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*bp));
+  bp->ops = (frm_store_op_t*)get_clear_memory(2 * sizeof(frm_store_op_t));
+  bp->nops = 2;
+  bp->ops[0].key = strdup((sid + "/state/local/dual").c_str());
+  bp->ops[0].value = (uint8_t*)strdup("\"put first\"");
+  bp->ops[0].value_len = strlen("\"put first\"");
+  bp->ops[1].key = strdup((sid + "/state/local/dual").c_str());   /* OWNED twice */
+  bp->ops[1].is_delete = 1;      /* value NULL, value_len 0 */
+  bp->op_name = "del-test-atomic";
+  bp->reply_to = &cap.actor;
+  bp->corr = 4244;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_BATCH;
+  m.payload = bp;
+  m.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &m));
+  wave_db_pump(db);                          /* the store actor runs the batch */
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);   /* the reply lands corr-matched */
+  ASSERT_EQ(cap.rcs.size(), 1u);
+  EXPECT_EQ(cap.rcs[0], 0) << "put + delete of the same key is one batch";
+
+  char* absent = frame_recall(f, "dual");
+  EXPECT_EQ(absent, nullptr) << "the delete won: the put is ABSENT in the end state";
+  free(absent);
+
+  /* Refused: a delete op WITH a value refuses loud (rc != 0) and the whole
+     atomic batch with it — the sibling put commits NOTHING. */
+  frm_store_batch_payload_t* smuggler =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*smuggler));
+  smuggler->ops = (frm_store_op_t*)get_clear_memory(2 * sizeof(frm_store_op_t));
+  smuggler->nops = 2;
+  smuggler->ops[0].key = strdup((sid + "/state/local/pair").c_str());
+  smuggler->ops[0].value = (uint8_t*)strdup("\"should never appear\"");
+  smuggler->ops[0].value_len = strlen("\"should never appear\"");
+  smuggler->ops[1].key = strdup((sid + "/state/local/pair2").c_str());
+  smuggler->ops[1].value = (uint8_t*)strdup("smuggled");
+  smuggler->ops[1].value_len = strlen("smuggled");
+  smuggler->ops[1].is_delete = 1;
+  smuggler->op_name = "del-test-smuggler";
+  smuggler->reply_to = &cap.actor;
+  smuggler->corr = 4245;
+  message_t m2;
+  m2.type = (uint32_t)FRM_STORE_BATCH;
+  m2.payload = smuggler;
+  m2.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &m2));
+  wave_db_pump(db);
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);
+  ASSERT_EQ(cap.rcs.size(), 2u);
+  EXPECT_NE(cap.rcs[1], 0) << "a DELETE carrying a value refuses loud";
+
+  char* ghost = frame_recall(f, "pair");
+  EXPECT_EQ(ghost, nullptr) << "the refusing batch committed NOTHING — not even its put";
+  free(ghost);
+
+  actor_destroy(&cap.actor);   /* drains + frees the delivered reply nodes */
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestSyncScanAndBatchRefuseOnPooledStore) {
+  /* The two NEW sync store helpers refuse LOUD on a POOLED store — the same
+     inline-only rule as wave_db_pump's pump refusal (no hang, no mailbox
+     steal): production reaches these effects through the actor paths. */
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_config_t plain = test_config();
+  frame_t* f = frame_create(db, NULL, NULL, &plain);
+  ASSERT_NE(f, nullptr);
+
+  char* text = (char*)0x1;
+  EXPECT_NE(_frame_sync_scan(f, "sessions/x", "sessions/x0", 4, &text), 0)
+      << "the sync scan refuses loud on a pooled store";
+  EXPECT_EQ(text, nullptr) << "the refused scan returns no text";
+
+  /* The refused batch's ops ownership still TRANSFERS: the helper frees the
+     array and the ops' heap fields itself (valgrind watches this teardown). */
+  frm_store_op_t* ops = (frm_store_op_t*)get_clear_memory(2 * sizeof(frm_store_op_t));
+  ops[0].key = strdup("/state/local/a");
+  ops[0].value = (uint8_t*)strdup("\"x\"");
+  ops[0].value_len = strlen("\"x\"");
+  ops[1].key = strdup("/state/local/b");
+  ops[1].is_delete = 1;
+  EXPECT_NE(_frame_sync_batch(f, ops, 2, "pooled refusal probe"), 0)
+      << "the sync batch refuses loud on a pooled store";
+
+  frame_destroy(f);
+  wave_db_close(db);            /* documented order: stop, close, destroy */
+  scheduler_pool_stop(pool);
+  scheduler_pool_destroy(pool);
+}
+
 TEST(TestFrame, TestReportBindIsOneCrossSubtreeBatch) {
   /* The cross-frame effect is ONE atomic batch, composed at the PARENT's
      actor with the parent's PRE-ALLOCATED seq; the child only ever allocated
