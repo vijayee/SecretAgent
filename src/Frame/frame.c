@@ -2536,14 +2536,6 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
               f->sid_path);
     goto fail;
   }
-  /* The same pool guard as frame_create: a resumed POOLED frame on an
-     inline-store root is a mailbox nobody pumps. */
-  if (f->pool != NULL && db->store_pool == NULL) {
-    log_error("frame_resume: a POOLED frame on '%s' requires a POOLED store "
-              "— open the root with wave_db_open_config and a store pool; "
-              "refusing loud", f->sid_path);
-    goto fail;
-  }
   /* The birth record is the resume gate: a path without meta/created is not
      one of this process's frames (typo, foreign prefix, missing db). */
   char* created = _frame_subtree_text(f->st, "meta/created");
@@ -2586,12 +2578,28 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
     f->max_depth = 4;
   }
 
+  /* The pool guard of frame_create, at RESOLVED time: the cfg above is
+     copied already, so f->pool is what this frame will run with. A frame
+     pool and a store pool must agree — a POOLED frame on an inline-store
+     root OR an inline (cfg-less) resume on a POOLED store is a mailbox
+     nobody pumps on one side. A mismatch refuses loud instead of hanging. */
+  if ((f->pool != NULL) != (db->store_pool != NULL)) {
+    log_error("frame_resume: the frame pool and the store pool must match "
+              "at '%s' — a POOLED frame requires a POOLED store (and the "
+              "resumed cfg must carry that pool); refusing loud",
+              f->sid_path);
+    goto fail;
+  }
+
   actor_init(&f->actor, f, _frame_behavior, f->pool);
   return f;
 
 fail:
   if (f->st != NULL) database_subtree_close(f->st);
   free(f->sid_path);
+  free(f->model_base_url);
+  free(f->model_api_key);
+  free(f->model_name);
   free(f);
   return NULL;
 }

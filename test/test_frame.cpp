@@ -67,6 +67,47 @@ TEST(TestFrame, TestPoolAttachAndInheritance) {
   scheduler_pool_destroy(pool);
 }
 
+TEST(TestFrame, TestResumePoolMismatchRefusesLoud) {
+  /* frame_resume resolves the cfg's pool BEFORE the guard fires: a resumed
+     frame whose pool disagrees with the store's is a mailbox nobody pumps
+     on one side — refuse loud now, never hang at first pump. */
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+
+  /* A POOLED frame on a POOLED store — the working shape whose birth record
+     must be visible to resume. */
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_config_t pooled = test_config();
+  pooled.pool = pool;
+  frame_t* f = frame_create(db, NULL, "pooled resume pin", &pooled);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  frame_destroy(f);
+
+  /* The pinned direction: resume that frame with a cfg that carries NO
+     pool. The RESOLVED frame pool (NULL) mismatches the pooled store's. */
+  frame_config_t plain = test_config();
+  EXPECT_EQ(frame_resume(db, sid.c_str(), &plain), nullptr)
+      << "a pooled store's frame resumed pool-less must refuse, not hang";
+
+  /* The landed direction still fires at the right time: a POOLED resume cfg
+     against an inline-store root. */
+  wave_database_root_t* inline_db = wave_db_open(NULL);
+  ASSERT_NE(inline_db, nullptr);
+  EXPECT_EQ(frame_resume(inline_db, sid.c_str(), &pooled), nullptr)
+      << "a POOLED resume cfg on an inline store must refuse, not hang";
+
+  wave_db_close(inline_db);
+  wave_db_close(db);
+  scheduler_pool_stop(pool);
+  scheduler_pool_destroy(pool);
+}
+
 TEST(TestFrame, TestFrameStartQueuesOneTurnContinuation) {
   frame_config_t plain = test_config();
   wave_database_root_t* db = wave_db_open(NULL);

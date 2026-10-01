@@ -247,9 +247,6 @@ TEST(TestLoop, TestScriptedLoopRunsCellAndCompletes) {
      semantics; see loop.c's REPORT SEMANTICS note). */
   EXPECT_EQ(frame_is_done(f), 1);
 
-  /* TEMP DEBUG */
-  { char* dbg = frame_debug_events(f); fprintf(stderr, "DBGEVENTS=%s\n", dbg ? dbg : "(null)"); for (auto& s : sm.captured) fprintf(stderr, "DBGCAPTURE=%s\n", s.c_str()); if (dbg) free(dbg); }
-
   /* Audit trail: exactly four records — cell.run, state.remember (n = 7),
      frame.report (the cell's own completion report), cell.result. */
   json_value_t* events = load_events(f);

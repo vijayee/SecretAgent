@@ -498,6 +498,7 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
   e->phase = FRAME_PHASE_NONE;
   e->store_kind = (frame_store_kind_e)0;
   e->store_corr = 0;
+  e->turn_cell_corr = 0;
   e->model_retry_step = 0;
   if (e->turn_reply != NULL) {
     model_reply_destroy(e->turn_reply);
@@ -1078,7 +1079,11 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
     json_object_set(result_payload, "status", json_new_int(1));
     json_object_set(result_payload, "text",
                     json_new_string("cell refused before execution"));
-    _frame_event_post_fire(f, "cell.result", result_payload);
+    if (_frame_event_post_fire(f, "cell.result", result_payload) != 0) {
+      log_error("loop: the refused cell's paired cell.result (corr %llu) was "
+                "refused pre-post at '%s' (already logged)",
+                (unsigned long long)e->turn_cell_corr, frame_sid(f));
+    }
   }
   (void)_loop_post_turn(f);   /* resume */
 }
