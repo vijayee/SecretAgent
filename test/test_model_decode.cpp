@@ -11,13 +11,16 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 
 extern "C" {
 #include "../src/Frame/frame.h"
 #include "../src/Frame/model.h"
+#include "../src/Frame/model_internal.h"
 #include "../src/Util/json.h"
 }
 
@@ -132,6 +135,53 @@ static json_value_t* make_messages(void) {
   json_object_set(m, "content", json_new_string("compute six times seven"));
   json_array_append(msgs, m);
   return msgs;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Submit-path tests (plan Task 4): REAL async submit over the loop thread */
+/* ---------------------------------------------------------------------- */
+
+/* model.h's sink contract recorded from the test's side: every delivery
+   (body/error are OWNED by the sink — recorded then freed). wait() blocks a
+   bounded wall-clock on a real condition_variable, so a missed delivery
+   fails as a timeout, never a hang. */
+typedef struct sink_record_t {
+  std::mutex m;
+  std::condition_variable cv;
+  int calls;
+  std::thread::id thread_id;   /* which thread fired the sink */
+  int status;
+  bool has_body;
+  std::string body;
+  bool has_error;
+  std::string error;
+} sink_record_t;
+
+static void sink_record(void* ctx, int status, char* body, size_t body_len,
+                        char* error) {
+  sink_record_t* r = (sink_record_t*)ctx;
+  std::unique_lock<std::mutex> lk(r->m);
+  r->calls++;
+  r->thread_id = std::this_thread::get_id();
+  r->status = status;
+  r->has_body = (body != NULL);
+  if (body != NULL) r->body.assign(body, body_len);
+  r->has_error = (error != NULL);
+  if (error != NULL) r->error = error;
+  lk.unlock();
+  r->cv.notify_all();
+  /* The sink OWNS the heap body/error (model.h's contract): record, then
+     free — a recorded-then-freed delivery never leaks. */
+  free(body);
+  free(error);
+}
+
+/* Bounded (3000 ms per the plan) wait for the n'th delivery. */
+static bool sink_wait_calls(sink_record_t* r, int n) {
+  std::unique_lock<std::mutex> lk(r->m);
+  return r->cv.wait_for(lk, std::chrono::milliseconds(3000), [&] {
+           return r->calls >= n;
+         });
 }
 
 TEST(TestModelDecode, TestToolCallStringArguments) {
@@ -477,4 +527,136 @@ TEST(TestModelDecode, TestConfigTimeoutReachesTransport) {
   json_value_destroy(msgs);
   server.join();
   close(listen_fd);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Submit-path tests (plan Task 4): REAL async submit over the loop thread */
+/* ---------------------------------------------------------------------- */
+
+/* The canned body carries BOTH content and a tool call — the same shape the
+   standing complete() tests pin (content decoded verbatim, the first tool
+   call's `code` argument decoded from its JSON-string form). */
+static const char* CONTENT_AND_TOOL_BODY =
+    "{\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\","
+    "\"message\":{\"role\":\"assistant\",\"content\":\"thinking about it\","
+    "\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"execute\","
+    "\"arguments\":\"{\\\"code\\\":\\\"print(6*7)\\\"}\"}}]}}]}";
+
+TEST(TestModelDecode, TestSubmitRoundTripMatchesComplete) {
+  uint16_t port = 0;
+  int listen_fd = fake_server_listen(&port);
+  ASSERT_GE(listen_fd, 0);
+  std::string seen_body;
+  std::atomic<uint8_t> seen;
+  seen.store(0);
+  std::thread server(fake_server_run_canned, listen_fd, 200,
+                     CONTENT_AND_TOOL_BODY, &seen_body, &seen);
+
+  std::string base_url = "http://127.0.0.1:" + std::to_string(port);
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", 4};
+  model_backend_t* mb = model_http_backend_create(&cfg);
+  ASSERT_NE(mb, nullptr);
+  ASSERT_NE(mb->submit, nullptr);   /* the http backend is NOT sync-only */
+
+  json_value_t* msgs = make_messages();
+  sink_record_t rec = {};   /* zero-init: C++ members value-init */
+  int rc = mb->submit(mb, msgs, NULL, sink_record, &rec);
+  EXPECT_EQ(rc, 0);
+  ASSERT_TRUE(sink_wait_calls(&rec, 1));
+
+  /* Exactly ONE delivery, on the loop thread (NOT the submitting test
+     thread); sink_record consumed the heap body/error. */
+  {
+    std::unique_lock<std::mutex> lk(rec.m);
+    EXPECT_EQ(rec.calls, 1);
+    EXPECT_EQ(rec.status, 200);
+    EXPECT_TRUE(rec.has_body);
+    EXPECT_STREQ(CONTENT_AND_TOOL_BODY, rec.body.c_str());
+    EXPECT_FALSE(rec.has_error);
+    EXPECT_NE(rec.thread_id, std::this_thread::get_id())
+        << "the sink fires on the loop thread, never the submitter";
+  }
+  /* A second delivery must not follow the first (at-most-one). */
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  {
+    std::unique_lock<std::mutex> lk(rec.m);
+    EXPECT_EQ(rec.calls, 1);
+  }
+
+  /* The SAME completion surface complete() yields on the same canned body —
+     through the shared decode helper (model_internal.h): content + tool
+     code + finish reason, matching the standing complete() pins. */
+  model_reply_t* reply = NULL;
+  char* err = NULL;
+  int drc = _model_result_from_http(rec.status, rec.body.c_str(),
+                                    rec.body.size(), NULL, &reply, &err);
+  EXPECT_EQ(drc, 0) << (err ? err : "(no error string)");
+  ASSERT_NE(reply, nullptr);
+  EXPECT_STREQ(reply->content, "thinking about it");
+  ASSERT_NE(reply->tool_code, nullptr);
+  EXPECT_STREQ(reply->tool_code, "print(6*7)");
+  EXPECT_STREQ(reply->finish_reason, "tool_calls");
+
+  free(err);
+  model_reply_destroy(reply);
+  /* The deferred client teardown is a QUEUED loop op (its 100 ms tick
+     ceiling); giving it the tick keeps this fixture from ever stranding it
+     at the backend destroy's loop unmount. */
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  model_backend_destroy(mb);
+  json_value_destroy(msgs);
+  server.join();
+  close(listen_fd);
+}
+
+TEST(TestModelDecode, TestSubmitTransportFailureReachesTheSink) {
+  /* Port 1: refusals return instantly (no server listening) — the http
+     client fires a transport-error completion (status -1, reason, NULL
+     body), the model submit has ALREADY returned 0, and the sink carries
+     the failure to the caller. */
+  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", 4};
+  model_backend_t* mb = model_http_backend_create(&cfg);
+  ASSERT_NE(mb, nullptr);
+
+  json_value_t* msgs = make_messages();
+  sink_record_t rec = {};
+  int rc = mb->submit(mb, msgs, NULL, sink_record, &rec);
+  EXPECT_EQ(rc, 0);   /* accepted: the failure arrives AT the sink */
+  ASSERT_TRUE(sink_wait_calls(&rec, 1));
+
+  {
+    std::unique_lock<std::mutex> lk(rec.m);
+    EXPECT_EQ(rec.calls, 1);
+    EXPECT_NE(rec.thread_id, std::this_thread::get_id());
+    EXPECT_EQ(rec.status, -1);
+    EXPECT_FALSE(rec.has_body);
+    EXPECT_TRUE(rec.has_error);
+    EXPECT_NE(rec.error.find("http client: connect"), std::string::npos)
+        << "err: " << rec.error;
+  }
+
+  /* Same settle as the round-trip test: the deferred teardown op's tick. */
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  model_backend_destroy(mb);
+  json_value_destroy(msgs);
+}
+
+TEST(TestModelDecode, TestSubmitRejectedNeverCallsSink) {
+  /* NULL messages (http body unbuildable) → rejected BEFORE any I/O:
+     rc != 0 and the sink NEVER fires — the http client's rejected-submit
+     contract, inherited verbatim by the model backend. */
+  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", 4};
+  model_backend_t* mb = model_http_backend_create(&cfg);
+  ASSERT_NE(mb, nullptr);
+
+  sink_record_t rec = {};
+  int rc = mb->submit(mb, NULL, NULL, sink_record, &rec);
+  EXPECT_NE(rc, 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  {
+    std::unique_lock<std::mutex> lk(rec.m);
+    EXPECT_EQ(rec.calls, 0);
+  }
+
+  model_backend_destroy(mb);
 }

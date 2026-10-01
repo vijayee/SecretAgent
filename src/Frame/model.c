@@ -40,6 +40,15 @@
 //     is a dedicated runtime/turn thread, the wait is BOUNDED (the client's
 //     request timer plus dispatch slack), and nothing on the reactor loop
 //     ever waits on a caller (the completion callback is µs-scale).
+//   - submit() (model.h's async contract, orchestration slice) is the
+//     ENGINE's path and the worker-non-blocking guarantee: the request is
+//     built on the calling thread, submitted to the http client, and the
+//     call RETURNS — the model's wall time happens on the reactor thread,
+//     and the completion forwards the raw status/body/error to the caller's
+//     sink ON the loop thread (deferring its own client teardown; the sink
+//     posts FRM_MODEL_RESULT, and the frame decodes via
+//     _model_result_from_http — model_internal.h's shared helper, the ONE
+//     error surface behind complete()'s decode too).
 //
 // Body is compiled only in the WaveDB build: frame_config_t lives inside
 // frame.h's SA_HAS_WDB guard (same gate as frame.c's store body).
@@ -80,20 +89,12 @@
    loud request-build error, not silent truncation). */
 #define SA_MODEL_URL_MAX 1024
 
-/* The http backend rides BOTH gates: the completion boundary is the WaveDB
-   gate's shape (frame_config_t), but its transport is the streams client —
-   so the machinery below is wrapped in SA_HAS_STREAMS too. Under a
-   WDB-no-streams build only the three always-linked functions below remain
-   (the frame refuses its default-backend build there in the same shape). */
-#if defined(SA_HAS_STREAMS)
-
-static const char* EXECUTE_TOOL_DESCRIPTION =
-  "Execute one Python cell in the frame's interpreter. Give the COMPLETE cell "
-  "body as `code`; state and child frames go through the actor verbs "
-  "(remember/recall/spawn/report). One tool call per turn.";
-
 /* ------------------------------------------------------------------ */
-/* Small helpers                                                      */
+/* The shared reply decode (model_internal.h's one helper)            */
+/*                                                                    */
+/* WDB-gated ONLY — it touches no transport type, and the engine's    */
+/* FRM_MODEL_RESULT behavior (loop.c) consumes it on the frame's own  */
+/* thread in every build the frame compiles in, streams or not.       */
 /* ------------------------------------------------------------------ */
 
 /* Heap copy via get_memory (aborts on OOM; callers free with free()). */
@@ -131,6 +132,194 @@ static char* _model_excerpt(const char* body, size_t body_len) {
   out[used] = '\0';
   return out;
 }
+
+/* body -> model_reply_t (defined below; the shared helper is its
+   first internal caller). */
+static int _model_decode_body(const char* body, size_t body_len,
+                              model_reply_t** reply_out, char** error_out);
+
+int _model_result_from_http(int status, const char* body, size_t body_len,
+                            const char* transport_error,
+                            model_reply_t** reply_out, char** error_out) {
+  *reply_out = NULL;
+  *error_out = NULL;
+  /* Non-2xx (status -1, the transport-failure shape, included) is an error
+     with the standing surface: the body excerpt first, the transport's own
+     reason when there is no body, "(no body)" when neither says anything. */
+  if (status < 200 || status >= 300) {
+    char* excerpt = _model_excerpt(body, body_len);
+    const char* detail =
+      (excerpt != NULL && excerpt[0] != '\0') ? excerpt
+      : (transport_error != NULL && transport_error[0] != '\0') ? transport_error
+      : "(no body)";
+    *error_out = _model_error("model client: HTTP %d: %s", status, detail);
+    free(excerpt);
+    return -1;
+  }
+  return _model_decode_body(body, body_len, reply_out, error_out);
+}
+
+/* Extract `code` from tool_calls[0].function.arguments in either shape
+   (string containing the object, or the object directly). */
+static int _model_decode_arguments(const json_value_t* arguments,
+                                   char** code_out, char** error_out) {
+  *code_out = NULL;
+
+  json_value_t* args_object = (json_value_t*)arguments;   /* borrowed default */
+  json_value_t* parsed = NULL;                            /* owned in string form */
+  if (json_type(arguments) == JSON_STRING) {
+    /* String form: the string's CONTENT is the JSON document. */
+    const char* args_text = json_as_string(arguments);
+    char* parse_err = NULL;
+    parsed = json_parse(args_text, strlen(args_text), &parse_err);
+    if (parsed == NULL) {
+      *error_out = _model_error("model client: decode: tool call arguments "
+                                "are not valid JSON: %s",
+                                parse_err ? parse_err : "parse failed");
+      free(parse_err);
+      return -1;
+    }
+    args_object = parsed;
+  } else if (json_type(arguments) != JSON_OBJECT) {
+    *error_out = _model_error("model client: decode: tool call arguments are "
+                              "neither a JSON string nor an object");
+    return -1;
+  }
+
+  json_value_t* code = json_get(args_object, "code");
+  if (json_type(code) != JSON_STRING) {
+    json_value_destroy(parsed);
+    *error_out = _model_error("model client: decode: tool call has no string "
+                              "`code` argument");
+    return -1;
+  }
+  *code_out = _model_heap_str(json_as_string(code));
+  json_value_destroy(parsed);   /* NULL when the borrowed object form was used */
+  return 0;
+}
+
+/* body -> model_reply_t. body may be NULL when body_len == 0 (the http layer
+   NUL-terminates the buffer at +1 either way). */
+static int _model_decode_body(const char* body, size_t body_len,
+                              model_reply_t** reply_out, char** error_out) {
+  *reply_out = NULL;
+  *error_out = NULL;
+  if (body == NULL || body_len == 0) {
+    *error_out = _model_error("model client: decode: response body is empty");
+    return -1;
+  }
+  char* parse_err = NULL;
+  json_value_t* root = json_parse(body, body_len, &parse_err);
+  if (root == NULL) {
+    *error_out = _model_error("model client: decode: %s",
+                              parse_err ? parse_err : "malformed response");
+    free(parse_err);
+    return -1;
+  }
+  free(parse_err);
+
+  if (json_type(root) != JSON_OBJECT) {
+    *error_out = _model_error("model client: decode: choices missing (root is "
+                              "not an object)");
+    json_value_destroy(root);
+    return -1;
+  }
+  json_value_t* choices = json_get(root, "choices");
+  if (json_type(choices) != JSON_ARRAY || json_size(choices) == 0) {
+    *error_out = _model_error("model client: decode: choices missing");
+    json_value_destroy(root);
+    return -1;
+  }
+  json_value_t* choice = json_at(choices, 0);
+  if (json_type(choice) != JSON_OBJECT) {
+    *error_out = _model_error("model client: decode: first choice is not an object");
+    json_value_destroy(root);
+    return -1;
+  }
+  json_value_t* message = json_get(choice, "message");
+  if (json_type(message) != JSON_OBJECT) {
+    *error_out = _model_error("model client: decode: message missing in first choice");
+    json_value_destroy(root);
+    return -1;
+  }
+
+  model_reply_t* reply = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
+  reply->content = NULL;
+  reply->tool_code = NULL;
+  reply->finish_reason = NULL;
+
+  /* content: absent or null -> "" (assistant text may come only as a tool
+     call); any other non-string type is a decode error. */
+  json_value_t* content = json_get(message, "content");
+  if (content == NULL || json_type(content) == JSON_NULL) {
+    reply->content = (char*)get_memory(2);
+    reply->content[0] = '\0';
+  } else if (json_type(content) == JSON_STRING) {
+    reply->content = _model_heap_str(json_as_string(content));
+  } else {
+    *error_out = _model_error("model client: decode: message.content is neither "
+                              "absent nor a string");
+    json_value_destroy(root);
+    model_reply_destroy(reply);
+    return -1;
+  }
+
+  /* Reasoning models (Ollama gemma4-class) legitimately answer with an
+     empty `content` and their text in a `reasoning` string field. When
+     content is EMPTY (whether absent, null, or literally ""), the reasoning
+     IS the assistant's turn text — surfacing it keeps the transcript and
+     the audit trail from vanishing into a silent empty completion. A
+     non-empty content always wins; both are kept verbatim then. */
+  if (reply->content[0] == '\0') {
+    json_value_t* reasoning = json_get(message, "reasoning");
+    if (reasoning != NULL && json_type(reasoning) == JSON_STRING &&
+        json_as_string(reasoning)[0] != '\0') {
+      char* r = _model_heap_str(json_as_string(reasoning));
+      if (r != NULL) {
+        free(reply->content);
+        reply->content = r;
+      }
+    }
+  }
+
+  /* tool_calls: only the FIRST call is consumed — the single-tool surface
+     means one cell per turn. */
+  json_value_t* tool_calls = json_get(message, "tool_calls");
+  if (tool_calls != NULL && json_type(tool_calls) == JSON_ARRAY &&
+      json_size(tool_calls) > 0) {
+    json_value_t* tool_call = json_at(tool_calls, 0);
+    json_value_t* function = json_get(tool_call, "function");
+    json_value_t* arguments = json_get(function, "arguments");
+    if (_model_decode_arguments(arguments, &reply->tool_code, error_out) != 0) {
+      json_value_destroy(root);
+      model_reply_destroy(reply);
+      return -1;
+    }
+  }
+
+  json_value_t* finish_reason = json_get(choice, "finish_reason");
+  if (json_type(finish_reason) == JSON_STRING) {
+    reply->finish_reason = _model_heap_str(json_as_string(finish_reason));
+  } else {
+    reply->finish_reason = NULL;
+  }
+
+  json_value_destroy(root);
+  *reply_out = reply;
+  return 0;
+}
+
+/* The http backend rides BOTH gates: the completion boundary is the WaveDB
+   gate's shape (frame_config_t), but its transport is the streams client —
+   so the machinery below is wrapped in SA_HAS_STREAMS too. Under a
+   WDB-no-streams build only the three always-linked functions below remain
+   (the frame refuses its default-backend build there in the same shape). */
+#if defined(SA_HAS_STREAMS)
+
+static const char* EXECUTE_TOOL_DESCRIPTION =
+  "Execute one Python cell in the frame's interpreter. Give the COMPLETE cell "
+  "body as `code`; state and child frames go through the actor verbs "
+  "(remember/recall/spawn/report). One tool call per turn.";
 
 /* Owned deep copy of a BORROWED json value, via serialize -> re-parse (the
    codec round-trips every shape it emits). JSON_NULL/NULL yields NULL. */
@@ -372,159 +561,6 @@ static int _model_join_url(const char* base_url, char* out, size_t out_size) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Reply decode                                                       */
-/* ------------------------------------------------------------------ */
-
-/* Extract `code` from tool_calls[0].function.arguments in either shape
-   (string containing the object, or the object directly). */
-static int _model_decode_arguments(const json_value_t* arguments,
-                                   char** code_out, char** error_out) {
-  *code_out = NULL;
-
-  json_value_t* args_object = (json_value_t*)arguments;   /* borrowed default */
-  json_value_t* parsed = NULL;                            /* owned in string form */
-  if (json_type(arguments) == JSON_STRING) {
-    /* String form: the string's CONTENT is the JSON document. */
-    const char* args_text = json_as_string(arguments);
-    char* parse_err = NULL;
-    parsed = json_parse(args_text, strlen(args_text), &parse_err);
-    if (parsed == NULL) {
-      *error_out = _model_error("model client: decode: tool call arguments "
-                                "are not valid JSON: %s",
-                                parse_err ? parse_err : "parse failed");
-      free(parse_err);
-      return -1;
-    }
-    args_object = parsed;
-  } else if (json_type(arguments) != JSON_OBJECT) {
-    *error_out = _model_error("model client: decode: tool call arguments are "
-                              "neither a JSON string nor an object");
-    return -1;
-  }
-
-  json_value_t* code = json_get(args_object, "code");
-  if (json_type(code) != JSON_STRING) {
-    json_value_destroy(parsed);
-    *error_out = _model_error("model client: decode: tool call has no string "
-                              "`code` argument");
-    return -1;
-  }
-  *code_out = _model_heap_str(json_as_string(code));
-  json_value_destroy(parsed);   /* NULL when the borrowed object form was used */
-  return 0;
-}
-
-/* body -> model_reply_t. body may be NULL when body_len == 0 (the http layer
-   NUL-terminates the buffer at +1 either way). */
-static int _model_decode_body(const char* body, size_t body_len,
-                              model_reply_t** reply_out, char** error_out) {
-  *reply_out = NULL;
-  *error_out = NULL;
-  if (body == NULL || body_len == 0) {
-    *error_out = _model_error("model client: decode: response body is empty");
-    return -1;
-  }
-  char* parse_err = NULL;
-  json_value_t* root = json_parse(body, body_len, &parse_err);
-  if (root == NULL) {
-    *error_out = _model_error("model client: decode: %s",
-                              parse_err ? parse_err : "malformed response");
-    free(parse_err);
-    return -1;
-  }
-  free(parse_err);
-
-  if (json_type(root) != JSON_OBJECT) {
-    *error_out = _model_error("model client: decode: choices missing (root is "
-                              "not an object)");
-    json_value_destroy(root);
-    return -1;
-  }
-  json_value_t* choices = json_get(root, "choices");
-  if (json_type(choices) != JSON_ARRAY || json_size(choices) == 0) {
-    *error_out = _model_error("model client: decode: choices missing");
-    json_value_destroy(root);
-    return -1;
-  }
-  json_value_t* choice = json_at(choices, 0);
-  if (json_type(choice) != JSON_OBJECT) {
-    *error_out = _model_error("model client: decode: first choice is not an object");
-    json_value_destroy(root);
-    return -1;
-  }
-  json_value_t* message = json_get(choice, "message");
-  if (json_type(message) != JSON_OBJECT) {
-    *error_out = _model_error("model client: decode: message missing in first choice");
-    json_value_destroy(root);
-    return -1;
-  }
-
-  model_reply_t* reply = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
-  reply->content = NULL;
-  reply->tool_code = NULL;
-  reply->finish_reason = NULL;
-
-  /* content: absent or null -> "" (assistant text may come only as a tool
-     call); any other non-string type is a decode error. */
-  json_value_t* content = json_get(message, "content");
-  if (content == NULL || json_type(content) == JSON_NULL) {
-    reply->content = (char*)get_memory(2);
-    reply->content[0] = '\0';
-  } else if (json_type(content) == JSON_STRING) {
-    reply->content = _model_heap_str(json_as_string(content));
-  } else {
-    *error_out = _model_error("model client: decode: message.content is neither "
-                              "absent nor a string");
-    json_value_destroy(root);
-    model_reply_destroy(reply);
-    return -1;
-  }
-
-  /* Reasoning models (Ollama gemma4-class) legitimately answer with an
-     empty `content` and their text in a `reasoning` string field. When
-     content is EMPTY (whether absent, null, or literally ""), the reasoning
-     IS the assistant's turn text — surfacing it keeps the transcript and
-     the audit trail from vanishing into a silent empty completion. A
-     non-empty content always wins; both are kept verbatim then. */
-  if (reply->content[0] == '\0') {
-    json_value_t* reasoning = json_get(message, "reasoning");
-    if (reasoning != NULL && json_type(reasoning) == JSON_STRING &&
-        json_as_string(reasoning)[0] != '\0') {
-      char* r = _model_heap_str(json_as_string(reasoning));
-      if (r != NULL) {
-        free(reply->content);
-        reply->content = r;
-      }
-    }
-  }
-
-  /* tool_calls: only the FIRST call is consumed — the single-tool surface
-     means one cell per turn. */
-  json_value_t* tool_calls = json_get(message, "tool_calls");
-  if (tool_calls != NULL && json_type(tool_calls) == JSON_ARRAY &&
-      json_size(tool_calls) > 0) {
-    json_value_t* tool_call = json_at(tool_calls, 0);
-    json_value_t* function = json_get(tool_call, "function");
-    json_value_t* arguments = json_get(function, "arguments");
-    if (_model_decode_arguments(arguments, &reply->tool_code, error_out) != 0) {
-      json_value_destroy(root);
-      model_reply_destroy(reply);
-      return -1;
-    }
-  }
-
-  json_value_t* finish_reason = json_get(choice, "finish_reason");
-  if (json_type(finish_reason) == JSON_STRING) {
-    reply->finish_reason = _model_heap_str(json_as_string(finish_reason));
-  } else {
-    reply->finish_reason = NULL;
-  }
-
-  json_value_destroy(root);
-  *reply_out = reply;
-  return 0;
-}
-
 /* ------------------------------------------------------------------ */
 /* Backend                                                            */
 /* ------------------------------------------------------------------ */
@@ -661,38 +697,130 @@ static int _model_http_complete(void* self, json_value_t* messages,
     }
     return -1;
   }
-  if (status < 200 || status >= 300) {
-    if (error_out != NULL) {
-      char* excerpt = _model_excerpt(body, body_len);
-      /* Transport failures (status -1) carry the http layer's reason in
-         error and no body — surface it so a live misdiagnosis never reads
-         as an empty reply. */
-      const char* detail =
-        (excerpt != NULL && excerpt[0] != '\0') ? excerpt
-        : (error != NULL && error[0] != '\0') ? error
-        : "(no body)";
-      *error_out = _model_error("model client: HTTP %d: %s", status, detail);
-      free(excerpt);
-    }
-    free(body);
-    free(error);
-    return -1;
-  }
-
+  /* The SHARED completion surface (model_internal.h's `_model_result_from_http`):
+     non-2xx → the standing HTTP %d error; 2xx → the decoded reply. One error
+     surface, two delivery modes — the engine's FRM_MODEL_RESULT decodes with
+     the very same helper. */
   model_reply_t* decoded = NULL;
-  char* decode_err = NULL;
-  if (_model_decode_body(body, body_len, &decoded, &decode_err) != 0) {
-    if (error_out != NULL) *error_out = decode_err; else free(decode_err);
-    free(body);
-    return -1;
-  }
-  /* The stolen body (heap, NUL-terminated by the client) moves out raw. */
-  if (raw_out != NULL) {
+  char* result_err = NULL;
+  int drc = _model_result_from_http(status, body, body_len, error,
+                                    &decoded, &result_err);
+  /* The stolen body (heap, NUL-terminated by the client) moves out raw —
+     complete()'s documented 4th out-param. */
+  if (raw_out != NULL && drc == 0) {
     *raw_out = body;
     body = NULL;
   }
   free(body);
+  free(error);
+  if (drc != 0) {
+    if (error_out != NULL) *error_out = result_err; else free(result_err);
+    return -1;
+  }
   *reply = decoded;
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* The async submit (model.h's model_response_sink_fn contract)       */
+/* ------------------------------------------------------------------ */
+
+/* The submit-side relay record: the http completion's ctx — the engine's
+   sink pair moved across the loop-thread boundary. Heap; freed by the
+   completion that fires it. */
+typedef struct _model_submit_relay_t {
+  model_response_sink_fn fn;         /* the sink (never NULL when carried) */
+  void* ctx;                         /* the sink's ctx */
+  http_client_t* client;             /* OWNED; torn down AFTER forwarding */
+} _model_submit_relay_t;
+
+/* The http completion → the model sink, ownership straight through: body
+   and error move into the sink's hands untouched (model.h's contract), the
+   relay dies, and the client teardown defers (a client cannot be destroyed
+   from inside its own completion — destroy joins the loop; the deferred
+   variant returns and lets the queued op finish the record). Runs ON the
+   loop thread, µs-scale (one indirect call + one enqueue). */
+static void _model_submit_on(void* ctx, int status, char* body,
+                             size_t body_len, char* error) {
+  _model_submit_relay_t* relay = (_model_submit_relay_t*)ctx;
+  if (relay->fn != NULL) {
+    relay->fn(relay->ctx, status, body, body_len, error);
+  } else {
+    /* Defensive only (every submit path carries a sink): the heap still
+       dies instead of leaking — a dropped delivery must not leak either. */
+    log_error("model client: a submit completion arrived with no sink");
+    free(body);
+    free(error);
+  }
+  http_client_t* client = relay->client;
+  free(relay);
+  http_client_defer_destroy(client);
+}
+
+static int _model_http_submit(void* self, json_value_t* messages,
+                              json_value_t* tools,
+                              model_response_sink_fn on_done, void* on_done_ctx) {
+  _model_http_backend_t* b = (_model_http_backend_t*)self;
+  if (on_done == NULL) return -1;   /* nowhere to deliver — rejected */
+
+  /* Build FIRST, on the calling thread (model.h's contract: messages/tools
+     are borrowed and the engine destroys its array right after submit):
+     a build failure is a rc != 0 return — the sink never fires. */
+  char url[SA_MODEL_URL_MAX];
+  if (_model_join_url(b->base_url, url, sizeof(url)) != 0) {
+    return -1;
+  }
+  char* request_text = NULL;
+  char* build_err = NULL;
+  if (_model_request_text(b, messages, tools, &request_text, &build_err) != 0) {
+    free(build_err);   /* built nothing, delivered nothing */
+    return -1;
+  }
+
+  /* The relay owns the sink pair from here — a failure AFTER this point is
+     still a DELIVERABLE failure: the sink fires SYNCHRONOUSLY on the
+     calling thread with status -1 and the submit returns 0 (accepted into
+     the failure path), so the "exactly once" invariant holds either way and
+     the caller sees the transport-shaped error rather than a bare refusal. */
+  _model_submit_relay_t* relay = get_clear_memory(sizeof(_model_submit_relay_t));
+  if (relay == NULL) {
+    free(request_text);
+    on_done(on_done_ctx, -1, NULL, 0,
+            _model_error("model client: transport: relay allocation failed"));
+    return 0;
+  }
+
+  /* One client per POST as today; its destruction is DEFERRED to the
+     completion (a client cannot be destroyed from inside its own
+     completion — the destroy joins the loop's teardown ops). */
+  http_client_t* client = http_client_create(b->loop);
+  if (client == NULL) {
+    free(request_text);
+    on_done(on_done_ctx, -1, NULL, 0,
+            _model_error("model client: transport: http client "
+                         "allocation failed"));
+    free(relay);
+    return 0;
+  }
+
+  relay->fn = on_done;
+  relay->ctx = on_done_ctx;
+  relay->client = client;
+  int rc = http_client_submit(client, url, b->api_key, request_text,
+                              b->timeout_ms, _model_submit_on, relay);
+  free(request_text);
+  if (rc != 0) {
+    /* Rejected before any I/O: this completion NEVER fires (the http
+       client's contract) — the sink will never fire for this call, so the
+       submit reports the refusal and owns everything back. The destroy is
+       documented safe from the submit thread on a reject path. */
+    http_client_destroy(client);
+    free(relay);
+    return -1;
+  }
+  /* Accepted: the completion fires exactly once on the loop thread — the
+     relay/client die there; the SUBMITTING thread returns immediately and
+     never waits on the model call. */
   return 0;
 }
 
@@ -713,6 +841,7 @@ model_backend_t* model_http_backend_create(const frame_config_t* cfg) {
   _model_http_backend_t* b =
     (_model_http_backend_t*)get_clear_memory(sizeof(_model_http_backend_t));
   b->base.complete = _model_http_complete;
+  b->base.submit = _model_http_submit;
   b->base_url = _model_heap_str(cfg->model_base_url);
   b->model_name = _model_heap_str(cfg->model_name);
   b->timeout_ms = model_timeout_ms_resolve(cfg->model_timeout_ms);

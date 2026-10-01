@@ -97,6 +97,7 @@
 #include "frame_internal.h"
 #include "frame_messages.h"
 #include "model.h"
+#include "model_internal.h"
 #include "../Actor/actor.h"
 #include "../Platform/platform_time.h"
 #include "../Util/allocator.h"
@@ -567,203 +568,6 @@ static void _loop_model_sink(void* ctx, int status, char* body,
   }
   _frame_post(mailbox, (uint32_t)FRM_MODEL_RESULT, p,
               frm_model_payload_destroy, "model result");
-}
-
-/* The FRM_MODEL_RESULT arrival's raw-body decode: the SAME completion
-   surface model.c's complete() returns (message.content with the reasoning
-   fallback; the first tool call's `code` argument, argument-object or
-   JSON-string; finish_reason) with model.c's exact error text shape
-   ("model client: HTTP %d: <excerpt | transport reason | (no body)>") —
-   0 ok (*reply_out owns the reply); nonzero (*error_out owns the reason).
-   Task 4's shared _model_result_from_http (model_internal.h) replaces this
-   local decode one-for-one (one error surface, two delivery modes). */
-static char* _loop_decode_http_error(int status, const char* body,
-                                     size_t body_len,
-                                     const char* transport_error) {
-  char excerpt[201];
-  excerpt[0] = '\0';
-  if (body != NULL && body_len > 0) {
-    size_t n = (body_len < sizeof(excerpt) - 1) ? body_len
-                                                : sizeof(excerpt) - 1;
-    memcpy(excerpt, body, n);
-    excerpt[n] = '\0';
-    /* cut at the first newline so the log line stays one line */
-    size_t cut = strcspn(excerpt, "\r\n");
-    excerpt[cut] = '\0';
-  }
-  const char* detail =
-      (excerpt[0] != '\0') ? excerpt
-      : (transport_error != NULL && transport_error[0] != '\0') ? transport_error
-      : "(no body)";
-  size_t need = (size_t)snprintf(NULL, 0, "model client: HTTP %d: %s", status,
-                                 detail) + 1;
-  char* out = get_memory(need);
-  snprintf(out, need, "model client: HTTP %d: %s", status, detail);
-  return out;
-}
-
-static int _loop_decode_arguments(const json_value_t* arguments,
-                                  char** code_out, char** error_out) {
-  if (arguments == NULL) {
-    *error_out = _loop_trunc("model client: decode: tool call has no arguments",
-                             200);
-    return -1;
-  }
-  json_value_t* args_obj = (json_value_t*)arguments;   /* borrowed or parsed */
-  json_value_t* parsed_args = NULL;
-  if (json_type(arguments) == JSON_STRING) {
-    /* Lenient servers carry the argument object as a JSON string. */
-    char* aerr = NULL;
-    const char* args_text = json_as_string(arguments);
-    parsed_args = json_parse(args_text, strlen(args_text), &aerr);
-    if (aerr != NULL) free(aerr);
-    if (parsed_args == NULL) {
-      *error_out =
-          _loop_trunc("model client: decode: tool call arguments is not a "
-                      "JSON string carrying an object", 200);
-      return -1;
-    }
-    args_obj = parsed_args;
-  }
-  if (json_type(args_obj) != JSON_OBJECT) {
-    if (parsed_args != NULL) json_value_destroy(parsed_args);
-    *error_out = _loop_trunc("model client: decode: tool call arguments are "
-                             "neither string nor object", 200);
-    return -1;
-  }
-  json_value_t* code = json_get(args_obj, "code");
-  if (code == NULL || json_type(code) != JSON_STRING) {
-    if (parsed_args != NULL) json_value_destroy(parsed_args);
-    *error_out = _loop_trunc("model client: decode: tool call has no string "
-                             "`code` argument", 200);
-    return -1;
-  }
-  *code_out = strdup(json_as_string(code));
-  if (parsed_args != NULL) json_value_destroy(parsed_args);
-  if (*code_out == NULL) {
-    *error_out = _loop_trunc("model client: decode: out of memory copying the "
-                             "cell code", 200);
-    return -1;
-  }
-  return 0;
-}
-
-static int _loop_decode_body(const char* body, size_t body_len,
-                             model_reply_t** reply_out, char** error_out) {
-  *reply_out = NULL;
-  *error_out = NULL;
-  if (body == NULL || body_len == 0) {
-    *error_out = _loop_trunc("model client: decode: response body is empty", 200);
-    return -1;
-  }
-  char* perr = NULL;
-  json_value_t* root = json_parse(body, body_len, &perr);
-  if (root == NULL) {
-    char detail[100];
-    snprintf(detail, sizeof(detail), "model client: decode: %s",
-             (perr != NULL) ? perr : "response body is not valid JSON");
-    if (perr != NULL) free(perr);
-    *error_out = _loop_trunc(detail, 200);
-    return -1;
-  }
-  json_value_t* choices = json_get(root, "choices");
-  if (choices == NULL || json_type(choices) != JSON_ARRAY || json_size(choices) < 1) {
-    json_value_destroy(root);
-    *error_out = _loop_trunc("model client: decode: choices missing", 200);
-    return -1;
-  }
-  json_value_t* choice = json_at(choices, 0);
-  if (choice == NULL || json_type(choice) != JSON_OBJECT) {
-    json_value_destroy(root);
-    *error_out = _loop_trunc("model client: decode: first choice is not an "
-                             "object", 200);
-    return -1;
-  }
-  json_value_t* message = json_get(choice, "message");
-  if (message == NULL) {
-    json_value_destroy(root);
-    *error_out = _loop_trunc("model client: decode: message missing in first "
-                             "choice", 200);
-    return -1;
-  }
-
-  model_reply_t* reply = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
-  json_value_t* content = json_get(message, "content");
-  if (content != NULL && json_type(content) != JSON_NULL &&
-      json_type(content) != JSON_STRING) {
-    json_value_destroy(root);
-    model_reply_destroy(reply);
-    *error_out = _loop_trunc("model client: decode: message.content is neither "
-                             "absent nor a string", 200);
-    return -1;
-  }
-  if (content != NULL && json_type(content) == JSON_STRING) {
-    reply->content = strdup(json_as_string(content));
-  } else {
-    reply->content = strdup("");
-  }
-  if (reply->content == NULL) {
-    json_value_destroy(root);
-    model_reply_destroy(reply);
-    *error_out = _loop_trunc("model client: decode: out of memory copying the "
-                             "content", 200);
-    return -1;
-  }
-
-  /* Reasoning models legitimately answer with an empty `content` and their
-     text in a `reasoning` string field (model.c's rule, kept verbatim): a
-     non-empty content always wins; both are kept verbatim then. */
-  if (reply->content[0] == '\0') {
-    json_value_t* reasoning = json_get(message, "reasoning");
-    if (reasoning != NULL && json_type(reasoning) == JSON_STRING &&
-        json_as_string(reasoning)[0] != '\0') {
-      char* r = strdup(json_as_string(reasoning));
-      if (r != NULL) {
-        free(reply->content);
-        reply->content = r;
-      }
-    }
-  }
-
-  /* tool_calls: only the FIRST call is consumed — the single-tool surface
-     means one cell per turn. */
-  json_value_t* tool_calls = json_get(message, "tool_calls");
-  if (tool_calls != NULL && json_type(tool_calls) == JSON_ARRAY &&
-      json_size(tool_calls) > 0) {
-    json_value_t* tool_call = json_at(tool_calls, 0);
-    json_value_t* function = (tool_call != NULL) ? json_get(tool_call, "function")
-                                                 : NULL;
-    json_value_t* arguments = (function != NULL) ? json_get(function, "arguments")
-                                                 : NULL;
-    if (_loop_decode_arguments(arguments, &reply->tool_code, error_out) != 0) {
-      json_value_destroy(root);
-      model_reply_destroy(reply);
-      return -1;
-    }
-  }
-
-  json_value_t* finish_reason = json_get(choice, "finish_reason");
-  if (finish_reason != NULL && json_type(finish_reason) == JSON_STRING) {
-    reply->finish_reason = strdup(json_as_string(finish_reason));
-  }
-
-  json_value_destroy(root);
-  *reply_out = reply;
-  return 0;
-}
-
-static int _loop_decode_completion(int status, const char* body, size_t body_len,
-                                   const char* transport_error,
-                                   model_reply_t** reply_out, char** error_out) {
-  if (status < 200 || status >= 300) {
-    *error_out = _loop_decode_http_error(status, body, body_len, transport_error);
-    return -1;
-  }
-  if (transport_error != NULL && transport_error[0] != '\0') {
-    *error_out = _loop_trunc(transport_error, 200);
-    return -1;
-  }
-  return _loop_decode_body(body, body_len, reply_out, error_out);
 }
 
 /* The derive's store round trip (the turn step's yield): compose the events
@@ -1241,7 +1045,7 @@ void _frame_engine_model_arrived(frame_t* f, frm_model_payload_t* payload) {
   e->phase = FRAME_PHASE_NONE;
   model_reply_t* reply = NULL;
   char* err = NULL;
-  int rc = _loop_decode_completion(payload->status, payload->body,
+  int rc = _model_result_from_http(payload->status, payload->body,
                                    payload->body_len, payload->error,
                                    &reply, &err);
   frm_model_payload_destroy(payload);   /* the raw body/error die here */
