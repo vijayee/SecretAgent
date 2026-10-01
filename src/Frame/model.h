@@ -19,10 +19,23 @@ typedef struct model_reply_t {
   char* finish_reason;   /* heap, or NULL */
 } model_reply_t;
 
+/* Asynchronous completion delivery (orchestration slice). After a rc==0
+   submit, the sink fires EXACTLY ONCE — on the streams loop thread or
+   synchronously within submit — and it takes OWNERSHIP of body and error
+   (heap; free() or consume). A rc != 0 return means rejected before any I/O:
+   the sink will NEVER fire for that call. submit must copy or serialize
+   everything it needs from messages/tools before it returns. NULL = the
+   backend is sync-only (scripted tests; the engine drains it inline). */
+typedef void (*model_response_sink_fn)(void* ctx, int status, char* body,
+                                       size_t body_len, char* error);
+
 /* vtable so tests inject scripted turns without network: */
 typedef struct model_backend_t {
   int (*complete)(void* self, json_value_t* messages, json_value_t* tools,
                   char**, model_reply_t** reply, char** error_out);   /* 0 ok */
+  /* NULL = sync-only backend (scripted tests; the engine drains it inline) */
+  int (*submit)(void* self, json_value_t* messages, json_value_t* tools,
+                model_response_sink_fn on_done, void* on_done_ctx);
 } model_backend_t;
 
 /* The http backend is built from the frame config, which lives inside

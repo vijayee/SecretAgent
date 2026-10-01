@@ -1,47 +1,71 @@
 //
 // Created by victor on 9/29/26.
 //
-// The turn-loop engine (Task 10) — the piece that makes the stack
-// model-driven. One frame, one loop, one thread: the threading model (the
-// loop runs on the CALLER's thread; the frame actor is inline, NULL pool, and
-// pumped by the loop itself; the frame's own pyrt worker is the only other
-// thread in the picture and talks to the loop through the frame mailbox) is
-// documented on frame_internal.h.
+// The turn engine — the piece that makes the stack model-driven. Since the
+// orchestration slice (Task 3 of the frame-orchestration plan) the engine is
+// a PHASE MACHINE carried on the frame, not a held-thread for(;;): every
+// step composes, posts the next store round trip / message, and RETURNS
+// (yields) — the step CONTINUES in the next arrival dispatch. The frame's
+// own actor IS the engine's runner: its owner (a scheduler pool worker in
+// production; the synchronous test driver's bounded pump) picks it up on
+// every arrival:
 //
-// THE TURN, in order:
-//   1. derive — the loop rebuilds the model's ENTIRE view from the frame's
+//   frame_start ──▶ FRM_TURN ─┬─▶ checks + FRM_STORE_SCAN (the derive)
+//                             │        └─▶ phase=STORE, yield
+// (the store's FRM_STORE_REPLY routes back via frame.c's reply-router
+//  step 4 into _frame_engine_store_reply):
+//   FRAME_STORE_DERIVE ─▶ parse the raw records + the projection (µs) ─▶
+//                            async backend: submit() ─▶ phase=MODEL, yield
+//                            sync backend:  complete() INLINE (test driver)
+//   FRM_MODEL_RESULT ─▶ decode (µs) ─▶ tool path / content path
+//   FRAME_STORE_CELL_RUN ─▶ FRM_CELL_EXECUTE ─▶ phase=CELL, yield
+//   PYRT_RESULT ─▶ slot completed ─▶ repost FRM_TURN ─▶ next turn
+//   FRAME_STORE_FINISH ─▶ the turn's message + completion commit ─▶
+//                            top: engine ends / child: quiet-completion
+//                            (Task 6's terminate)
+//
+// ONE TURN = at most four mailbox dispatches; every arrow above is a
+// dispatch or a repost — never a wait. NO lock exists on the engine's path.
+//
+// THE TURN'S RULES, in the old for(;;)'s exact order (the restructure kept
+// every rule byte-equivalent):
+//   1. derive — the engine rebuilds the model's ENTIRE view from the frame's
 //      stored event log on every turn (stateless; nothing accumulates in
-//      hidden loop memory): msg.append events become {role, content}
+//      hidden engine memory): msg.append events become {role, content}
 //      messages; the ctx snapshot (state.remember events replayed as
 //      newest-value-wins) and one-line child reports (frame.report events)
 //      go into the system prompt; cell results since the newest msg.append
 //      ride along as tool-result-equivalent user messages. The projection
-//      reads the store through frame_debug_events — already the bounded,
-//      root-level, ABSOLUTE-bounds reverse scan this module requires
-//      (database_subtree_scan_* is broken in both directions and never
-//      touched here). Nothing materializes to disk: the store IS the source.
-//   2. complete — one model call: the single `execute` tool (tools=NULL gets
-//      model.c's canned tool), the backend's raw_out passed NULL (it is the
-//      documented NULL-tolerant out-param; the loop does not want the raw
-//      body).
-//   3. tool path — EV_CELL_RUN event (one root batch), the code handed to
-//      the frame actor as FRM_CELL_EXECUTE (frame_dispatch, synchronous on
-//      the loop thread), then a bounded pump-and-wait for the PYRT_RESULT
-//      that completes the frame's pending-cell slot; the frame's own
-//      behavior writes the paired EV_CELL_RESULT event in the same dispatch
-//      that completes the slot. A FAILED cell does not end the loop: the
-//      next derive carries its status-1 text (traceback) back as a user
-//      message and the model self-corrects.
-//   4. content path — msg.append assistant event. TOP frames end here
-//      (status flips to done); CHILD frames keep their "running" status —
-//      REPORT SEMANTICS (the decided design): a report marks the REPORTING
-//      frame done at every depth; a child additionally binds the report
-//      event into the parent's log, a top frame has no parent log to bind
-//      into and reports into its OWN log instead. Children therefore end
-//      exclusively via the report verb (actor.report within a cell); a child
-//      whose loop ends on a no-tool-call turn is simply left "running" —
-//      dangling-join stragglers are the tree-slice's business, not the
-//      loop's.
+//      reads the store as ONE bounded reverse scan (FRAME_STORE_DERIVE —
+//      root-level, ABSOLUTE-bounds; database_subtree_scan_* is broken in
+//      both directions and never touched here). Nothing materializes to
+//      disk: the store IS the source.
+//   2. complete — one model call. async backend (submit != NULL): the
+//      derived array is handed over and destroyed; the completion arrives
+//      later as FRM_MODEL_RESULT. Sync backend (submit == NULL — every
+//      scripted test backend): complete() runs INLINE inside the derive
+//      reply's dispatch — blocking the actor, which is acceptable ONLY on
+//      the documented inline/test driver (§6), never on a pool worker in
+//      production. tools = NULL: model.c's canned single `execute` tool.
+//   3. tool path — the cell.run audit is the FRAME_STORE_CELL_RUN round
+//      trip (the audit commit BEFORE any cell executes — no untracked cell
+//      ever runs); the reply dispatches FRM_CELL_EXECUTE (the old tool path
+//      verbatim: the unclaimed-payload check, model_reply_destroy) and a
+//      pending cell yields in FRAME_PHASE_CELL. A SYNCHRONOUS refusal never
+//      set the pending slot — the ENGINE writes its PAIRED status-1
+//      cell.result right there (the audit-honesty fix: the old loop's
+//      refusal paths left the cell.run line unpaired) and the next turn
+//      re-derives from it. A FAILED cell does not end the turn: the next
+//      derive carries its status-1 text (traceback) back as a user message
+//      and the model self-corrects.
+//   4. content path — msg.append (or the empty-turn control event) and, for
+//      a TOP frame, the status->done put in ONE atomic FRAME_STORE_FINISH
+//      batch (message + completion cannot half-apply); its reply ends the
+//      engine. CHILD frames: Task 6's quiet-completion terminate — until
+//      then the child's status stays "running" (REPORT SEMANTICS: a report
+//      marks the REPORTING frame done at every depth; a child additionally
+//      binds the report event into the parent's log, a top frame has no
+//      parent log to bind into and reports into its OWN log).
 //
 // MESSAGE-ARRAY CONSTRUCTION SIMPLIFICATION (documented): NO
 // tool_call/tool-role history is reconstructed. Each turn sends a FRESH
@@ -51,12 +75,19 @@
 // the result text carries the outcome, and history-by-projection is where
 // token bloat would otherwise creep back. One helper builds the whole array.
 //
-// ERRORS: model errors retry ONCE (the same derived array — the store has
-// not moved) and end the loop nonzero with EV_CONTROL events ("model-error",
-// then "model-error-final"); derive failure, a missing backend, a missing
-// python runtime, and a cell still in flight at the wait deadline each fail
-// loud with their own control kind. The loop NEVER spins and never fails
-// silently.
+// ERRORS: model errors retry ONCE (the retry is ONE fresh FRM_TURN repost —
+// the re-derive is provably equivalent to the old loop's same-array retry
+// because the derive is stateless from the store: a steering write that
+// slipped in only ADDS context) and end the engine failed with control
+// events ("model-error", then "model-error-final"); the store round trips'
+// refusals, a missing backend, a missing python runtime, and each awaited
+// phase's deadline break each fail loud with their own control kind. The
+// engine NEVER spins and never fails silently.
+//
+// The synchronous driver: frame_run_loop (below) is start-or-pump — a
+// bounded pump of the frame's, its live ancestors', and the inline store's
+// mailboxes over the SAME engine; the public event-driven entry is
+// frame_start (frame.h; the pool owns pacing).
 //
 // Cap: frame_set_loop_turn_cap (runtime state on the frame; 0 = the
 // SA_LOOP_MAX_TURNS default of 64) bounds model turns issued per run — fail
@@ -67,6 +98,7 @@
 #include "frame_messages.h"
 #include "model.h"
 #include "../Actor/actor.h"
+#include "../Platform/platform_time.h"
 #include "../Util/allocator.h"
 #include "../Util/atomic_compat.h"
 #include "../Util/log.h"
@@ -110,8 +142,8 @@
    message stays bounded; older results roll off). */
 #define SA_LOOP_RESULTS_BLOCK_MAX 8
 
-/* Bounded pump-and-wait for one cell (the loop's timeout while the pyrt
-   worker runs it; a first-time interpreter boot lives well inside this). */
+/* Bounded wait for the engine's FRAME_PHASE_CELL (the driver's per-phase
+   deadline; a first-time interpreter boot lives well inside this). */
 #ifndef SA_LOOP_CELL_WAIT_MS
 #define SA_LOOP_CELL_WAIT_MS 60000
 #endif
@@ -202,9 +234,10 @@ static void _loop_sb_putf(loop_sb_t* b, const char* fmt, ...) {
 
 /* ---------------------------------------------------------------------------
  * Derivation. The event record shape (frame_messages.h): {"seq","type",
- * "frame","corr","at","cause","payload"} as ONE root-level scan bounded to
- * the newest 512 records, ascending — the projection runs two passes over
- * that parsed array: pass A fills the system-prompt material (snapshot +
+ * "frame","corr","at","cause","payload"} — the derive's DOM is the parsed
+ * event array the FRM_STORE_SCAN reply carried (ascending seq, bounded to
+ * the newest 512 records), and the projection runs two passes over that
+ * parsed array: pass A fills the system-prompt material (snapshot +
  * report lines), pass B projects the message stream in order.
  * ------------------------------------------------------------------------- */
 
@@ -303,17 +336,11 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
   return sb.s;   /* freed by the caller */
 }
 
-/* ONE helper builds the whole messages array (loop.c's documented message
-   construction). Returns a fresh JSON array value the loop destroys after
-   the model call; NULL on derivation failure (the caller logs a control
-   event). */
-static json_value_t* _loop_derive_context(frame_t* f) {
-  char* events_json = frame_debug_events(f);
-  if (events_json == NULL) return NULL;
-  char* perr = NULL;
-  json_value_t* events = json_parse(events_json, strlen(events_json), &perr);
-  free(events_json);
-  if (perr != NULL) free(perr);
+/* ONE helper builds the whole messages array (the projection, byte-
+   equivalent to the old loop's derive): returns a fresh JSON array value the
+   engine destroys after the model call; NULL on failure (the caller logs a
+   control event). `events` = the derive's parsed DOM (consumed). */
+static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
   if (events == NULL || json_type(events) != JSON_ARRAY) {
     json_value_destroy(events);
     return NULL;
@@ -415,7 +442,10 @@ static json_value_t* _loop_derive_context(frame_t* f) {
 }
 
 /* ---------------------------------------------------------------------------
- * The loop proper.
+ * The engine. frame_internal.h's handlers + the frame-side helpers they
+ * lean on (frame.c: _frame_post / _frame_store_actor / _frame_store_corr_next
+ * / _frame_event_post / _frame_event_post_fire / _frame_seq_rollback /
+ * _frame_engine_finish_post / _frame_pump).
  * ------------------------------------------------------------------------- */
 
 /* The loop's own corr counter (pairs cell.run with cell.result on the audit
@@ -427,14 +457,18 @@ static uint64_t _loop_next_corr(void) {
   return atomic_fetch_add(&_loop_corr, 1) + 1;
 }
 
-/* One control event {kind, text}; never fatal on its own failure (the loop's
-   caller decides what a missed audit line means — the log carries it). */
+/* One control event {kind, text}; FIRE-AND-POST (§1): every engine path that
+   can be OBSERVED externally ends through an awaited phase (FINISH/BIND
+   reply), and the store's FIFO order puts every earlier control batch ahead
+   of it — assertions riding post-commit state stay deterministic (the sync
+   driver additionally drains the inline store to quiescence before its
+   return). */
 static void _loop_control(frame_t* f, const char* kind, const char* text) {
   json_value_t* payload = json_new_object();
   json_object_set(payload, "kind", json_new_string(kind));
   json_object_set(payload, "text",
                   (text != NULL) ? json_new_string(text) : json_new_null());
-  if (_frame_event_write(f, "control", payload) != 0) {
+  if (_frame_event_post_fire(f, "control", payload) != 0) {
     log_error("loop: control event '%s' refused by the store at '%s'", kind,
               frame_sid(f));
   }
@@ -451,161 +485,892 @@ static void _loop_control(frame_t* f, const char* kind, const char* text) {
 #define _loop_python_ready() 1
 #endif
 
-int frame_run_loop(frame_t* f) {
-  if (_frame_is_live(f) == 0) {
-    log_error("frame_run_loop: dead frame");
-    return 1;
+/* The terminal step: end the live engine. `failed` is frame_run_loop's rc
+   (engine_failed); a TOP frame failure makes NO status change (the pinned
+   cap-is-a-failure shape). Task 6's _frame_engine_terminate grows the
+   child-side notify branch (the failure text bound into the parent's log). */
+static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed) {
+  if (e == NULL) {
+    log_error("loop: the engine ended at an unusable frame (already logged)");
+    return;
+  }
+  e->engine_live = 0;
+  e->phase = FRAME_PHASE_NONE;
+  e->store_kind = (frame_store_kind_e)0;
+  e->store_corr = 0;
+  e->model_retry_step = 0;
+  if (e->turn_reply != NULL) {
+    model_reply_destroy(e->turn_reply);
+    e->turn_reply = NULL;
+  }
+  if (failed) e->engine_failed = 1;
+}
+
+/* Repost the turn continuation (engine -> itself; never a wait). The
+   refusal is the DESTROY flag only — actor_send's return value means
+   "the mailbox was busy" (was_empty), NOT "refused": a continuation pushed
+   into a non-empty mailbox is still delivered. */
+static int _loop_post_turn(frame_t* f) {
+  actor_t* actor = _frame_actor(f);
+  if (actor == NULL || (atomic_load(&actor->flags) & ACTOR_FLAG_DESTROY)) {
+    log_error("loop: the turn continuation was refused at '%s' — the mailbox "
+              "is gone; the engine ends failed",
+              (f != NULL) ? frame_sid(f) : "?");
+    _loop_engine_end(f, _frame_engine_state(f), 1);
+    return -1;
+  }
+  message_t m;
+  m.type = (uint32_t)FRM_TURN;
+  m.payload = NULL;
+  m.payload_destroy = NULL;
+  (void)actor_send(actor, &m);
+  return 0;
+}
+
+/* The engine's model sink (model.h's contract): whatever thread the backend
+   completes on (the streams loop thread; a test backend synchronously within
+   submit — µs-scale either way: field writes + one post, NO decode here),
+   it moves body/error ownership into the FRM_MODEL_RESULT payload the
+   frame's own dispatch decodes. */
+static void _loop_model_sink(void* ctx, int status, char* body,
+                             size_t body_len, char* error) {
+  frame_t* f = (frame_t*)ctx;
+  if (f == NULL) {
+    log_error("loop: the model completion arrived with no frame context — "
+              "dropped loud (body/error die here)");
+    free(body);
+    free(error);
+    return;
+  }
+  frm_model_payload_t* p = get_clear_memory(sizeof(frm_model_payload_t));
+  if (p == NULL) {
+    log_error("loop: the model completion payload failed to allocate at '%s' — "
+              "the completion is dropped loud", frame_sid(f));
+    free(body);
+    free(error);
+    return;
+  }
+  p->status = status;
+  p->body = body;
+  p->body_len = body_len;
+  p->error = error;
+  actor_t* mailbox = _frame_actor(f);
+  if (mailbox == NULL) {
+    /* The frame died under the in-flight submit: the completion is unusable
+       now. The decode side would answer it with the unmatched-arrival drop —
+       skip the dead mailbox and drop loud here. */
+    log_error("loop: the model completion arrived after the frame '%s' died "
+              "— dropped loud", frame_sid(f));
+    frm_model_payload_destroy(p);
+    return;
+  }
+  _frame_post(mailbox, (uint32_t)FRM_MODEL_RESULT, p,
+              frm_model_payload_destroy, "model result");
+}
+
+/* The FRM_MODEL_RESULT arrival's raw-body decode: the SAME completion
+   surface model.c's complete() returns (message.content with the reasoning
+   fallback; the first tool call's `code` argument, argument-object or
+   JSON-string; finish_reason) with model.c's exact error text shape
+   ("model client: HTTP %d: <excerpt | transport reason | (no body)>") —
+   0 ok (*reply_out owns the reply); nonzero (*error_out owns the reason).
+   Task 4's shared _model_result_from_http (model_internal.h) replaces this
+   local decode one-for-one (one error surface, two delivery modes). */
+static char* _loop_decode_http_error(int status, const char* body,
+                                     size_t body_len,
+                                     const char* transport_error) {
+  char excerpt[201];
+  excerpt[0] = '\0';
+  if (body != NULL && body_len > 0) {
+    size_t n = (body_len < sizeof(excerpt) - 1) ? body_len
+                                                : sizeof(excerpt) - 1;
+    memcpy(excerpt, body, n);
+    excerpt[n] = '\0';
+    /* cut at the first newline so the log line stays one line */
+    size_t cut = strcspn(excerpt, "\r\n");
+    excerpt[cut] = '\0';
+  }
+  const char* detail =
+      (excerpt[0] != '\0') ? excerpt
+      : (transport_error != NULL && transport_error[0] != '\0') ? transport_error
+      : "(no body)";
+  size_t need = (size_t)snprintf(NULL, 0, "model client: HTTP %d: %s", status,
+                                 detail) + 1;
+  char* out = get_memory(need);
+  snprintf(out, need, "model client: HTTP %d: %s", status, detail);
+  return out;
+}
+
+static int _loop_decode_arguments(const json_value_t* arguments,
+                                  char** code_out, char** error_out) {
+  if (arguments == NULL) {
+    *error_out = _loop_trunc("model client: decode: tool call has no arguments",
+                             200);
+    return -1;
+  }
+  json_value_t* args_obj = (json_value_t*)arguments;   /* borrowed or parsed */
+  json_value_t* parsed_args = NULL;
+  if (json_type(arguments) == JSON_STRING) {
+    /* Lenient servers carry the argument object as a JSON string. */
+    char* aerr = NULL;
+    const char* args_text = json_as_string(arguments);
+    parsed_args = json_parse(args_text, strlen(args_text), &aerr);
+    if (aerr != NULL) free(aerr);
+    if (parsed_args == NULL) {
+      *error_out =
+          _loop_trunc("model client: decode: tool call arguments is not a "
+                      "JSON string carrying an object", 200);
+      return -1;
+    }
+    args_obj = parsed_args;
+  }
+  if (json_type(args_obj) != JSON_OBJECT) {
+    if (parsed_args != NULL) json_value_destroy(parsed_args);
+    *error_out = _loop_trunc("model client: decode: tool call arguments are "
+                             "neither string nor object", 200);
+    return -1;
+  }
+  json_value_t* code = json_get(args_obj, "code");
+  if (code == NULL || json_type(code) != JSON_STRING) {
+    if (parsed_args != NULL) json_value_destroy(parsed_args);
+    *error_out = _loop_trunc("model client: decode: tool call has no string "
+                             "`code` argument", 200);
+    return -1;
+  }
+  *code_out = strdup(json_as_string(code));
+  if (parsed_args != NULL) json_value_destroy(parsed_args);
+  if (*code_out == NULL) {
+    *error_out = _loop_trunc("model client: decode: out of memory copying the "
+                             "cell code", 200);
+    return -1;
+  }
+  return 0;
+}
+
+static int _loop_decode_body(const char* body, size_t body_len,
+                             model_reply_t** reply_out, char** error_out) {
+  *reply_out = NULL;
+  *error_out = NULL;
+  if (body == NULL || body_len == 0) {
+    *error_out = _loop_trunc("model client: decode: response body is empty", 200);
+    return -1;
+  }
+  char* perr = NULL;
+  json_value_t* root = json_parse(body, body_len, &perr);
+  if (root == NULL) {
+    char detail[100];
+    snprintf(detail, sizeof(detail), "model client: decode: %s",
+             (perr != NULL) ? perr : "response body is not valid JSON");
+    if (perr != NULL) free(perr);
+    *error_out = _loop_trunc(detail, 200);
+    return -1;
+  }
+  json_value_t* choices = json_get(root, "choices");
+  if (choices == NULL || json_type(choices) != JSON_ARRAY || json_size(choices) < 1) {
+    json_value_destroy(root);
+    *error_out = _loop_trunc("model client: decode: choices missing", 200);
+    return -1;
+  }
+  json_value_t* choice = json_at(choices, 0);
+  if (choice == NULL || json_type(choice) != JSON_OBJECT) {
+    json_value_destroy(root);
+    *error_out = _loop_trunc("model client: decode: first choice is not an "
+                             "object", 200);
+    return -1;
+  }
+  json_value_t* message = json_get(choice, "message");
+  if (message == NULL) {
+    json_value_destroy(root);
+    *error_out = _loop_trunc("model client: decode: message missing in first "
+                             "choice", 200);
+    return -1;
   }
 
-  unsigned cap = _frame_loop_turn_cap(f);
-  unsigned turn = 0;                       /* model turns ISSUED */
+  model_reply_t* reply = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
+  json_value_t* content = json_get(message, "content");
+  if (content != NULL && json_type(content) != JSON_NULL &&
+      json_type(content) != JSON_STRING) {
+    json_value_destroy(root);
+    model_reply_destroy(reply);
+    *error_out = _loop_trunc("model client: decode: message.content is neither "
+                             "absent nor a string", 200);
+    return -1;
+  }
+  if (content != NULL && json_type(content) == JSON_STRING) {
+    reply->content = strdup(json_as_string(content));
+  } else {
+    reply->content = strdup("");
+  }
+  if (reply->content == NULL) {
+    json_value_destroy(root);
+    model_reply_destroy(reply);
+    *error_out = _loop_trunc("model client: decode: out of memory copying the "
+                             "content", 200);
+    return -1;
+  }
 
-  for (;;) {
+  /* Reasoning models legitimately answer with an empty `content` and their
+     text in a `reasoning` string field (model.c's rule, kept verbatim): a
+     non-empty content always wins; both are kept verbatim then. */
+  if (reply->content[0] == '\0') {
+    json_value_t* reasoning = json_get(message, "reasoning");
+    if (reasoning != NULL && json_type(reasoning) == JSON_STRING &&
+        json_as_string(reasoning)[0] != '\0') {
+      char* r = strdup(json_as_string(reasoning));
+      if (r != NULL) {
+        free(reply->content);
+        reply->content = r;
+      }
+    }
+  }
+
+  /* tool_calls: only the FIRST call is consumed — the single-tool surface
+     means one cell per turn. */
+  json_value_t* tool_calls = json_get(message, "tool_calls");
+  if (tool_calls != NULL && json_type(tool_calls) == JSON_ARRAY &&
+      json_size(tool_calls) > 0) {
+    json_value_t* tool_call = json_at(tool_calls, 0);
+    json_value_t* function = (tool_call != NULL) ? json_get(tool_call, "function")
+                                                 : NULL;
+    json_value_t* arguments = (function != NULL) ? json_get(function, "arguments")
+                                                 : NULL;
+    if (_loop_decode_arguments(arguments, &reply->tool_code, error_out) != 0) {
+      json_value_destroy(root);
+      model_reply_destroy(reply);
+      return -1;
+    }
+  }
+
+  json_value_t* finish_reason = json_get(choice, "finish_reason");
+  if (finish_reason != NULL && json_type(finish_reason) == JSON_STRING) {
+    reply->finish_reason = strdup(json_as_string(finish_reason));
+  }
+
+  json_value_destroy(root);
+  *reply_out = reply;
+  return 0;
+}
+
+static int _loop_decode_completion(int status, const char* body, size_t body_len,
+                                   const char* transport_error,
+                                   model_reply_t** reply_out, char** error_out) {
+  if (status < 200 || status >= 300) {
+    *error_out = _loop_decode_http_error(status, body, body_len, transport_error);
+    return -1;
+  }
+  if (transport_error != NULL && transport_error[0] != '\0') {
+    *error_out = _loop_trunc(transport_error, 200);
+    return -1;
+  }
+  return _loop_decode_body(body, body_len, reply_out, error_out);
+}
+
+/* The derive's store round trip (the turn step's yield): compose the events
+   range's ABSOLUTE root-level bounds (pure key composition — the
+   _frame_events_bounds string shape, no store access) and post the bounded
+   reverse scan as FRM_STORE_SCAN; the reply continues inside
+   _frame_engine_store_reply's FRAME_STORE_DERIVE branch. */
+static void _loop_post_derive(frame_t* f, frame_engine_state_t* e) {
+  const char* sid = frame_sid(f);
+  size_t base = (sid != NULL) ? strlen(sid) : 0;
+  char* lo = get_memory(base + strlen("/events") + 1);
+  char* hi = get_memory(base + strlen("/events0") + 1);
+  frm_store_scan_payload_t* sp =
+      (frm_store_scan_payload_t*)get_clear_memory(sizeof(frm_store_scan_payload_t));
+  if (sid == NULL || lo == NULL || hi == NULL || sp == NULL) {
+    log_error("loop: out of memory composing the derive scan at '%s'",
+              (sid != NULL) ? sid : "?");
+    free(lo);
+    free(hi);
+    free(sp);
+    _loop_control(f, "derive-error", NULL);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  snprintf(lo, base + strlen("/events") + 1, "%s/events", sid);
+  snprintf(hi, base + strlen("/events0") + 1, "%s/events0", sid);
+  sp->start = lo;                    /* OWNED by the store round trip */
+  sp->end = hi;                      /* OWNED */
+  sp->limit = SA_FRAME_DEBUG_MAX_EVENTS;
+  sp->reply_to = _frame_actor(f);
+  sp->corr = _frame_store_corr_next(f);
+  /* The awaited round trip's routing is set BEFORE the post (this dispatch
+     is the single runner; the reply routes in a LATER dispatch). */
+  e->phase = FRAME_PHASE_STORE;
+  e->store_kind = FRAME_STORE_DERIVE;
+  e->store_corr = sp->corr;
+  _frame_post(_frame_store_actor(f), (uint32_t)FRM_STORE_SCAN, sp,
+              frm_store_scan_payload_destroy, "derive scan");
+}
+
+/* The tool path's cell.run audit = the FRAME_STORE_CELL_RUN round trip (the
+   audit commit BEFORE any cell executes — no untracked cell ever runs); the
+   reply dispatches the cell. */
+static void _loop_post_cell_run(frame_t* f, frame_engine_state_t* e,
+                                model_reply_t* reply) {
+  uint64_t corr = _loop_next_corr();
+  json_value_t* run_payload = json_new_object();
+  if (run_payload == NULL) {
+    log_error("loop: out of memory building the cell.run payload at '%s'",
+              frame_sid(f));
+    model_reply_destroy(reply);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  json_object_set(run_payload, "code", json_new_string(reply->tool_code));
+  json_object_set(run_payload, "corr", json_new_int((int64_t)corr));
+
+  e->store_corr = _frame_store_corr_next(f);
+  e->turn_cell_corr = corr;
+  e->phase = FRAME_PHASE_STORE;
+  e->store_kind = FRAME_STORE_CELL_RUN;
+  uint64_t seq = 0;
+  int rc = _frame_event_post(f, "cell.run", run_payload, e->store_corr,
+                             _frame_actor(f), &seq);   /* consumes the payload */
+  if (rc != 0) {
+    /* The audit line was refused (e.g. a huge cell, logged loud pre-post) —
+       fail loud rather than execute an untracked cell. */
+    e->phase = FRAME_PHASE_NONE;
+    e->store_kind = (frame_store_kind_e)0;
+    e->store_corr = 0;
+    _frame_seq_rollback(f, seq);
+    log_error("loop: cell.run event refused at '%s'", frame_sid(f));
+    _loop_control(f, "audit-error", "cell.run event refused");
+    model_reply_destroy(reply);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  /* The model reply rides the engine state to the CELL_RUN reply (which
+     dispatches the cell out of it and destroys it). */
+  e->turn_reply = reply;
+}
+
+/* The tool path (the model called `execute`): the audit round trip + yield. */
+static void _loop_tool_path(frame_t* f, frame_engine_state_t* e,
+                            model_reply_t* reply) {
+  if (!_loop_python_ready()) {
+    log_error("loop: tool call at '%s' but this build has no python "
+              "runtime — no cell can execute", frame_sid(f));
+    _loop_control(f, "python-missing", "no python runtime in this build");
+    model_reply_destroy(reply);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  _loop_post_cell_run(f, e, reply);
+}
+
+/* The content path (no tool call: the turn ends): msg.append — or, on an
+   empty assistant turn, the empty-turn control event — and, for a TOP
+   frame, the meta/status=done put in ONE atomic FRAME_STORE_FINISH batch.
+   The reply ends the engine (top; child: Task 6's quiet-completion
+   terminate). */
+static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
+                               model_reply_t* reply) {
+  /* The content is read BEFORE the reply dies (the finish batch composes its
+     own copies — the batch's value is json-serialized text, not the reply's
+     pointer), and the reply is destroyed after the batch composing used it. */
+  const char* content =
+      (reply->content != NULL && reply->content[0] != '\0') ? reply->content : NULL;
+  uint64_t corr = _frame_store_corr_next(f);
+  int frc = _frame_engine_finish_post(f, content, _frame_is_child(f) ? 0 : 1,
+                                      corr, _frame_actor(f));
+  model_reply_destroy(reply);
+  if (frc != 0) {
+    /* Pre-post refusal (already logged loud; the seq rolled back): the
+       turn's message + completion never committed. */
+    _loop_control(f, "commit-error", "turn finish batch refused");
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  e->phase = FRAME_PHASE_STORE;
+  e->store_kind = FRAME_STORE_FINISH;
+  e->store_corr = corr;
+  /* yield: the FINISH reply ends the engine */
+}
+
+/* The reply processing, shared by the sync and the async arrival paths —
+   "scripted backends drive the SAME code". Model error → control
+   "model-error" + ONE retry (a fresh FRM_TURN repost; the re-derive is
+   provably equivalent — the derive is stateless from the store), second
+   consecutive failure → control "model-error-final" + engine end failed. */
+static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
+                                int rc, model_reply_t* reply, char* err) {
+  if (rc != 0 || reply == NULL) {
+    const char* detail =
+        (err != NULL && err[0] != '\0') ? err : "backend returned no reply";
+    if (e->model_retries < 1) {
+      _loop_control(f, "model-error", detail);
+      free(err);
+      e->model_retries = 1;
+      e->model_retry_step = 1;   /* the repost skips the checks + the count */
+      (void)_loop_post_turn(f);
+      return;
+    }
+    _loop_control(f, "model-error-final", detail);
+    free(err);
+    if (reply != NULL) model_reply_destroy(reply);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  free(err);
+  e->model_retries = 0;       /* fresh retry budget per successful call */
+
+  if (reply->tool_code != NULL) {
+    _loop_tool_path(f, e, reply);
+    return;
+  }
+  _loop_content_path(f, e, reply);
+}
+
+/* The FRAME_STORE_DERIVE reply's continuation: parse the materialized raw
+   records into the DOM (µs, bounded 512, unparseable dropped loud — the old
+   frame_debug_events tail's shape MOVED here: the store worker carried raw
+   texts), run the UNCHANGED two-pass projection, and take the model path. */
+static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
+                                   frm_store_reply_payload_t* r) {
+  if (r->rc != 0) {
+    log_error("loop: the derive scan at '%s' was refused by the store (%d) — "
+              "nothing can be derived", frame_sid(f), r->rc);
+    _loop_control(f, "derive-error", NULL);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  json_value_t* events = json_new_array();
+  if (events == NULL) {
+    log_error("loop: out of memory building the derive DOM at '%s'",
+              frame_sid(f));
+    _loop_control(f, "derive-error", NULL);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  for (size_t i = 0; i < r->n; i++) {
+    char* perr = NULL;
+    json_value_t* rec = json_parse(r->records[i], strlen(r->records[i]), &perr);
+    if (perr != NULL) free(perr);
+    if (rec == NULL) {
+      log_error("loop: unparseable event record dropped at '%s'", frame_sid(f));
+      continue;
+    }
+    json_array_append(events, rec);
+  }
+  json_value_t* messages = _loop_project(f, events);   /* consumes the DOM */
+  if (messages == NULL) {
+    log_error("loop: the projection failed at '%s'", frame_sid(f));
+    _loop_control(f, "derive-error", NULL);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+
+  model_backend_t* mb = _frame_backend_get(f);
+  if (mb == NULL) {
+    log_error("loop: '%s' has no usable model backend", frame_sid(f));
+    _loop_control(f, "model-missing", NULL);
+    json_value_destroy(messages);
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+
+  if (mb->submit != NULL) {
+    /* The ASYNC shape (Task 4's http submit): rc 0 → the sink fires EXACTLY
+       ONCE (FRM_MODEL_RESULT) and the engine yields in FRAME_PHASE_MODEL;
+       rc != 0 = rejected before any I/O — the sink will NEVER fire. */
+    int src = mb->submit(mb, messages, NULL, _loop_model_sink, f);
+    json_value_destroy(messages);
+    if (src != 0) {
+      log_error("loop: the model submit was rejected (the sink will never "
+                "fire) at '%s'", frame_sid(f));
+      _loop_control(f, "submit-failed", NULL);
+      _loop_engine_end(f, e, 1);
+      return;
+    }
+    e->phase = FRAME_PHASE_MODEL;
+    return;                    /* yield: the completion arrives as a message */
+  }
+
+  /* The SYNC shape (every scripted test backend): complete() runs INLINE
+     inside this dispatch — blocking the actor, acceptable ONLY on the
+     documented inline/test driver (§6), never on a pool worker in
+     production (a production backend implements submit). raw_out = NULL:
+     the documented NULL-tolerant body out-param — the engine keeps only the
+     parsed reply. The derived array's lifetime ends here either way (the
+     model-error retry re-derives; nothing retains it). */
+  model_reply_t* reply = NULL;
+  char* err = NULL;
+  int crc = mb->complete(mb, messages, NULL, NULL, &reply, &err);
+  json_value_destroy(messages);
+  _frame_engine_reply(f, e, crc, reply, err);
+}
+
+/* The FRAME_STORE_CELL_RUN reply's continuation: rc != 0 → the old loop's
+   audit rule at the reply; rc == 0 → dispatch FRM_CELL_EXECUTE (the old tool
+   path verbatim: the unclaimed-payload check, model_reply_destroy) and
+   yield in FRAME_PHASE_CELL on a pending cell — OR write the paired
+   status-1 cell.result for a synchronous refusal (the audit-honesty fix)
+   and resume the turn. */
+static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc) {
+  if (rc != 0) {
+    if (e->turn_reply != NULL) {
+      model_reply_destroy(e->turn_reply);
+      e->turn_reply = NULL;
+    }
+    log_error("loop: cell.run event refused at '%s'", frame_sid(f));
+    _loop_control(f, "audit-error", "cell.run event refused");
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  if (e->turn_reply == NULL || e->turn_reply->tool_code == NULL) {
+    log_error("loop: the cell.run round trip lost the model reply at '%s' — "
+              "failing loud", frame_sid(f));
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+
+  frm_cell_payload_t* cp = get_clear_memory(sizeof(frm_cell_payload_t));
+  if (cp == NULL) {
+    log_error("loop: out of memory building the FRM_CELL_EXECUTE payload at "
+              "'%s'", frame_sid(f));
+    model_reply_destroy(e->turn_reply);
+    e->turn_reply = NULL;
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  cp->corr = e->turn_cell_corr;
+  cp->code = strdup(e->turn_reply->tool_code);
+  if (cp->code == NULL) {
+    log_error("loop: out of memory copying the cell code at '%s'", frame_sid(f));
+    frm_cell_payload_destroy(cp);
+    model_reply_destroy(e->turn_reply);
+    e->turn_reply = NULL;
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  message_t m;
+  m.type = (uint32_t)FRM_CELL_EXECUTE;
+  m.payload = cp;
+  m.payload_destroy = frm_cell_payload_destroy;
+  /* The frame behavior consumes the payload on every handled path, so a
+     non-NULL leftover means it did not claim the message. */
+  frame_dispatch(f, &m);
+  if (m.payload != NULL) {
+    log_error("loop: FRM_CELL_EXECUTE unclaimed at '%s'", frame_sid(f));
+    frm_cell_payload_destroy((frm_cell_payload_t*)m.payload);
+    m.payload = NULL;
+  }
+  model_reply_destroy(e->turn_reply);
+  e->turn_reply = NULL;
+
+  if (_frame_cell_pending(f) != 0) {
+    e->phase = FRAME_PHASE_CELL;   /* yield: PYRT_RESULT reposts the turn */
+    return;
+  }
+
+  /* A synchronous refusal (pending never set — a second in-flight cell,
+     a pyrt boot/execute refusal, corr 0): the ENGINE writes the PAIRED
+     status-1 cell.result right here (the audit-honesty fix — the refused
+     cell.run line's counterpart), then the next turn re-derives from it. */
+  json_value_t* result_payload = json_new_object();
+  if (result_payload == NULL) {
+    log_error("loop: out of memory building the refused cell's paired "
+              "cell.result at '%s'", frame_sid(f));
+  } else {
+    json_object_set(result_payload, "corr",
+                    json_new_int((int64_t)e->turn_cell_corr));
+    json_object_set(result_payload, "status", json_new_int(1));
+    json_object_set(result_payload, "text",
+                    json_new_string("cell refused before execution"));
+    _frame_event_post_fire(f, "cell.result", result_payload);
+  }
+  (void)_loop_post_turn(f);   /* resume */
+}
+
+/* The FRAME_STORE_FINISH reply's continuation: rc != 0 → control
+   "commit-error" + engine end failed; rc == 0 → the END rule (§1): a TOP
+   frame's engine ends (the status put rode the batch). A CHILD's
+   quiet-completion terminate is Task 6's _frame_engine_terminate — until it
+   lands the child's engine ends and its status stays "running" (the old
+   loop's shape). */
+static void _loop_engine_on_finish(frame_t* f, frame_engine_state_t* e, int rc) {
+  if (rc != 0) {
+    log_error("loop: the turn finish batch was refused (%d) at '%s'",
+              rc, frame_sid(f));
+    _loop_control(f, "commit-error", "turn finish batch refused");
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+  _loop_engine_end(f, e, 0);
+}
+
+int _frame_engine_start(frame_t* f) {
+  if (!_frame_is_live(f)) {
+    log_error("frame_start: dead frame");
+    return -1;
+  }
+  frame_engine_state_t* e = _frame_engine_state(f);
+  if (e == NULL || e->engine_live) {
+    log_error("frame_start: an engine is already live at '%s' — ONE engine "
+              "per frame",
+              (f != NULL) ? frame_sid(f) : "?");
+    return -1;
+  }
+  /* The per-run knobs (§1: turns_issued resets at frame_start — the cap
+     stays a per-run bound, exactly like the old loop's; a full-run retry
+     gets a fresh budget and fresh failed-knob state). */
+  e->turns_issued = 0;
+  e->model_retries = 0;
+  e->model_retry_step = 0;
+  e->engine_failed = 0;
+  e->phase = FRAME_PHASE_NONE;
+  e->store_kind = (frame_store_kind_e)0;
+  e->store_corr = 0;
+  e->turn_cell_corr = 0;
+  e->turn_reply = NULL;
+  e->engine_live = 1;
+  return _loop_post_turn(f);
+}
+
+void _frame_engine_turn(frame_t* f) {
+  frame_engine_state_t* e = (f != NULL) ? _frame_engine_state(f) : NULL;
+  if (e == NULL) {
+    log_error("frame: FRM_TURN at an unusable frame — dropping loud");
+    return;
+  }
+  if (!e->engine_live) {
+    /* A late repost after a terminal step: loud, nothing to destroy (the
+       continuation's payload is NULL). */
+    log_error("frame: FRM_TURN late-dropped at '%s' — no turn engine is "
+              "live", frame_sid(f));
+    return;
+  }
+  if (_frame_is_live(f) == 0) {
+    /* The subtree died under a queued continuation (a destroy raced the
+       mailbox) — a dead frame cannot derive anything. */
+    log_error("loop: the frame's subtree is gone on a queued turn at '%s' "
+              "— the engine ends failed", frame_sid(f));
+    _loop_engine_end(f, e, 1);
+    return;
+  }
+
+  if (e->model_retry_step != 0) {
+    /* A model-RETRY continuation: the old loop's retry did not spend a turn
+       and re-ran no checks — go straight to the re-derive. */
+    e->model_retry_step = 0;
+  } else {
     /* Stop request drains before anything else (FRM_STOP is a control
        request, not an interruption: the running cell finishes). */
     if (_frame_stop_requested(f)) {
-      log_info("loop: stop requested before turn %u of '%s'", turn + 1,
-               frame_sid(f));
-      return 0;
+      log_info("loop: stop requested before turn %u of '%s'",
+               (unsigned)(e->turns_issued + 1), frame_sid(f));
+      _loop_engine_end(f, e, 0);
+      return;
     }
     /* A report (from any earlier turn's cell) already ended this frame —
-       clean completion whether it is now top or child. */
-    if (frame_is_done(f)) return 0;
+       clean completion whether it is now top or child (the advisory direct
+       read, spec §5's carve-out). */
+    if (frame_is_done(f)) {
+      _loop_engine_end(f, e, 0);
+      return;
+    }
     /* Fail loud at the cap: never an infinite loop. */
-    if (turn == cap) {
+    unsigned cap = _frame_loop_turn_cap(f);
+    if (e->turns_issued == cap) {
       log_error("loop: turn limit %u reached at '%s' — failing loud",
                 cap, frame_sid(f));
       _loop_control(f, "turn-limit", "model turn budget exhausted");
-      return 1;
-    }
-    turn++;
-
-    json_value_t* messages = _loop_derive_context(f);
-    if (messages == NULL) {
-      log_error("loop: derivation failed at '%s'", frame_sid(f));
-      _loop_control(f, "derive-error", NULL);
-      return 1;
+      _loop_engine_end(f, e, 1);
+      return;
     }
     model_backend_t* mb = _frame_backend_get(f);
     if (mb == NULL) {
       log_error("loop: '%s' has no usable model backend", frame_sid(f));
       _loop_control(f, "model-missing", NULL);
-      json_value_destroy(messages);
-      return 1;
+      _loop_engine_end(f, e, 1);
+      return;
     }
-
-    model_reply_t* reply = NULL;
-    char* err = NULL;
-    /* raw_out = NULL: the documented NULL-tolerant body out-param of
-       model.h's complete() — the loop keeps only the parsed reply. */
-    int rc = mb->complete(mb, messages, NULL, NULL, &reply, &err);
-    if (rc != 0 || reply == NULL) {
-      /* Retry ONCE with the same derived array (the store has not moved);
-         then fail loud. */
-      _loop_control(f, "model-error", (err != NULL) ? err : "backend returned no reply");
-      free(err);
-      err = NULL;
-      reply = NULL;
-      rc = mb->complete(mb, messages, NULL, NULL, &reply, &err);
-      if (rc != 0 || reply == NULL) {
-        _loop_control(f, "model-error-final",
-                      (err != NULL) ? err : "backend returned no reply");
-        free(err);
-        json_value_destroy(messages);
-        return 1;
-      }
-    }
-    free(err);
-
-    if (reply->tool_code != NULL) {
-      /* --- the tool path ------------------------------------------------ */
-      if (!_loop_python_ready()) {
-        log_error("loop: tool call at '%s' but this build has no python "
-                  "runtime — no cell can execute", frame_sid(f));
-        _loop_control(f, "python-missing", "no python runtime in this build");
-        model_reply_destroy(reply);
-        json_value_destroy(messages);
-        return 1;
-      }
-      uint64_t corr = _loop_next_corr();
-      json_value_t* run_payload = json_new_object();
-      json_object_set(run_payload, "code", json_new_string(reply->tool_code));
-      json_object_set(run_payload, "corr", json_new_int((int64_t)corr));
-      if (_frame_event_write(f, "cell.run", run_payload) != 0) {
-        /* The audit line was refused (e.g. a huge cell) — fail loud rather
-           than execute an untracked cell. */
-        log_error("loop: cell.run event refused at '%s'", frame_sid(f));
-        _loop_control(f, "audit-error", "cell.run event refused");
-        model_reply_destroy(reply);
-        json_value_destroy(messages);
-        return 1;
-      }
-
-      frm_cell_payload_t* cp = get_clear_memory(sizeof(frm_cell_payload_t));
-      cp->corr = corr;
-      cp->code = strdup(reply->tool_code);
-      message_t m;
-      m.type = (uint32_t)FRM_CELL_EXECUTE;
-      m.payload = cp;
-      m.payload_destroy = frm_cell_payload_destroy;
-      /* The frame behavior consumes the payload on every handled path, so a
-         non-NULL leftover means it did not claim the message. */
-      frame_dispatch(f, &m);
-      if (m.payload != NULL) {
-        log_error("loop: FRM_CELL_EXECUTE unclaimed at '%s'", frame_sid(f));
-        frm_cell_payload_destroy((frm_cell_payload_t*)m.payload);
-        m.payload = NULL;
-      }
-      model_reply_destroy(reply);
-      reply = NULL;
-
-      uint8_t cell_status = 1;
-      if (_frame_cell_wait(f, SA_LOOP_CELL_WAIT_MS, &cell_status) != 0) {
-        /* The cell is still running at the deadline; its eventual result
-           still lands (the frame slot completes it) but the loop stops
-           waiting. */
-        log_error("loop: cell corr %llu in flight past the %d ms wait at '%s'",
-                  (unsigned long long)corr, (int)SA_LOOP_CELL_WAIT_MS,
-                  frame_sid(f));
-        _loop_control(f, "cell-timeout", NULL);
-        json_value_destroy(messages);
-        return 1;
-      }
-      /* A status-1 cell does NOT end the loop: the traceback rides the next
-         derive as a status-1 user message and the model self-corrects. */
-      log_info("loop: cell corr %llu of '%s' completed with status %u",
-               (unsigned long long)corr, frame_sid(f), cell_status);
-      json_value_destroy(messages);
-      continue;
-    }
-
-    /* --- the content path (no tool call: the turn ends) ---------------- */
-    if (reply->content != NULL && reply->content[0] != '\0') {
-      if (frame_append_msg(f, "assistant", reply->content) != 0) {
-        log_error("loop: assistant msg.append refused at '%s'", frame_sid(f));
-        _loop_control(f, "commit-error", "assistant msg.append refused");
-        model_reply_destroy(reply);
-        json_value_destroy(messages);
-        return 1;
-      }
-    } else {
-      /* An empty stop (no tool call, no content) still lands in the audit
-         trail as a control event — a turn that writes nothing must never
-         vanish from the record. The model chose to stop: the frame ends. */
-      _loop_control(f, "empty-turn", NULL);
-    }
-    model_reply_destroy(reply);
-    json_value_destroy(messages);
-
-    /* TOP frames end here; children left running end via report only. */
-    if (!_frame_is_child(f)) {
-      if (_frame_set_status_done(f) != 0) {
-        log_error("loop: status->done refused at '%s'", frame_sid(f));
-        return 1;
-      }
-    }
-    return 0;
+    e->turns_issued++;
   }
+  _loop_post_derive(f, e);   /* the derive = the store round trip; yield */
+}
+
+void _frame_engine_store_reply(frame_t* f, frm_store_reply_payload_t* r) {
+  frame_engine_state_t* e = (f != NULL) ? _frame_engine_state(f) : NULL;
+  if (e == NULL || !e->engine_live || e->phase != FRAME_PHASE_STORE ||
+      e->store_corr == 0 || r == NULL || r->corr != e->store_corr) {
+    log_error("loop: an unmatched engine store reply (corr %llu) at '%s' — "
+              "dropped loud",
+              (unsigned long long)((r != NULL) ? r->corr : 0),
+              (f != NULL) ? frame_sid(f) : "?");
+    if (r != NULL) frm_store_reply_payload_destroy(r);
+    return;
+  }
+  int rc = r->rc;
+  frame_store_kind_e kind = e->store_kind;
+  e->phase = FRAME_PHASE_NONE;
+  e->store_corr = 0;
+  switch (kind) {
+    case FRAME_STORE_DERIVE:
+      _loop_engine_on_derive(f, e, r);
+      break;
+    case FRAME_STORE_CELL_RUN:
+      _loop_engine_on_cell_run(f, e, rc);
+      break;
+    case FRAME_STORE_FINISH:
+      _loop_engine_on_finish(f, e, rc);
+      break;
+    default:
+      break;
+  }
+  frm_store_reply_payload_destroy(r);   /* the raw records die here */
+}
+
+void _frame_engine_model_arrived(frame_t* f, frm_model_payload_t* payload) {
+  frame_engine_state_t* e = (f != NULL) ? _frame_engine_state(f) : NULL;
+  if (e == NULL || payload == NULL || !e->engine_live ||
+      e->phase != FRAME_PHASE_MODEL) {
+    /* A late/duplicated arrival (after a terminal step, or outside the
+       await): a loud drop — the payload's ownership dies here. */
+    log_error("loop: an unmatched model completion at '%s' — dropped loud",
+              (f != NULL) ? frame_sid(f) : "?");
+    if (payload != NULL) frm_model_payload_destroy(payload);
+    return;
+  }
+  e->phase = FRAME_PHASE_NONE;
+  model_reply_t* reply = NULL;
+  char* err = NULL;
+  int rc = _loop_decode_completion(payload->status, payload->body,
+                                   payload->body_len, payload->error,
+                                   &reply, &err);
+  frm_model_payload_destroy(payload);   /* the raw body/error die here */
+  _frame_engine_reply(f, e, rc, reply, err);
+}
+
+void _frame_engine_cell_done(frame_t* f) {
+  frame_engine_state_t* e = (f != NULL) ? _frame_engine_state(f) : NULL;
+  if (e == NULL || !e->engine_live || e->phase != FRAME_PHASE_CELL) {
+    return;   /* not the engine's cell (a direct-API/driver-driven cell) */
+  }
+  e->phase = FRAME_PHASE_NONE;
+  (void)_loop_post_turn(f);   /* the turn continues after the cell's result */
+}
+
+void _frame_engine_child_report(frame_t* f, frm_child_report_payload_t* payload) {
+  /* Task 5 fills this behavior (the live-children bookkeeping + the
+     resume); Task 3 declares the route. Nothing posts FRM_CHILD_REPORT
+     before a terminate reports it — a delivery here is a routing bug. */
+  log_error("loop: FRM_CHILD_REPORT for '%s' at '%s' — the parent-resume "
+            "route is not wired yet (Task 5 fills it); dropping loud",
+            (payload != NULL && payload->child_sid != NULL)
+                ? payload->child_sid : "?",
+            (f != NULL) ? frame_sid(f) : "?");
+  if (payload != NULL) frm_child_report_payload_destroy(payload);
+}
+
+/* ---------------------------------------------------------------------------
+ * The synchronous driver (§6): start-or-pump over the SAME engine.
+ * ------------------------------------------------------------------------- */
+
+/* The deadline per awaited phase (frame_internal.h's contract); NONE — the
+   transient gap between a terminal step and the next dispatch — gets the
+   store deadline (it resolves within one pump in every real flow). */
+static unsigned _loop_phase_deadline_ms(frame_phase_e phase) {
+  switch (phase) {
+    case FRAME_PHASE_CELL:
+      return SA_LOOP_CELL_WAIT_MS;
+    case FRAME_PHASE_MODEL:
+      return SA_LOOP_MODEL_WAIT_MS;
+    default:
+      return SA_LOOP_STORE_WAIT_MS;
+  }
+}
+
+/* Before every return: drain the INLINE store to quiescence so no
+   fire-and-post outlives the driver's return (the belt to the store FIFO's
+   suspenders). A pooled store is never pumped here (workers own pacing). */
+static void _loop_driver_drain_store(frame_t* f) {
+  if (_frame_store_pooled(f) != 0) {
+    return;
+  }
+  actor_t* store = _frame_store_actor(f);
+  if (store == NULL) return;
+  uint64_t deadline =
+      platform_monotonic_ns() + (uint64_t)SA_LOOP_STORE_WAIT_MS * 1000000ULL;
+  while (actor_run(store, ACTOR_BATCH_SIZE)) {
+    if (platform_monotonic_ns() >= deadline) {
+      log_error("loop: the inline store did not reach quiescence within %d ms "
+                "at '%s' — giving the driver's drain up (the store keeps the "
+                "queue; its own log carries the stall)",
+                (int)SA_LOOP_STORE_WAIT_MS, frame_sid(f));
+      break;
+    }
+  }
+}
+
+int frame_run_loop(frame_t* f) {
+  if (_frame_is_live(f) == 0) {
+    log_error("frame_run_loop: dead frame");
+    return 1;
+  }
+  frame_engine_state_t* e = _frame_engine_state(f);
+  if (e == NULL) {
+    log_error("frame_run_loop: unusable frame state");
+    return 1;
+  }
+
+  /* Start-or-pump (§6): an engine that is NOT live is started (refused →
+     rc 1); an ALREADY-LIVE one is fine — the driver pumps from where the
+     engine is, which is how a spawned child's queued FRM_TURN gets drained
+     by the synchronous driver. */
+  if (e->engine_live == 0) {
+    if (frame_start(f) != 0) return 1;
+  }
+
+  /* The bounded pump: the deadline is PER PHASE (the cell deadline
+     SA_LOOP_CELL_WAIT_MS, SA_LOOP_MODEL_WAIT_MS, SA_LOOP_STORE_WAIT_MS); a
+     breaking deadline is a loud stall, never a hang. */
+  frame_phase_e seen = FRAME_PHASE_NONE;
+  uint64_t seen_trip = 0;      /* the STORE phase re-enters once per awaited
+                                  round trip — the deadline resets per TRIP
+                                  (the store wait is µs–ms per round trip,
+                                  per frame_internal.h's deadline contract) */
+  int seen_valid = 0;
+  uint64_t phase_started = 0;
+  for (;;) {
+    /* ONE pump cycle over the frame's whole round-trip surface (the frame
+       mailbox, its live ancestors', the inline store — frame_internal.h's
+       ONE pump order); everything the engine awaits lands within cycles. */
+    _frame_pump(f);
+    if (e->engine_live == 0) break;
+    if (e->phase == FRAME_PHASE_CHILDREN) break;   /* Task 5's yield */
+    if (!seen_valid || e->phase != seen ||
+        (e->phase == FRAME_PHASE_STORE && e->store_corr != seen_trip)) {
+      seen = e->phase;
+      seen_trip = e->store_corr;
+      seen_valid = 1;
+      phase_started = platform_monotonic_ns();
+    }
+    if (platform_monotonic_ns() - phase_started >=
+        (uint64_t)_loop_phase_deadline_ms(e->phase) * 1000000ULL) {
+      /* The deadline break: control per phase + engine end failed — the
+         old loop's cell-timeout rule, per the awaited phase. The stall's
+         own message is the diagnosis (the awaited reply routes whenever it
+         lands; late engine replies drop loud). */
+      const char* kind = "store-timeout";
+      if (e->phase == FRAME_PHASE_CELL) kind = "cell-timeout";
+      else if (e->phase == FRAME_PHASE_MODEL) kind = "model-await";
+      log_error("loop: the engine at '%s' awaited phase %u past its %u ms "
+                "deadline — the engine ends failed loud", frame_sid(f),
+                (unsigned)e->phase, _loop_phase_deadline_ms(e->phase));
+      _loop_control(f, kind, NULL);
+      _loop_engine_end(f, e, 1);
+      break;
+    }
+    platform_sleep_ms(1);
+  }
+
+  _loop_driver_drain_store(f);
+  /* 2 on the CHILDREN yield (live; Task 5 fills the branch), else 0 clean
+     / 1 failed loud by the terminal step's engine_failed. */
+  if (e->phase == FRAME_PHASE_CHILDREN) return 2;
+  return (e->engine_failed != 0) ? 1 : 0;
 }
 
 #endif /* SA_HAS_WDB */

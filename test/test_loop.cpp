@@ -218,7 +218,7 @@ TEST(TestLoop, TestScriptedLoopRunsCellAndCompletes) {
       R"json({"choices":[{"message":{"role":"assistant","content":"all done"}}]})json";
   std::vector<std::string> replies = {turn1, turn2};
 
-  scripted_model_t sm;
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
   sm.base.complete = scripted_complete;
   sm.replies = &replies;
   sm.steer_frame = NULL;
@@ -290,7 +290,7 @@ TEST(TestLoop, TestSteeringBetweenTurnsReordersCells) {
       R"json({"choices":[{"message":{"role":"assistant","content":"both cells ran"}}]})json";
   std::vector<std::string> replies = {turn1, turn2, turn3};
 
-  scripted_model_t sm;
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
   sm.base.complete = scripted_complete;
   sm.replies = &replies;
   sm.steer_frame = f;
@@ -365,7 +365,7 @@ TEST(TestLoop, TestTurnLimitFailsLoud) {
       R"json({"type":"function","function":{"name":"execute",)json"
       R"json("arguments":"{\"code\":\"pass\"}"}}]}}]})json";
   std::vector<std::string> replies = {};
-  scripted_model_t sm;
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
   sm.base.complete = scripted_complete;
   sm.replies = &replies;
   sm.steer_frame = NULL;
@@ -415,7 +415,7 @@ TEST(TestLoop, TestSilentEmptyTurnLeavesControlTrail) {
 
   std::vector<std::string> replies = {
       R"json({"choices":[{"message":{"role":"assistant","content":""}}]})json"};
-  scripted_model_t sm;
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
   sm.base.complete = scripted_complete;
   sm.replies = &replies;
   sm.steer_frame = NULL;
@@ -442,6 +442,87 @@ TEST(TestLoop, TestSilentEmptyTurnLeavesControlTrail) {
   }
   EXPECT_TRUE(saw_empty_turn) << "an empty stop must be visible in the audit trail";
   EXPECT_EQ(frame_is_done(f), 1) << "the model chose to stop — the frame ends done";
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* The ASYNC scripted backend (the plan's Task-3 listing): submit copies what
+   it needs (the serialized messages), then fires the engine's model sink
+   EXACTLY ONCE, synchronously within submit (model.h's contract) with ONE
+   canned content-only completion — the sink posts the FRM_MODEL_RESULT, the
+   shape a production backend's loop-thread completion lands in after
+   model.c's relay forwards it. */
+typedef struct async_model_t {
+  model_backend_t base;
+  std::vector<std::string> replies;
+  std::vector<std::string> captured;
+} async_model_t;
+
+static int async_submit(void* self, json_value_t* messages, json_value_t* tools,
+                        model_response_sink_fn on_done, void* on_done_ctx) {
+  (void)tools;
+  async_model_t* am = (async_model_t*)self;
+  char* seen = json_serialize(messages);
+  if (seen != NULL) {
+    am->captured.emplace_back(seen);
+    free(seen);
+  }
+  if (am->replies.empty()) {
+    /* Rejected before any I/O: the sink never fires. */
+    return -1;
+  }
+  std::string body = am->replies.front();
+  am->replies.erase(am->replies.begin());
+  if (on_done == NULL) return -1;
+  char* heap_body = strdup(body.c_str());
+  if (heap_body == NULL) return -1;
+  on_done(on_done_ctx, 200, heap_body, strlen(heap_body), NULL);
+  return 0;
+}
+
+TEST(TestLoop, TestAsyncScriptedBackendDrivesTheSameEngine) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "async drive", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* The async scripted backend: submit() stashes the serialized messages and
+     POSTS an FRM_MODEL_RESULT straight back into the frame's mailbox (the
+     shape a production backend's loop-thread completion lands in after the
+     model.c relay forwards it) with ONE canned content-only completion. */
+  async_model_t am = {};   /* zero-init: the vtable's members are set explicitly below */
+  am.base.complete = NULL;                 /* async-only: the engine must take the submit path */
+  am.base.submit = async_submit;
+  am.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"async done"}}]})json");
+  frame_set_model_backend(f, &am.base);
+
+  /* The pump drives the SAME engine; the async step YIELDS at
+     FRAME_PHASE_MODEL and the posted result resumes it; the derive itself
+     rode the store actor's FRM_STORE_SCAN round trip before that. */
+  EXPECT_EQ(frame_run_loop(f), 0);
+  ASSERT_EQ(am.captured.size(), 1u);
+  EXPECT_NE(am.captured[0].find("Goal: async drive"), std::string::npos);
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  bool saw_assistant = false;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "msg.append") &&
+        strcmp(json_as_string(json_get(json_get(rec, "payload"), "role")),
+               "assistant") == 0 &&
+        strcmp(json_as_string(json_get(json_get(rec, "payload"), "content")),
+               "async done") == 0) {
+      saw_assistant = true;
+    }
+  }
+  EXPECT_TRUE(saw_assistant);
   json_value_destroy(events);
 
   frame_destroy(f);
@@ -550,7 +631,7 @@ TEST(TestLoop, TestRestartReplayRestoresSeqAndContext) {
 
   /* The replayed msg.append reaches the next turn's derived context: the
      content-only scripted model records what it was sent. */
-  recording_model_t rm;
+  recording_model_t rm = {};
   rm.base.complete = recording_complete;
   rm.replies.push_back(
       R"json({"choices":[{"message":{"role":"assistant","content":"resumed fine"}}]})json");

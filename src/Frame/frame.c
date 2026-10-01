@@ -218,8 +218,9 @@ static const char SA_FRAME_STATUS_DONE[] = "done";
 #define SA_FRAME_LINEAGE_SUBTREE "lineage"
 #define SA_FRAME_LINEAGE_PREDICATE "parent_of"
 
-/* frame_debug_events materialization bound: newest 512 records max. */
-#define SA_FRAME_DEBUG_MAX_EVENTS 512
+/* frame_debug_events materialization bound: newest 512 records max (the
+   SHARED bound rides frame_internal.h — frame.c's scans, the store actor's
+   scan replies, and the engine's FRM_STORE_SCAN must agree on the number). */
 
 struct wave_database_root_t {
   actor_t store_actor;        /* FIRST member (house rule: actor states lead
@@ -277,11 +278,21 @@ struct frame_t {
   uint64_t cell_pyrt_corr;    /* the pyrt executor corr it was handed as */
   uint8_t cell_status;        /* completion status of the pending/last cell */
   uint8_t stop_requested;     /* FRM_STOP: the loop drains, then stops */
-  /* The engine knob this slice's Task 1 carries (Task 3 adds the rest): set
-     by frame_start while ONE engine is live on the frame. Single-writer
-     discipline like the cell slot: every access is on the frame's dispatch
-     thread (an inline frame's owner thread) or before the actor runs. */
-  uint8_t engine_live;
+  /* The nesting depth of THIS frame's behavior dispatches (0 = not inside a
+     mailbox dispatch). The single-runner discipline keeps it exact; the sync
+     store APIs consult it: a caller INSIDE the frame's own dispatch can
+     never pump this frame's mailbox (a nested actor_run on the sentinel
+     queue frees the outer run's node — the ASan-proven reentrancy hazard),
+     so its writes go FIRE-AND-POST (the store's FIFO commits them ahead of
+     the engine's next awaited trip) and its result-returning reads refuse
+     loud instead of deadlocking. */
+  uint8_t dispatch_depth;
+  /* The TURN ENGINE's state (Task 3; the machine behind frame_start / the
+     FRM_TURN continuations — spec §1; loop.c's handlers lean on it through
+     _frame_engine_state). Single-writer discipline like the cell slot: every
+     access is on the frame's dispatch thread (an inline frame's owner
+     thread, or this actor's one pool worker). */
+  frame_engine_state_t engine;
   /* --- the store round trip (Task 2; §5) --------------------------------- */
   uint64_t store_corr_seq;          /* the frame's OWN round-trip key space:
                                        a nonzero allocator (0 = fire-and-post) */
@@ -563,7 +574,7 @@ static uint64_t _frame_seq_alloc(frame_t* f) {
   return f->seq;
 }
 
-static void _frame_seq_rollback(frame_t* f, uint64_t abandoned) {
+void _frame_seq_rollback(frame_t* f, uint64_t abandoned) {
   if (f == NULL || abandoned == 0) return;
   if (f->seq == abandoned) {
     f->seq = abandoned - 1;
@@ -612,12 +623,14 @@ static int _frame_bridge_pending_take(frame_t* f, uint64_t corr,
   return 0;
 }
 
-/* A post that hands ownership to the actor system: the DESTROY/dropped-send
-   case is checked from the target's flag (actor_send's return value means
-   "was busy", not "refused" — a queued message at a busy mailbox is still
-   delivered). Refusals log loud. */
-static void _frame_post(actor_t* target, uint32_t type, void* payload,
-                        void (*destroy)(void*), const char* what) {
+/* A post that hands ownership to the actor system (frame_internal.h's
+   contract — the store behaviors, the frame behaviors, AND the turn engine's
+   handlers all post through it): the DESTROY/dropped-send case is checked
+   from the target's flag (actor_send's return value means "was busy", not
+   "refused" — a queued message at a busy mailbox is still delivered).
+   Refusals log loud. */
+void _frame_post(actor_t* target, uint32_t type, void* payload,
+                 void (*destroy)(void*), const char* what) {
   message_t m;
   m.type = type;
   m.payload = payload;
@@ -655,6 +668,17 @@ static void _store_reply_send(actor_t* reply_to, uint64_t corr, int rc,
               "store reply");
 }
 
+/* 1 when the frame's OWN behavior is on the call stack (a NESTED sync
+   caller): such a caller must never pump this frame's mailbox — a nested
+   actor_run's pop frees the outer run's node (the sentinel queue's design;
+   the ASan-proven reentrancy hazard) and a nested await would deadlock on a
+   reply its own dispatch has to return first. The sync write paths respond
+   with fire-and-post (the store's FIFO commits the batch ahead of the
+   engine's next awaited trip) and the result-returning reads refuse loud. */
+static uint8_t _frame_nested_sync(const frame_t* f) {
+  return (f != NULL && f->dispatch_depth > 0) ? 1 : 0;
+}
+
 /* The synchronous round-trip refusal (§5's inline-only rule): the direct
    sync APIs pump-wait, and a POOLED store's pacing belongs to its workers —
    mixing an arbitrary caller's thread into pool-driven serialization would
@@ -685,6 +709,132 @@ void _frame_pump(frame_t* f) {
   if (f->root != NULL && f->root->store_pool == NULL) {
     actor_run(&f->root->store_actor, ACTOR_BATCH_SIZE);
   }
+}
+
+actor_t* _frame_store_actor(frame_t* f) {
+  return (f != NULL && f->root != NULL) ? &f->root->store_actor : NULL;
+}
+
+uint8_t _frame_store_pooled(const frame_t* f) {
+  return (f != NULL && f->root != NULL && f->root->store_pool != NULL) ? 1 : 0;
+}
+
+uint64_t _frame_store_corr_next(frame_t* f) {
+  return (f != NULL) ? ++f->store_corr_seq : 0;
+}
+
+frame_engine_state_t* _frame_engine_state(frame_t* f) {
+  return (f != NULL) ? &f->engine : NULL;
+}
+
+/* The content path's ONE atomic turn-end batch (frame_internal.h's
+   contract): the assistant msg.append — or, on an empty assistant turn, the
+   empty-turn control event (the exact payload _loop_control composes) — at
+   the frame's PRE-ALLOCATED seq, plus the meta/status=done put for a TOP
+   engine, in ONE root batch. The old loop wrote msg.append and the status as
+   two separate awaited writes; one atomic batch keeps the turn's message +
+   its completion from ever half-applying. */
+int _frame_engine_finish_post(frame_t* f, const char* append_text,
+                              int write_status, uint64_t corr,
+                              actor_t* reply_to) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: finish batch on a dead frame");
+    return -1;
+  }
+  json_value_t* payload = json_new_object();
+  const char* type_name = (append_text != NULL) ? "msg.append" : "control";
+  if (payload == NULL) {
+    log_error("frame: out of memory building the finish payload");
+    return -1;
+  }
+  if (append_text != NULL) {
+    json_object_set(payload, "role", json_new_string("assistant"));
+    json_object_set(payload, "content", json_new_string(append_text));
+  } else {
+    json_object_set(payload, "kind", json_new_string("empty-turn"));
+    json_object_set(payload, "text", json_new_null());
+  }
+
+  uint64_t seq = _frame_seq_alloc(f);
+  char* text = _frame_event_json(f, seq, type_name, payload);  /* consumes payload */
+  char* evkey = (text != NULL) ? _frame_event_key(f->sid_path, seq) : NULL;
+  char* status_val = (write_status != 0)
+      ? (char*)get_memory(strlen(SA_FRAME_STATUS_DONE) + 1) : NULL;
+  if (status_val != NULL) {
+    memcpy(status_val, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
+  }
+  frm_store_op_t put_ops[2];
+  size_t nops = 0;
+  put_ops[nops].key = evkey;                    /* OWNED by the round trip */
+  put_ops[nops].value = (uint8_t*)text;         /* OWNED */
+  put_ops[nops].value_len = (text != NULL) ? strlen(text) : 0;
+  nops++;
+  if (status_val != NULL) {
+    char* k_status = _frame_subkey(f->sid_path, "meta/status");
+    put_ops[nops].key = k_status;               /* OWNED */
+    put_ops[nops].value = (uint8_t*)status_val; /* OWNED */
+    put_ops[nops].value_len = strlen(SA_FRAME_STATUS_DONE);
+    nops++;
+  }
+  /* The batch cap: the composers mirror the store behavior's check —
+     never truncation (the event record alone already carries the big
+     text; the status put adds only its fixed-size key). */
+  size_t total = 0;
+  for (size_t i = 0; i < nops; i++) {
+    if (put_ops[i].key == NULL || put_ops[i].value == NULL) {
+      log_error("frame: out of memory composing the finish batch at '%s'",
+                f->sid_path);
+      for (size_t j = 0; j < nops; j++) {
+        free((void*)put_ops[j].key);
+        free((void*)put_ops[j].value);
+      }
+      _frame_seq_rollback(f, seq);
+      return -1;
+    }
+    total += strlen(put_ops[i].key) + put_ops[i].value_len;
+  }
+  if (total > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame: the finish batch at '%s' is %zu bytes, exceeding the "
+              "%d-byte WAL batch cap — refusing, never truncating",
+              f->sid_path, total, (int)SA_FRAME_MAX_BATCH_BYTES);
+    for (size_t i = 0; i < nops; i++) {
+      free((void*)put_ops[i].key);
+      free((void*)put_ops[i].value);
+    }
+    _frame_seq_rollback(f, seq);
+    return -1;
+  }
+
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  if (bp == NULL) {
+    log_error("frame: out of memory building the finish batch");
+    for (size_t i = 0; i < nops; i++) {
+      free((void*)put_ops[i].key);
+      free((void*)put_ops[i].value);
+    }
+    _frame_seq_rollback(f, seq);
+    return -1;
+  }
+  bp->ops = (frm_store_op_t*)get_clear_memory(nops * sizeof(frm_store_op_t));
+  if (bp->ops == NULL) {
+    log_error("frame: out of memory building the finish batch");
+    for (size_t i = 0; i < nops; i++) {
+      free((void*)put_ops[i].key);
+      free((void*)put_ops[i].value);
+    }
+    _frame_seq_rollback(f, seq);
+    free(bp);
+    return -1;
+  }
+  memcpy(bp->ops, put_ops, nops * sizeof(frm_store_op_t));
+  bp->nops = nops;
+  bp->op_name = "turn finish";                  /* BORROWED literal */
+  bp->reply_to = reply_to;
+  bp->corr = corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "finish batch");
+  return 0;
 }
 
 /* Bounded pure-drain pump-wait (the _frame_cell_wait shape) until `done_slot`
@@ -963,8 +1113,8 @@ static void _store_behavior(void* state, message_t* msg) {
    on every path. seq_out carries the PRE-ALLOCATED seq (also on the
    refusal paths — for a best-effort rollback). Returns 0 once POSTED;
    -1/-3 on the pre-post refusals (already logged; nothing was posted). */
-static int _frame_event_post(frame_t* f, const char* type_name, json_value_t* payload,
-                             uint64_t corr, actor_t* reply_to, uint64_t* seq_out) {
+int _frame_event_post(frame_t* f, const char* type_name, json_value_t* payload,
+                      uint64_t corr, actor_t* reply_to, uint64_t* seq_out) {
   if (seq_out != NULL) *seq_out = 0;
   if (f == NULL || f->st == NULL) {
     log_error("frame: event '%s' on a dead frame",
@@ -1009,20 +1159,24 @@ static int _frame_event_post(frame_t* f, const char* type_name, json_value_t* pa
 }
 
 /* Fire-and-post event write (corr 0, reply_to NULL): nothing awaits the
-   reply; a pre-post refusal is rolled back in the frame's own seq, a
-   store-stage one leaves the recorded gap (the store worker logs it). */
-static void _frame_event_post_fire(frame_t* f, const char* type_name,
-                                   json_value_t* payload) {
+   reply — the engine's control events and PYRT_RESULT's cell.result; a
+   pre-post refusal is rolled back in the frame's own seq, a store-stage one
+   leaves the recorded gap (the store worker logs it). Returns the pre-post
+   rc (0 = posted). */
+int _frame_event_post_fire(frame_t* f, const char* type_name,
+                           json_value_t* payload) {
   uint64_t seq = 0;
   int rc = _frame_event_post(f, type_name, payload, 0, NULL, &seq);
   if (rc != 0) _frame_seq_rollback(f, seq);
+  return rc;
 }
 
-/* The loop's SYNC-SEMANTICS write (frame_internal.h contract): post the
-   event batch with a sync corr and pump-wait the reply — the caller keeps
-   today's "rc 0 = committed" contract. POOLED store: refuse loud (the sync
-   store API is inline-only; the engine's own writes ride fire-and-post/round
-   trips instead). */
+/* The SYNC-SEMANTICS write (frame_internal.h contract): post the event
+   batch with a sync corr and pump-wait the reply — the caller keeps the
+   "rc 0 = committed" contract. Its callers are the direct sync APIs
+   (frame_append_msg etc.); the ENGINE's writes ride fire-and-post and the
+   awaited store round trips instead. POOLED store: refuse loud (the sync
+   store API is inline-only). */
 int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload) {
   if (f == NULL || f->st == NULL) {
     log_error("frame: event '%s' on a dead frame",
@@ -1033,6 +1187,15 @@ int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload)
   if (_frame_sync_store_refused(f, "event write")) {
     json_value_destroy(payload);
     return -1;
+  }
+  if (_frame_nested_sync(f)) {
+    /* A caller inside this frame's own dispatch cannot await its reply (the
+       reply routes when this very dispatch returns) — fire-and-post: the
+       store's FIFO commits it ahead of the engine's next awaited trip, and
+       a store-stage refusal is the store worker's loud log. */
+    log_info("frame: a nested event write '%s' at '%s' posts fire-and-post "
+             "(no await inside a dispatch)", type_name, f->sid_path);
+    return _frame_event_post_fire(f, type_name, payload);
   }
   uint64_t seq = 0;
   free(f->sync.text);
@@ -1174,6 +1337,13 @@ static int _frame_remember_sync(frame_t* f, const char* key, const char* json_va
     return -1;
   }
   if (_frame_sync_store_refused(f, "remember")) return -1;
+  if (_frame_nested_sync(f)) {
+    /* Nested (inside this frame's own dispatch): fire-and-post, no await. */
+    uint64_t nseq = 0;
+    int nrc = _frame_remember_post(f, key, json_value, state_prefix, 0, NULL, &nseq);
+    if (nrc != 0) _frame_seq_rollback(f, nseq);
+    return (nrc == 0) ? 0 : nrc;
+  }
   uint64_t seq = 0;
   free(f->sync.text);
   memset(&f->sync, 0, sizeof(f->sync));
@@ -1435,8 +1605,14 @@ static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
     return;
   }
 
-  /* 4. The engine's store round trips (Task 3): loop.c's handlers route
-     here when a turn store trip is in flight. */
+  /* 4. The engine's store round trips (Task 3): loop.c's handler continues
+     the turn step inside this dispatch (the payload's ownership moves with
+     it) when the engine awaits one. */
+  if (f->engine.engine_live != 0 && f->engine.phase == FRAME_PHASE_STORE &&
+      f->engine.store_corr != 0 && r->corr == f->engine.store_corr) {
+    _frame_engine_store_reply(f, r);   /* consumes the payload */
+    return;
+  }
 
   /* 5. The registered cell-verb bridge corrs. */
   {
@@ -1463,7 +1639,7 @@ static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
   frm_store_reply_payload_destroy(r);
 }
 
-static void _frame_behavior(void* state, message_t* msg) {
+static void _frame_behavior_impl(void* state, message_t* msg) {
   frame_t* f = (frame_t*)state;
   if (msg == NULL) return;
   switch (msg->type) {
@@ -1638,10 +1814,17 @@ static void _frame_behavior(void* state, message_t* msg) {
              this same dispatch exactly as today, and the event's commitment
              is FIFO-ahead of anything the frame posts after it (the next
              derive's scan). */
-          _frame_event_post_fire(f, "cell.result", result_payload);
+          if (_frame_event_post_fire(f, "cell.result", result_payload) != 0) {
+            log_error("frame: the cell.result event for corr %llu was refused "
+                      "pre-post at '%s' (already logged)",
+                      (unsigned long long)f->cell_corr, f->sid_path);
+          }
         }
         f->cell_status = r->status;
         f->cell_pending = 0;
+        /* The engine awaits the cell (Task 3): repost the turn continuation
+           — a no-op unless the engine is live in FRAME_PHASE_CELL. */
+        _frame_engine_cell_done(f);
       } else {
         log_error("frame: unclaimed PYRT_RESULT corr %llu at '%s' — no "
                   "pending cell matches; dropping",
@@ -1652,16 +1835,29 @@ static void _frame_behavior(void* state, message_t* msg) {
     }
 #endif
     case FRM_TURN:
-      /* Task-1's temporary holder (Task 3's engine replaces it): a
-         scheduled turn-step continuation. With no engine behaviors yet the
-         continuation is a LATE DROP — loud, then the engine knob clears so
-         a driver may restart (Task 3's engine consumes FRM_TURN for real).
-         No payload to destroy. */
-      f->engine_live = 0;
-      log_error("frame: FRM_TURN late-dropped at '%s' — no turn engine is "
-                "wired yet (Task 3's loop replaces this holder)",
-                f->sid_path);
+      /* The engine's scheduled turn-step continuation (Task 3): ONE turn
+         step — the checks and the derive's store round trip — then a yield,
+         with the step continued by the arrival dispatches. No payload. */
+      _frame_engine_turn(f);
       break;
+    case FRM_MODEL_RESULT: {
+      /* The model completion arrived RAW (the engine's sink posts it — the
+         Task-4 http relay forwards into this same shape): the frame's OWN
+         dispatch decodes it (loop.c) and processes the reply. Consumed on
+         every path. */
+      frm_model_payload_t* mp = (frm_model_payload_t*)msg->payload;
+      msg->payload = NULL;
+      _frame_engine_model_arrived(f, mp);
+      break;
+    }
+    case FRM_CHILD_REPORT: {
+      /* The child-engine terminal resume (Task 5 fills the behavior; Task 3
+         declares the route here). Consumed on every path. */
+      frm_child_report_payload_t* crp = (frm_child_report_payload_t*)msg->payload;
+      msg->payload = NULL;
+      _frame_engine_child_report(f, crp);
+      break;
+    }
     case FRM_STOP:
       /* Control, not interruption: a cell in flight runs to its boundary;
          the loop (which pumps this inbox) drains and then stops. */
@@ -1765,6 +1961,16 @@ static void _frame_behavior(void* state, message_t* msg) {
     default:
       break;
   }
+}
+
+/* The behavior's dispatch wrapper: tracks THIS frame's dispatch depth around
+   the real switch — the sync store APIs consult it (see frame_t's
+   dispatch_depth note: a nested caller must never pump this frame's mailbox). */
+static void _frame_behavior(void* state, message_t* msg) {
+  frame_t* f = (frame_t*)state;
+  if (f != NULL) f->dispatch_depth++;
+  _frame_behavior_impl(state, msg);
+  if (f != NULL) f->dispatch_depth--;
 }
 
 /* Test/synchronous entry point (frame.h): route a message through the SAME
@@ -2409,28 +2615,10 @@ void frame_set_loop_turn_cap(frame_t* f, unsigned cap) {
 }
 
 int frame_start(frame_t* f) {
-  if (!_frame_is_live(f)) {
-    log_error("frame_start: dead frame");
-    return -1;
-  }
-  if (f->engine_live) {
-    log_error("frame_start: an engine is already live at '%s' — ONE engine "
-              "per frame", f->sid_path);
-    return -1;
-  }
-  f->engine_live = 1;   /* cleared again by the engine's terminal step (Task
-                           3's handlers replace this task's late-drop case) */
-  message_t m;
-  m.type = (uint32_t)FRM_TURN;
-  m.payload = NULL;
-  m.payload_destroy = NULL;
-  if (!actor_send(&f->actor, &m)) {
-    f->engine_live = 0;
-    log_error("frame_start: the turn continuation was refused at '%s'",
-              f->sid_path);
-    return -1;
-  }
-  return 0;
+  /* The engine's start contract lives with the turn engine (loop.c): the
+     dead-frame / already-live refuses, the per-run knob reset, and the ONE
+     FRM_TURN continuation it queues. */
+  return _frame_engine_start(f);
 }
 
 scheduler_pool_t* frame_pool(const frame_t* f) {
@@ -2492,6 +2680,17 @@ void frame_destroy(frame_t* f) {
   }
   free(f->sync.text);
   f->sync.text = NULL;
+  if (f->engine.turn_reply != NULL) {
+    /* A live engine's in-flight turn reply dies here (a destroy mid-turn —
+       the engine state is not the queue's business). */
+    if (f->engine.engine_live != 0) {
+      log_error("frame: the engine of '%s' was destroyed mid-turn (its "
+                "in-flight model reply and awaited store trip die with it)",
+                f->sid_path);
+    }
+    model_reply_destroy(f->engine.turn_reply);
+    f->engine.turn_reply = NULL;
+  }
   if (f->spawn_slot.child != NULL) {
     log_error("frame: an uncommitted spawn admission for '%s' is abandoned "
               "at teardown of '%s'", frame_sid(f->spawn_slot.child),
@@ -2553,6 +2752,13 @@ char* frame_recall(frame_t* f, const char* key) {
      corr-matched reply (§5: synchronous by PUMPING, never by locking). */
   if (f == NULL || f->st == NULL || !_frame_key_valid(key, "recall")) return NULL;
   if (_frame_sync_store_refused(f, "recall")) return NULL;
+  if (_frame_nested_sync(f)) {
+    log_error("frame: nested recall '%s' at '%s' refuses loud — a read can "
+              "never return from inside the frame's own dispatch (the engine "
+              "and the cell verbs use the store-actor round trips)",
+              key, f->sid_path);
+    return NULL;
+  }
   free(f->sync.text);
   memset(&f->sync, 0, sizeof(f->sync));
   f->sync.in_use = 1;
@@ -2830,6 +3036,11 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
     return NULL;
   }
   if (_frame_sync_store_refused(parent, "spawn")) return NULL;
+  if (_frame_nested_sync(parent)) {
+    log_error("frame_spawn: a nested spawn refuses loud — the admission "
+              "cannot be awaited from inside the frame's own dispatch");
+    return NULL;
+  }
   uint64_t corr = ++parent->store_corr_seq;
   frame_t* child = _frame_spawn_post(parent, goal, context_json, 0, corr);
   if (child == NULL) return NULL;
@@ -3046,6 +3257,11 @@ int frame_report(frame_t* child, const char* text) {
     return -1;
   }
   if (_frame_sync_store_refused(child, "report")) return -1;
+  if (_frame_nested_sync(child)) {
+    log_error("frame_report: a nested report refuses loud — the bind "
+              "cannot be awaited from inside the frame's own dispatch");
+    return -1;
+  }
   int rc = _frame_report_bind_post(child, 0, 0, text);
   if (rc != 0) {
     child->bind_slot.in_use = 0;
@@ -3078,6 +3294,11 @@ int frame_join(frame_t* child) {
     return -1;
   }
   if (_frame_sync_store_refused(parent, "join")) return -1;
+  if (_frame_nested_sync(parent)) {
+    log_error("frame_join: a nested join refuses loud — the batch cannot be "
+              "awaited from inside the parent's own dispatch");
+    return -1;
+  }
 
   uint64_t pseq = _frame_seq_alloc(parent);
   json_value_t* payload = json_new_object();
