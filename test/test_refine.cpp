@@ -14,6 +14,7 @@ extern "C" {
 #include "../src/Util/allocator.h"
 #include "../src/Frame/refine.h"
 #include "../src/Frame/frame_internal.h"   /* Task 3's _frame_sync_* helpers */
+#include "../src/Frame/model_internal.h"   /* Task 4's _model_request_body */
 }
 
 #include <string>
@@ -1039,6 +1040,582 @@ TEST(TestRefine, TestSyncScanReturnsNewestAscendingAsJointArray) {
   EXPECT_STREQ(empty, "[]");
   free(empty);
 
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 4: the no-tools review call + the proposal decode (row 18)     */
+/* ------------------------------------------------------------------ */
+
+/* PA's TRUNCATED_JSON_ERROR (refinement.ts:198-199, verbatim): the output
+   cap's refusal AND the incomplete-JSON diagnosis share the one wording. */
+static const char* const kTruncatedJson =
+    "the model stopped before completing its JSON object. This usually means "
+    "the output budget was exhausted; retry with a smaller request.";
+
+/* The scripted review backend (test_loop.cpp's scripted_complete idiom,
+   narrowed to the review's needs): EVERY call captures the tools DOM's
+   kind (-1 = a NULL POINTER, never seen here) and the serialized messages
+   array, then answers with sm->content as the decoded reply's content —
+   the review consumes ONLY content (no tool surface exists to carry a call). */
+typedef struct scripted_review_model_t {
+  model_backend_t base;
+  std::string content;          /* the canned reply content per call */
+  std::string captured_messages;
+  int tools_kind;               /* the tools ARGUMENT's json_type_e value */
+  int calls;
+} scripted_review_model_t;
+
+static int scripted_review_complete(void* self, json_value_t* messages,
+                                    json_value_t* tools, char** raw_out,
+                                    model_reply_t** reply_out, char** error_out) {
+  (void)raw_out;
+  (void)error_out;
+  scripted_review_model_t* sm = (scripted_review_model_t*)self;
+  sm->calls++;
+  /* The whole point of row 18: the review's tools argument is a JSON-null
+     DOM — the EXPLICIT no-tools shape the request builder then omits —
+     never a NULL pointer (which would compose the execute tool). */
+  sm->tools_kind = (tools == NULL) ? -1 : (int)json_type(tools);
+  char* seen = json_serialize(messages);
+  if (seen != NULL) {
+    sm->captured_messages.assign(seen);
+    free(seen);
+  }
+  model_reply_t* r = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
+  r->content = refi_dup(sm->content.c_str());
+  r->tool_code = NULL;
+  r->finish_reason = refi_dup("stop");
+  *reply_out = r;
+  return 0;
+}
+
+/* The model.c JSON-null omission, through the exported test surface: a
+   request built with tools = json_new_null() carries NEITHER a "tools"
+   nor a "tool_choice" key, while a build with tools = NULL (the pointer,
+   unchanged behavior) still carries the execute tool. The model/tool-free
+   body must be a valid request otherwise (model key + messages array
+   present, the tools-array shape carried verbatim with tool_choice auto). */
+TEST(TestRefine, TestRequestBodyOmitsToolsOnJsonNull) {
+  json_value_t* msgs = json_new_array();
+  json_value_t* m = json_new_object();
+  json_object_set(m, "role", json_new_string("user"));
+  json_object_set(m, "content", json_new_string("review the trajectory"));
+  json_array_append(msgs, m);
+  ASSERT_EQ(json_size(msgs), 1u);
+
+  /* The JSON-null tools: BOTH tool keys OMITTED from the document. */
+  json_value_t* no_tools = json_new_null();
+  char* body = NULL;
+  char* err = NULL;
+  ASSERT_EQ(_model_request_body("review-model", msgs, no_tools, &body, &err), 0)
+      << (err != NULL ? err : "(no error string)");
+  ASSERT_NE(body, nullptr);
+  json_value_t* req = json_parse(body, strlen(body), &err);
+  ASSERT_NE(req, nullptr) << "the tool-free body is a valid JSON request: " << body;
+  ASSERT_EQ(json_type(req), JSON_OBJECT);
+  json_value_t* model_v = json_get(req, "model");
+  ASSERT_NE(model_v, nullptr);
+  ASSERT_EQ(json_type(model_v), JSON_STRING);
+  EXPECT_STREQ(json_as_string(model_v), "review-model");
+  json_value_t* msgs_out = json_get(req, "messages");
+  ASSERT_NE(msgs_out, nullptr);
+  ASSERT_EQ(json_type(msgs_out), JSON_ARRAY);
+  ASSERT_EQ(json_size(msgs_out), 1u);
+  EXPECT_EQ(json_get(req, "tools"), nullptr)
+      << "a JSON-null tools argument carries NO tools key";
+  EXPECT_EQ(json_get(req, "tool_choice"), nullptr)
+      << "a JSON-null tools argument carries NO tool_choice key";
+  json_value_destroy(req);
+  free(body);
+
+  /* The NULL-POINTER shape is UNCHANGED (the turn loop's contract): the
+     canned execute tool rides with tool_choice auto. */
+  char* body2 = NULL;
+  err = NULL;
+  ASSERT_EQ(_model_request_body("review-model", msgs, NULL, &body2, &err), 0);
+  ASSERT_NE(body2, nullptr);
+  req = json_parse(body2, strlen(body2), &err);
+  ASSERT_NE(req, nullptr) << "the execute-tool body is a valid request: " << body2;
+  json_value_t* tools_out = json_get(req, "tools");
+  ASSERT_NE(tools_out, nullptr);
+  ASSERT_EQ(json_type(tools_out), JSON_ARRAY);
+  ASSERT_EQ(json_size(tools_out), 1u);
+  json_value_t* tool0 = json_at(tools_out, 0);
+  ASSERT_NE(tool0, nullptr);
+  json_value_t* fn = json_get(tool0, "function");
+  ASSERT_NE(fn, nullptr);
+  json_value_t* name = json_get(fn, "name");
+  ASSERT_NE(name, nullptr);
+  EXPECT_STREQ(json_as_string(name), "execute");
+  json_value_t* choice = json_get(req, "tool_choice");
+  ASSERT_NE(choice, nullptr);
+  EXPECT_STREQ(json_as_string(choice), "auto");
+  json_value_destroy(req);
+  free(body2);
+
+  /* The tools-ARRAY shape is unchanged too: the given array rides
+     verbatim (model.c's documented superset shape). */
+  json_value_t* scripted_tools = json_new_array();
+  json_value_t* cell = json_new_object();
+  json_object_set(cell, "type", json_new_string("function"));
+  json_object_set(cell, "name", json_new_string("probe_tool"));
+  json_array_append(scripted_tools, cell);
+  char* body3 = NULL;
+  err = NULL;
+  ASSERT_EQ(_model_request_body("review-model", msgs, scripted_tools, &body3, &err), 0);
+  ASSERT_NE(body3, nullptr);
+  req = json_parse(body3, strlen(body3), &err);
+  ASSERT_NE(req, nullptr);
+  json_value_t* carried = json_get(req, "tools");
+  ASSERT_NE(carried, nullptr);
+  ASSERT_EQ(json_size(carried), 1u);
+  json_value_t* carried_name = json_get(json_at(carried, 0), "name");
+  ASSERT_NE(carried_name, nullptr);
+  EXPECT_STREQ(json_as_string(carried_name), "probe_tool")
+      << "the array tools ride verbatim";
+  EXPECT_NE(json_get(req, "tool_choice"), nullptr);
+  json_value_destroy(req);
+  json_value_destroy(scripted_tools);
+  free(body3);
+
+  json_value_destroy(no_tools);
+  json_value_destroy(msgs);
+}
+
+/* The scripted review backend (test_loop.cpp's scripted_complete idiom) is
+   invoked BY refine_review and ASSERTS it received a tools DOM whose type
+   is JSON_NULL (not a NULL pointer) — the end-to-end shape guard (the
+   model never meets refine as a tool, spec §7). */
+TEST(TestRefine, TestReviewCallPassesJsonNullTools) {
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+
+  /* Seed the trajectory the review will read: two msg.append events whose
+     text the bounded view must carry. */
+  ASSERT_EQ(frame_append_msg(f, "user", "the chunked body decoded in place"), 0);
+  ASSERT_EQ(frame_append_msg(f, "assistant", "noted the chunked-body lesson"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;   /* the sync-scripted shape */
+  sm.content =
+      "{\"summary\":\"Chunked bodies decode in place\","
+      "\"rationale\":\"The chunked-body turn proved decoding happens in place\","
+      "\"edits\":[{\"action\":\"create\",\"kind\":\"memory\","
+      "\"title\":\"Chunked bodies decode silently\","
+      "\"content\":\"A chunked body decodes in place\","
+      "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"the "
+      "chunked-body turn\"},\"reason\":\"the chunked turn proved it\"}]}";
+  frame_set_model_backend(f, &sm.base);
+
+  refine_fold_t fold;
+  mk_fold_init(&fold);
+  ASSERT_NE(mk_fold_seed(&fold, "memory", "chunked_bodies", 1), nullptr);
+
+  char* traj = NULL;
+  refine_edit_t* edits = NULL;
+  size_t nedits = 99;   /* sentinel: the call zeroes every out-slot first */
+  char* summary = NULL;
+  char* rationale = NULL;
+  char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(),
+                                     "focus on chunked bodies", &traj, &edits,
+                                     &nedits, &summary, &rationale);
+  ASSERT_EQ(refusal, nullptr) << "the scripted review decodes: "
+                              << (refusal != NULL ? refusal : "(none)");
+  ASSERT_EQ(sm.calls, 1);
+
+  /* THE SHAPE GUARD: the backend received a JSON_NULL tools DOM. */
+  EXPECT_EQ(sm.tools_kind, (int)JSON_NULL)
+      << "tools is a JSON-null DOM, never a NULL pointer (-1) nor an array";
+
+  /* The bounded trajectory view the review consumed rides back to the
+     caller (produced HERE, freed by the CALLER). */
+  ASSERT_NE(traj, nullptr);
+  EXPECT_NE(strstr(traj, "the chunked body decoded in place"), nullptr)
+      << "the trajectory view carries the seeded event text: " << traj;
+  char* perr = NULL;
+  json_value_t* traj_arr = json_parse(traj, strlen(traj), &perr);
+  if (perr != NULL) free(perr);
+  ASSERT_NE(traj_arr, nullptr) << "the trajectory view stays parseable JSON";
+  ASSERT_EQ(json_type(traj_arr), JSON_ARRAY);
+  ASSERT_GE(json_size(traj_arr), 2u) << "both seeded events ride: " << traj;
+  json_value_destroy(traj_arr);
+
+  /* The review prompt carried the spec §3 step-4 sections (the captured
+     messages array). */
+  const std::string& seen = sm.captured_messages;
+  EXPECT_NE(seen.find("<current_harness_state>"), std::string::npos);
+  EXPECT_NE(seen.find("- chunked_bodies"), std::string::npos)
+      << "the current digest's entry line rides in the digest section";
+  EXPECT_NE(seen.find("<refinement_history>"), std::string::npos);
+  EXPECT_NE(seen.find("No prior refinement history."), std::string::npos)
+      << "an empty fold renders the empty-history line";
+  EXPECT_NE(seen.find("<trajectory>"), std::string::npos);
+  EXPECT_NE(seen.find("the chunked body decoded in place"), std::string::npos);
+  EXPECT_NE(seen.find("<user_refine_instructions>"), std::string::npos);
+  EXPECT_NE(seen.find("focus on chunked bodies"), std::string::npos);
+  EXPECT_EQ(seen.find("<shared_harness_context>"), std::string::npos)
+      << "an empty shared scope adds no read-only-context section";
+
+  /* The decoded proposal: one evidence-backed memory create. */
+  ASSERT_EQ(nedits, 1u);
+  ASSERT_NE(edits, nullptr);
+  EXPECT_STREQ(edits[0].action, "create");
+  EXPECT_STREQ(edits[0].kind, "memory");
+  EXPECT_EQ(edits[0].id, nullptr)
+      << "a create's id stays NULL — the slug derives at apply time "
+         "(refine.h: id NULL on create = slug(title, kind))";
+  EXPECT_STREQ(edits[0].title, "Chunked bodies decode silently");
+  EXPECT_STREQ(edits[0].content, "A chunked body decodes in place");
+  EXPECT_EQ(edits[0].expect_version, 0u);
+  EXPECT_EQ(edits[0].evidence_first, 1u);
+  EXPECT_EQ(edits[0].evidence_last, 2u);
+  EXPECT_STREQ(edits[0].reason, "the chunked turn proved it")
+      << "the edit's top-level reason feeds the record's evidence summary";
+  EXPECT_NE(summary, nullptr);
+  EXPECT_STREQ(summary, "Chunked bodies decode in place");
+  EXPECT_NE(rationale, nullptr);
+  EXPECT_STREQ(rationale, "The chunked-body turn proved decoding happens in place");
+
+  for (size_t i = 0; i < nedits; i++) refine_edit_destroy(&edits[i]);
+  free(edits);
+  free(traj);
+  free(summary);
+  free(rationale);
+  refine_fold_destroy(&fold);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* The trajectory's bounded tail slice (PA planRefinement's .slice(-80_000),
+   refinement.ts:1258): an over-cap joined scan text drops WHOLE OLDEST
+   records — never a mid-document cut — so the view stays a parseable array
+   holding a CONTIGUOUS newest run, never exceeds
+   SA_REFINE_TRAJECTORY_CHARS, and the newest record always survives. */
+TEST(TestRefine, TestReviewTrajectoryTailSliceDropsWholeOldestRecords) {
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+
+  /* Seed 24 bulk event records (~4 KB each, ~98 KB joined — past the
+     80,000-char cap but inside the frame's 120 KB seed batch), the oldest
+     carrying marker_0, the newest marker_23. The keys mirror frame.c's
+     REAL event-key shape ("events/%020llu") so the scan's ascending order
+     is the numeric seq order. */
+  frm_store_op_t* ops =
+      (frm_store_op_t*)get_clear_memory(24 * sizeof(frm_store_op_t));
+  char zkey[32];
+  for (uint64_t s = 0; s < 24; s++) {
+    std::string rec =
+        "{\"seq\":" + std::to_string(s) + ",\"type\":\"probe.bulk\","
+        "\"payload\":{\"blob\":\"" + std::string(4000, 'x') +
+        "\",\"marker\":\"marker_" + std::to_string(s) + "\"}}";
+    snprintf(zkey, sizeof(zkey), "%020llu", (unsigned long long)s);
+    ops[s].key = strdup((sid + "/events/" + zkey).c_str());
+    ops[s].value = (uint8_t*)strdup(rec.c_str());
+    ops[s].value_len = rec.size();
+  }
+  EXPECT_EQ(_frame_sync_batch(f, ops, 24, "bulk event seed"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.content =
+      "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":[]}";
+  frame_set_model_backend(f, &sm.base);
+
+  refine_fold_t fold;
+  mk_fold_init(&fold);
+  char* traj = NULL;
+  refine_edit_t* edits = NULL;
+  size_t nedits = 0;
+  char* summary = NULL;
+  char* rationale = NULL;
+  char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                     &traj, &edits, &nedits, &summary,
+                                     &rationale);
+  ASSERT_EQ(refusal, nullptr);
+  ASSERT_NE(traj, nullptr);
+  ASSERT_LE(strlen(traj), (size_t)SA_REFINE_TRAJECTORY_CHARS)
+      << "the bounded view never exceeds the cap";
+  ASSERT_GE(strlen(traj), 2u);
+
+  /* Parseable array, a contiguous NEWEST run: kept seqs are exactly
+     (24 - size)..23 in ascending order. */
+  char* perr = NULL;
+  json_value_t* arr = json_parse(traj, strlen(traj), &perr);
+  if (perr != NULL) free(perr);
+  ASSERT_NE(arr, nullptr) << "the sliced view stays parseable: " << traj;
+  ASSERT_EQ(json_type(arr), JSON_ARRAY);
+  size_t kept = json_size(arr);
+  ASSERT_GE(kept, 1u);
+  ASSERT_LT(kept, 24u) << "the cap DROPPED oldest records (the seed overflows)";
+  for (size_t i = 0; i < kept; i++) {
+    json_value_t* rec =
+        json_parse(json_as_string(json_at(arr, i)), strlen(json_as_string(json_at(arr, i))), NULL);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)(24 - (kept - i)))
+        << "the kept run is the contiguous newest block";
+    json_value_destroy(rec);
+  }
+  json_value_destroy(arr);
+
+  /* The newest record survives; the oldest records fall past the cap. */
+  EXPECT_NE(strstr(traj, "marker_23"), nullptr);
+  EXPECT_EQ(strstr(traj, "marker_0"), nullptr);
+
+  /* The review consumed exactly the bounded view (the prompt section). */
+  EXPECT_NE(sm.captured_messages.find("marker_23"), std::string::npos);
+  EXPECT_EQ(sm.captured_messages.find("marker_0"), std::string::npos);
+
+  free(traj);
+  free(edits);   /* a zero-edit proposal sets none to free */
+  free(summary);
+  free(rationale);
+  refine_fold_destroy(&fold);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* The proposal decode: a fenced reply ("```json ... ```") parses after the
+   trim; > SA_REFINE_MAX_EDITS edits refuse with the PA truncation wording
+   (kTruncatedJson — refinement.ts:199's shape; the cap is the refuse-loud
+   stand-in for the output reserve, spec §4); a non-JSON reply refuses loud;
+   edits missing required fields refuse with the validateEdit strings. */
+TEST(TestRefine, TestProposalDecodeCapsAndFences) {
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  refine_fold_t fold;
+  mk_fold_init(&fold);
+
+  /* 1. The fence: a prose-wrapped "```json ... ```" reply parses after the
+        trim (the decode's fence-trim; the JSON-only contract tolerated at
+        the fence the models actually emit). */
+  sm.content =
+      "Here is my proposal:\n```json\n"
+      "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":["
+      "{\"action\":\"create\",\"kind\":\"memory\",\"title\":\"Fenced lesson\","
+      "\"content\":\"the fenced lesson content\","
+      "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}]}\n```\nGood luck.";
+  {
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_EQ(refusal, nullptr) << (refusal != NULL ? refusal : "(none)");
+    ASSERT_EQ(nedits, 1u);
+    ASSERT_NE(edits, nullptr);
+    EXPECT_STREQ(edits[0].title, "Fenced lesson");
+    EXPECT_EQ(edits[0].id, nullptr) << "the create's slug derives at apply";
+    EXPECT_STREQ(edits[0].content, "the fenced lesson content");
+    EXPECT_EQ(edits[0].evidence_first, 1u);
+    EXPECT_EQ(edits[0].evidence_last, 2u);
+    EXPECT_STREQ(summary, "s");
+    EXPECT_STREQ(rationale, "r");
+    for (size_t i = 0; i < nedits; i++) refine_edit_destroy(&edits[i]);
+    free(edits);
+    free(traj);
+    free(summary);
+    free(rationale);
+  }
+
+  /* 2. The cap: a proposal with MORE than SA_REFINE_MAX_EDITS edits
+        refuses with PA's truncation wording — refuse-loud, never a silent
+        truncation to the first 8. */
+  {
+    std::string proposal =
+        "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":[";
+    for (int i = 0; i <= SA_REFINE_MAX_EDITS; i++) {
+      if (i > 0) proposal += ",";
+      proposal += "{\"action\":\"create\",\"kind\":\"memory\",\"title\":"
+                  "\"cap edit " + std::to_string(i) + "\",\"content\":\"c\","
+                  "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}";
+    }
+    proposal += "]}";
+    sm.content = proposal;
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_NE(refusal, nullptr) << "the over-cap proposal refuses loud";
+    EXPECT_STREQ(refusal, kTruncatedJson);
+    free(refusal);
+    EXPECT_EQ(nedits, 0u) << "no partial decode on the cap refusal";
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_EQ(traj, nullptr) << "a refused review leaves NO outs set";
+    free(summary);
+    free(rationale);
+  }
+
+  /* 3. A non-JSON reply refuses loud: a brace-free prose reply carries PA's
+        fall-through wording (refinement.ts:963's "Refiner did not return a
+        JSON object"); a brace-bearing but malformed one carries the
+        "the model did not return valid JSON: <reason>" line. */
+  {
+    sm.content =
+        "I reviewed the trajectory and found nothing worth persisting.";
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_NE(refusal, nullptr);
+    EXPECT_STREQ(refusal, "Refiner did not return a JSON object");
+    free(refusal);
+    EXPECT_EQ(traj, nullptr);
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_EQ(summary, nullptr);
+    EXPECT_EQ(rationale, nullptr);
+  }
+
+  /* 3b. A brace-bearing but syntactically malformed reply refuses with the
+         PA valid-JSON line (balanced braces, so NOT the truncation
+         diagnosis; the json reason rides). */
+  {
+    sm.content = "{\"summary\":\"s\",\"edits\":[]}{invalid json}";
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_NE(refusal, nullptr);
+    EXPECT_NE(strstr(refusal, "the model did not return valid JSON: "), nullptr)
+        << refusal;
+    free(refusal);
+    EXPECT_EQ(traj, nullptr);
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_EQ(summary, nullptr);
+    EXPECT_EQ(rationale, nullptr);
+  }
+
+  /* 4. A truncated fence — no closing ``` — whose JSON never completes
+        names the PA truncation cause (the incomplete-JSON diagnosis). */
+  {
+    sm.content =
+        "```json\n{\"summary\":\"s\",\"edits\":[{\"action\":\"cr";
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_NE(refusal, nullptr);
+    EXPECT_STREQ(refusal, kTruncatedJson);
+    free(refusal);
+    EXPECT_EQ(traj, nullptr);
+  }
+
+  /* 5. Field-shape refusals carry the validateEdit strings (the DECODE
+        refuses loud — no partial decode). */
+  const struct {
+    const char* what;
+    const char* edit_json;
+    const char* expect_refusal;
+  } fields[] = {
+      {"update without title/content",
+       "{\"action\":\"update\",\"kind\":\"memory\",\"id\":\"mid\","
+       "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}",
+       "update requires title and content"},
+      {"delete without id",
+       "{\"action\":\"delete\",\"kind\":\"memory\","
+       "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}",
+       "delete requires id"},
+      {"unsupported kind",
+       "{\"action\":\"create\",\"kind\":\"note\",\"title\":\"t\",\"content\":\"c\","
+       "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}",
+       "unsupported kind note"},
+      {"unsupported action",
+       "{\"action\":\"patch\",\"kind\":\"memory\",\"title\":\"t\",\"content\":\"c\","
+       "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}",
+       "unsupported action patch"},
+      {"the base prompt id",
+       "{\"action\":\"update\",\"kind\":\"prompt\",\"id\":\"base_system_prompt\","
+       "\"title\":\"t\",\"content\":\"c\","
+       "\"evidence\":{\"first_seq\":1,\"last_seq\":2}}",
+       "base system prompt is not editable"},
+  };
+  for (const auto& field : fields) {
+    SCOPED_TRACE(field.what);
+    std::string proposal =
+        std::string("{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":[") +
+        field.edit_json + "]}";
+    sm.content = proposal;
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_NE(refusal, nullptr) << "a field-shape refusal refuses the decode";
+    EXPECT_STREQ(refusal, field.expect_refusal);
+    free(refusal);
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_EQ(traj, nullptr);
+    free(summary);
+    free(rationale);
+  }
+
+  /* 6. The EMPTY edits proposal is a VALID decode (zero edits — the no-op
+        proposal PA's contract asks for; Task 5's no-op rule consumes it). */
+  {
+    sm.content =
+        "{\"summary\":\"nothing to persist\",\"rationale\":\"no "
+        "evidence-backed lessons in the trajectory\",\"edits\":[]}";
+    char* traj = NULL;
+    refine_edit_t* edits = NULL;
+    size_t nedits = 0;
+    char* summary = NULL;
+    char* rationale = NULL;
+    char* refusal = refine_review_call(f, &fold, (sid + "/harness").c_str(), NULL,
+                                       &traj, &edits, &nedits, &summary,
+                                       &rationale);
+    ASSERT_EQ(refusal, nullptr) << "an empty edits proposal is a valid decode";
+    EXPECT_EQ(nedits, 0u);
+    EXPECT_EQ(edits, nullptr);
+    EXPECT_STREQ(summary, "nothing to persist");
+    EXPECT_STREQ(rationale, "no evidence-backed lessons in the trajectory");
+    free(traj);
+    free(summary);
+    free(rationale);
+  }
+
+  refine_fold_destroy(&fold);
   frame_destroy(f);
   wave_db_close(db);
 }

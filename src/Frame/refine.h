@@ -181,5 +181,38 @@ json_value_t* refine_record_edit_json(const refine_edit_t* e,
                                       int applied, const char* error,
                                       unsigned after_version);
 
+/* --- the review call (spec §3 step 4): compose, call, decode only --------- */
+
+/* The review pass (spec §3 step 4): builds
+   [system = REFINE_REVIEW_SYSTEM] + [user = <current digest> +
+   <prior-refinement tail from the fold> + <read-only-context digest for a
+   local run against the shared scope> + "[trajectory]" + <instructions?>]
+   and calls the frame's OWN backend (the frame-injected test backend wins;
+   the shared/sync complete() vtable) with tools = json_new_null() — NO tool
+   surface (spec §7).
+
+   The trajectory's newest SA_REFINE_SCAN_EVENTS event records are read HERE
+   (a bounded FRM_STORE_SCAN round trip through the store actor, the derive's
+   own scan shape) and joined into a bounded tail slice of
+   <= SA_REFINE_TRAJECTORY_CHARS: the slice drops WHOLE OLDEST records —
+   never a mid-document cut — so the view stays parseable and
+   evidence-citable; it rides back in *trajectory_json (heap, the caller's
+   to free), the bounded view the review consumed. On a local run (scope_root
+   != "harness") the shared scope's log is ALSO scanned read-only and its
+   digest marks the read-only-context section; no write, no apply, no meta
+   happens here — decode only.
+
+   Returns NULL with the proposal decoded: *edits (a malloc'd refine_edit_t
+   array the caller destroys per element and frees), *nedits (0 = the valid
+   empty proposal), *summary and *rationale (heap, the caller's). Non-NULL
+   return = a malloc'd refusal string (validateEdit strings, the output-cap
+   truncation wording, the model error) and EVERY out-slot NULL/0 — the
+   decode refuses loud, no partial decode. */
+char* refine_review_call(frame_t* f, const refine_fold_t* fold,
+                         const char* scope_root, const char* instructions,
+                         char** trajectory_json,
+                         refine_edit_t** edits, size_t* nedits,
+                         char** summary, char** rationale);
+
 #endif /* SA_HAS_WDB */
 #endif /* SA_REFINE_H */

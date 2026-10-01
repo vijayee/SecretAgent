@@ -6,9 +6,12 @@
 
 #ifdef SA_HAS_WDB
 
+#include "frame_internal.h"   /* the backend fetch + the refine slice's
+                                 _frame_sync_scan round-trip helpers */
 #include "../Util/allocator.h"
 #include "../Util/log.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,10 +20,12 @@
 /* refine.c — the refine slice's DATA half (the orchestrator spec: the fold,
    the edit validation, the evidence gate, the apply semantics with version
    guards, the record's edit-element composition, and the fold's canonical
-   views — the FNV-1a-64 fingerprint and the bounded digest render). The
-   store-riding runners (refine_run / refine_rollback) land with their own
-   tasks; the store actor remains the only serializer this module ever
-   answers to. */
+   views — the FNV-1a-64 fingerprint and the bounded digest render) plus the
+   review pass (spec §3 step 4): the no-tools backend call over the composed
+   prompt and the JSON proposal decode under the output-cap guard — decode
+   ONLY (the store-riding runners refine_run / refine_rollback land with
+   their own tasks; the store actor remains the only serializer this module
+   ever answers to, and the review performs no store WRITE at all). */
 
 const char* const REFINE_KINDS[REFINE_KINDS_COUNT] = {
     "prompt", "memory", "skill", "subagent",
@@ -1012,6 +1017,591 @@ int refine_fold_parse(const char* records_array_json, refine_fold_t* fold) {
   }
   json_value_destroy(array);
   return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* The review call (spec §3 step 4): the no-tools review + the decode  */
+/* ------------------------------------------------------------------ */
+
+/* The shared (root-level) scope's harness root: refine_run composes the
+   current scope's root from it (frame_sid(f) + "/harness" for a local run);
+   the review call compares scope_root against it — EQUAL = a shared run (no
+   read-only-context section), anything else = a local run whose shared
+   scope is read-only context (spec §1's scoping semantics). A #define so
+   the "/log" range bounds compose as one literal. */
+#define REFINE_SCOPE_ROOT_SHARED "harness"
+
+/* The review's system prompt — the translated contract of refinement.ts
+   :129-180: the kinds, the actions, the JSON-only output, the
+   base-immutability line at its core, and OUR evidence requirement (spec
+   §4's recorded divergence) spelled out. A prompt, not code. */
+static const char REFINE_REVIEW_SYSTEM[] =
+    "You are SecretAgent's /refine continual harness subsystem.\n"
+    "\n"
+    "Review the current trajectory and emit precise Create, Update, or\n"
+    "Delete edits to the editable continual harness state: the persistent,\n"
+    "editable set of prompt notes, memories, skills, and subagent specs that\n"
+    "carries reusable behavior between sessions.\n"
+    "\n"
+    "Kinds:\n"
+    "- prompt: supplemental prompt notes only. The base system prompt is\n"
+    "  immutable and MUST NOT be rewritten; the id \"base_system_prompt\" is\n"
+    "  untouchable.\n"
+    "- memory: durable facts, decisions, failures, preferences, and\n"
+    "  outcomes.\n"
+    "- skill: an installed Python skill. Skill create/update edits MUST\n"
+    "  include a `reference` object with {\"type\":\"python\"}, a Python\n"
+    "  import, and a callable or call_pattern; they also MUST include an\n"
+    "  `arguments` object describing accepted inputs, required fields,\n"
+    "  defaults, and constraints.\n"
+    "- subagent: reusable delegation specs: purpose, instructions, and when\n"
+    "  to invoke them.\n"
+    "\n"
+    "Scope and edits:\n"
+    "- Propose edits only for the requested scope's store. Entries shown as\n"
+    "  read-only context are never edit targets; a needed session-specific\n"
+    "  override is a local create.\n"
+    "- Prefer small, specific lessons the trajectory actually evidences; do\n"
+    "  not restate what the current harness state already carries.\n"
+    "- Never edit source files; edits touch the harness state only.\n"
+    "\n"
+    "Evidence:\n"
+    "- Every edit names the event seqs it rests on: evidence =\n"
+    "  {\"first_seq\":<first>,\"last_seq\":<last>} citing the trajectory's\n"
+    "  event records. An edit without evidence is refused.\n"
+    "- Updates and deletes carry `expect.version`, the version the current\n"
+    "  harness state shows; a mismatch refuses the edit as stale.\n"
+    "\n"
+    "Output JSON only, in exactly this shape:\n"
+    "\n"
+    "{\n"
+    "  \"summary\": \"one sentence\",\n"
+    "  \"rationale\": \"why these edits are justified by trajectory evidence\",\n"
+    "  \"edits\": [\n"
+    "    {\n"
+    "      \"action\": \"create|update|delete\",\n"
+    "      \"kind\": \"prompt|memory|skill|subagent\",\n"
+    "      \"id\": \"stable id for update/delete, optional for create\",\n"
+    "      \"title\": \"required for create/update except delete\",\n"
+    "      \"content\": \"required for create/update except delete\",\n"
+    "      \"path\": \"optional grouping path\",\n"
+    "      \"reference\": {\"type\":\"python\",\"import\":\"package.module\",\n"
+    "                      \"callable\":\"function_name\"},\n"
+    "      \"arguments\": {},\n"
+    "      \"reason\": \"why this edit is useful\",\n"
+    "      \"expect\": {\"version\": 0},\n"
+    "      \"evidence\": {\"first_seq\": 0, \"last_seq\": 0}\n"
+    "    }\n"
+    "  ]\n"
+    "}\n";
+
+/* PA's TRUNCATED_JSON_ERROR (refinement.ts:198-199, verbatim): the over-cap
+   refusal AND the incomplete-reply's diagnosis share the one wording. */
+#define REFINE_TRUNCATED_JSON \
+  "the model stopped before completing its JSON object. This usually means " \
+  "the output budget was exhausted; retry with a smaller request."
+
+/* The bounded tail of prior refinements in the prompt (PA's
+   historyForPrompt .slice(-20), refinement.ts:1277). */
+#define REFINE_HISTORY_TAIL 20
+
+/* The scan-bounds scratch: a session subtree path plus one key stays well
+   inside this (frame.c's compositions are far shorter); the overflow is a
+   loud refusal, never a silent truncation. */
+#define REFINE_BOUND_MAX 256
+
+/* "<root>" .. "<root>0" — the two ABSOLUTE ROOT-LEVEL scan bounds for one
+   store range (never relative — the subtree-scan breakage, frame.c's
+   canonical pattern). Returns 0, -1 on overflow. */
+static int _refine_range_bounds(const char* root, char* lo, size_t lo_size,
+                                char* hi, size_t hi_size) {
+  size_t n = strlen(root);
+  if (n + 2 > lo_size || n + 2 > hi_size) return -1;
+  memcpy(lo, root, n + 1);
+  memcpy(hi, root, n + 1);
+  hi[n] = '0';
+  hi[n + 1] = '\0';
+  return 0;
+}
+
+/* PA's isInCompleteJson (refinement.ts:897-911, the diagnosis's shape): a
+   reply truncated inside a string or a bracket run is named as the cause
+   instead of the fragment. */
+static int _refine_json_is_incomplete(const char* text) {
+  size_t depth = 0;
+  int in_string = 0;
+  int escaped = 0;
+  for (const char* p = text; *p != '\0'; p++) {
+    char c = *p;
+    if (escaped) {
+      escaped = 0;
+      continue;
+    }
+    if (in_string) {
+      if (c == '\\') escaped = 1;
+      else if (c == '"') in_string = 0;
+      continue;
+    }
+    if (c == '"') in_string = 1;
+    else if (c == '{' || c == '[') depth++;
+    else if (c == '}' || c == ']') depth--;
+  }
+  return in_string || depth > 0;
+}
+
+/* The reply's JSON candidate: a malloc'd trimmed copy with the first code
+   fence stripped (the "```json ... ```" shape models actually emit — PA's
+   unanchored fence regex, refinement.ts:943, so prose may wrap the fence;
+   the lazy match ends at the FIRST closing fence, unclosed fences ride
+   whole). Caller frees. */
+static char* _refine_json_candidate(const char* content) {
+  size_t n = content != NULL ? strlen(content) : 0;
+  size_t begin = 0;
+  while (begin < n && isspace((unsigned char) content[begin])) begin++;
+  size_t end = n;
+  while (end > begin && isspace((unsigned char) content[end - 1])) end--;
+  const char* p = content + begin;
+  size_t plen = end - begin;
+
+  /* PA's unanchored fence search: the FIRST "```" anywhere in the trimmed
+     reply opens the candidate. */
+  const char* fence = NULL;
+  size_t fence_at = 0;
+  for (size_t i = 0; i + 3 <= plen; i++) {
+    if (p[i] == '`' && p[i + 1] == '`' && p[i + 2] == '`') {
+      fence = p + i;
+      fence_at = i;
+      break;
+    }
+  }
+  if (fence == NULL) {
+    char* candidate = get_memory(plen + 1);
+    memcpy(candidate, p, plen);
+    candidate[plen] = '\0';
+    return candidate;
+  }
+
+  /* The fence body: an optional "json" tag, then the run to the FIRST
+     closing fence — or, a truncated fence, everything the reply had. */
+  const char* body = fence + 3;
+  size_t body_len = plen - fence_at - 3;
+  if (body_len >= 4 && strncmp(body, "json", 4) == 0) {
+    body += 4;
+    body_len -= 4;
+  }
+  while (body_len > 0 && isspace((unsigned char) *body)) {
+    body++;
+    body_len--;
+  }
+  char* candidate = get_memory(body_len + 1);
+  memcpy(candidate, body, body_len);
+  candidate[body_len] = '\0';
+  char* close = strstr(candidate, "```");
+  if (close != NULL) {
+    size_t keep = (size_t) (close - candidate);   /* the lazy match's body */
+    while (keep > 0 && isspace((unsigned char) candidate[keep - 1])) keep--;
+    candidate[keep] = '\0';
+  }
+  return candidate;
+}
+
+/* The reply's content -> the proposal DOM (PA's extractJsonObject +
+   parseProposal, refinement.ts:914-996): the fence-trimmed content parses;
+   a truncated reply (inside a string or an open bracket run) is named with
+   PA's truncation wording; other parse failures and a non-object reply
+   refuse loud (the fall-through wording for a brace-free reply, PA's
+   :963 line). NULL + *error_out (heap, the caller's) on refusal. */
+static json_value_t* _refine_parse_proposal(const char* content, char** error_out) {
+  *error_out = NULL;
+  if (content == NULL || content[0] == '\0') {
+    *error_out = _refine_error("the model did not return valid JSON: the "
+                               "reply is empty");
+    return NULL;
+  }
+  char* candidate = _refine_json_candidate(content);
+  char* jerr = NULL;
+  json_value_t* dom = json_parse(candidate, strlen(candidate), &jerr);
+  if (dom == NULL) {
+    if (_refine_json_is_incomplete(candidate)) {
+      *error_out = _refine_error("%s", REFINE_TRUNCATED_JSON);
+    } else if (strchr(candidate, '{') != NULL) {
+      *error_out = _refine_error("the model did not return valid JSON: %s",
+                                 jerr != NULL ? jerr : "malformed");
+    } else {
+      *error_out = _refine_error("Refiner did not return a JSON object");
+    }
+    free(jerr);
+    free(candidate);
+    return NULL;
+  }
+  free(jerr);
+  free(candidate);
+  if (json_type(dom) != JSON_OBJECT) {
+    *error_out = _refine_error("Refiner JSON must be an object");
+    json_value_destroy(dom);
+    return NULL;
+  }
+  return dom;
+}
+
+/* The trajectory's bounded tail slice (PA planRefinement's .slice(-80_000),
+   refinement.ts:1258): the slice drops WHOLE OLDEST array elements until
+   the joint text fits <= SA_REFINE_TRAJECTORY_CHARS — never a mid-document
+   cut, so the view stays parseable and evidence-citable, and the newest
+   single record always survives. Consumes the input; returns the bounded
+   text (or NULL loud on an unparseable reply — the scan's own shape
+   guarantees an array, so this is an internal failure, never tolerated). */
+static char* _refine_trajectory_tail(char* raw) {
+  size_t n = strlen(raw);
+  if (n <= (size_t) SA_REFINE_TRAJECTORY_CHARS) return raw;
+
+  char* jerr = NULL;
+  json_value_t* arr = json_parse(raw, n, &jerr);
+  free(jerr);
+  if (arr == NULL || json_type(arr) != JSON_ARRAY) {
+    log_error("refine_review_call: the trajectory scan reply is not an array");
+    if (arr != NULL) json_value_destroy(arr);
+    free(raw);
+    return NULL;
+  }
+  size_t count = json_size(arr);
+  if (count == 0) {
+    json_value_destroy(arr);
+    free(raw);
+    char* out = get_memory(3);
+    memcpy(out, "[]", 3);
+    return out;
+  }
+  char** texts = get_memory(count * sizeof(char*));
+  size_t* lens = get_memory(count * sizeof(size_t));
+  for (size_t i = 0; i < count; i++) {
+    texts[i] = json_serialize(json_at(arr, i));
+    lens[i] = strlen(texts[i]);
+  }
+  json_value_destroy(arr);
+
+  /* The oldest start that still fits: walk from the NEWEST record back
+     while the accumulated run stays inside the cap. */
+  size_t best = count;
+  size_t run = 0;
+  for (size_t i = count; i-- > 0;) {
+    run += lens[i];
+    if (run + (count - i) + 1 > (size_t) SA_REFINE_TRAJECTORY_CHARS) break;
+    best = i;
+  }
+  if (best >= count) {
+    best = count - 1;   /* the newest record survives even alone-over-cap */
+  }
+  size_t out_len = 2;
+  for (size_t i = best; i < count; i++) out_len += lens[i] + 1;
+  char* out = get_memory(out_len + 1);
+  size_t w = 0;
+  out[w++] = '[';
+  for (size_t i = best; i < count; i++) {
+    if (i > best) out[w++] = ',';
+    memcpy(out + w, texts[i], lens[i]);
+    w += lens[i];
+  }
+  out[w++] = ']';
+  out[w] = '\0';
+  for (size_t i = 0; i < count; i++) free(texts[i]);
+  free(texts);
+  free(lens);
+  free(raw);
+  return out;
+}
+
+/* Composes the review's USER text (the spec §3 step-4 recipe): the current
+   digest, the prior-refinement tail from the fold, the read-only-context
+   digest for a local run against the shared scope, the bounded trajectory
+   view, and the caller's instructions when carried. On success *user_out
+   and *traj_out are the caller's heap strings (the caller frees BOTH, the
+   trajectory even on the LATER failures — it is the review's consumed
+   view). Returns 0, -1 loud (everything freed here; *traj_out NULLed). */
+static int _refine_review_compose(frame_t* f, const refine_fold_t* fold,
+                                  const char* scope_root,
+                                  const char* instructions, char** user_out,
+                                  char** traj_out) {
+  char* digest = refine_fold_digest(fold);   /* never NULL: the fold is checked */
+  char* traj_raw = NULL;
+  char* traj = NULL;
+  char* context_digest = NULL;
+  char* ctx_raw = NULL;
+  _refine_buf_t buf = {NULL, 0, 0};
+  char lo[REFINE_BOUND_MAX];
+  char hi[REFINE_BOUND_MAX];
+
+  /* The events trajectory: the store-actor round trip (spec §3's bullet),
+     the derive's own scan shape, the newest SA_REFINE_SCAN_EVENTS records,
+     then the bounded char tail slice. The range is the frame's EVENTS
+     subtree — "<sid>/events" .. "<sid>/events0" (frame.c's canonical
+     composition), never the whole session subtree. */
+  const char* sid = frame_sid(f);
+  if (snprintf(lo, sizeof(lo), "%s/events", sid) >= (int) sizeof(lo) ||
+      snprintf(hi, sizeof(hi), "%s/events0", sid) >= (int) sizeof(hi)) {
+    log_error("refine_review_call: '%s' overflows the scan-bounds buffer", sid);
+    goto compose_fail;
+  }
+  if (_frame_sync_scan(f, lo, hi, (size_t) SA_REFINE_SCAN_EVENTS, &traj_raw) != 0 ||
+      traj_raw == NULL) {
+    log_error("refine_review_call: the trajectory scan refused at '%s'",
+              frame_sid(f));
+    goto compose_fail;
+  }
+  traj = _refine_trajectory_tail(traj_raw);
+  traj_raw = NULL;
+  if (traj == NULL) goto compose_fail;
+
+  /* The read-only context: a local run scans the SHARED scope's log (the
+     other scope stays read-only, spec §1's scoping semantics); a shared run
+     composes no context section. */
+  if (strcmp(scope_root, REFINE_SCOPE_ROOT_SHARED) != 0) {
+    if (_refine_range_bounds(REFINE_SCOPE_ROOT_SHARED "/log", lo, sizeof(lo),
+                             hi, sizeof(hi)) != 0) {
+      log_error("refine_review_call: the shared-scope bounds overflow");
+      goto compose_fail;
+    }
+    if (_frame_sync_scan(f, lo, hi, (size_t) SA_REFINE_LOG_WINDOW, &ctx_raw) != 0 ||
+        ctx_raw == NULL) {
+      log_error("refine_review_call: the shared-scope context scan refused "
+                "at '%s'", frame_sid(f));
+      goto compose_fail;
+    }
+    if (strcmp(ctx_raw, "[]") != 0) {
+      refine_fold_t ctx_fold;
+      memset(&ctx_fold, 0, sizeof(ctx_fold));
+      if (refine_fold_parse(ctx_raw, &ctx_fold) != 0) {
+        log_error("refine_review_call: the shared-scope log does not fold — "
+                  "refused loud");
+        refine_fold_destroy(&ctx_fold);
+        goto compose_fail;
+      }
+      context_digest = refine_fold_digest(&ctx_fold);
+      refine_fold_destroy(&ctx_fold);
+    }
+  }
+
+  /* The user text, PA buildPrompt's join("\n\n") shape
+     (refinement.ts:1260-1270). */
+  _refine_buf_add(&buf, "<current_harness_state>\n%s\n</current_harness_state>",
+                  digest);
+  _refine_buf_add(&buf, "\n\n<refinement_history>\n");
+  if (fold->nrecords == 0) {
+    _refine_buf_add(&buf, "No prior refinement history.");
+  } else {
+    size_t newest = fold->nrecords;
+    size_t start = (newest > (size_t) REFINE_HISTORY_TAIL)
+                       ? newest - (size_t) REFINE_HISTORY_TAIL
+                       : 0;
+    for (size_t i = start; i < newest; i++) {
+      _refine_digest_record_line(&buf, fold->record_lines[i]);
+    }
+  }
+  _refine_buf_add(&buf, "\n</refinement_history>");
+  if (context_digest != NULL) {
+    _refine_buf_add(&buf, "\n\n<shared_harness_context>\nread-only context: "
+                          "shared-scope entries are never edit targets from "
+                          "a local refinement\n%s\n</shared_harness_context>",
+                    context_digest);
+  }
+  _refine_buf_add(&buf, "\n\n<trajectory>\n%s\n</trajectory>", traj);
+  if (instructions != NULL && instructions[0] != '\0') {
+    _refine_buf_add(&buf, "\n\n<user_refine_instructions>\n%s\n"
+                          "</user_refine_instructions>", instructions);
+  }
+  _refine_buf_add(&buf, "\n\nReturn only JSON edits. If no useful edit is "
+                        "justified, return an empty edits array with a "
+                        "rationale.");
+
+  free(digest);
+  if (context_digest != NULL) free(context_digest);
+  free(ctx_raw);
+  if (buf.text != NULL) buf.text[buf.len] = '\0';
+  *user_out = buf.text;
+  *traj_out = traj;
+  return 0;
+
+compose_fail:
+  free(digest);
+  free(context_digest);
+  free(ctx_raw);
+  free(traj_raw);
+  free(traj);
+  free(buf.text);
+  *user_out = NULL;
+  *traj_out = NULL;
+  return -1;
+}
+
+/* Walks the proposal's `edits` array into refine_edit_t's: the object
+   elements are the proposal's edits (PA's normalize filter), an over-cap
+   proposal refuses with PA's truncation wording, and EVERY edit is
+   validateEdit-checked here — the FIRST refusal is the whole decode's
+   refusal (no partial decode). The edit's top-level `reason` wins over the
+   evidence's summary when the proposal carries both. Returns 0 with
+   *edits_out (NULL when the proposal carries no edits — the valid empty
+   proposal), -1 + *error_out loud otherwise. */
+static int _refine_decode_edits(json_value_t* proposal, refine_edit_t** edits_out,
+                                size_t* nedits_out, char** error_out) {
+  *edits_out = NULL;
+  *nedits_out = 0;
+  *error_out = NULL;
+
+  json_value_t* edits_dom = json_get(proposal, "edits");
+  if (edits_dom == NULL || json_type(edits_dom) != JSON_ARRAY) {
+    return 0;   /* PA's normalize: a missing/non-array edits field is [] */
+  }
+  size_t nobj = 0;
+  for (size_t i = 0; i < json_size(edits_dom); i++) {
+    if (json_type(json_at(edits_dom, i)) == JSON_OBJECT) nobj++;
+  }
+  if (nobj > (size_t) SA_REFINE_MAX_EDITS) {
+    /* The output cap is the refuse-loud stand-in for the output reserve
+       (spec §4) — the truncation wording, never a silent truncation. */
+    *error_out = _refine_error("%s", REFINE_TRUNCATED_JSON);
+    return -1;
+  }
+  if (nobj == 0) return 0;
+
+  refine_edit_t* out = get_clear_memory(nobj * sizeof(refine_edit_t));
+  size_t n = 0;
+  for (size_t i = 0; i < json_size(edits_dom); i++) {
+    json_value_t* el = json_at(edits_dom, i);
+    if (el == NULL || json_type(el) != JSON_OBJECT) continue;   /* PA's filter */
+    refine_edit_t e;
+    memset(&e, 0, sizeof(e));
+    int rc = _refine_edit_decode(el, &e);
+    if (rc == 0) {
+      /* The proposal's own top-level reason wins over the evidence line's
+         summary (both feeds the record's evidence summary, Task 5's compose). */
+      json_value_t* reason = json_get(el, "reason");
+      if (reason != NULL && json_type(reason) == JSON_STRING) {
+        free(e.reason);
+        e.reason = _refine_dup(json_as_string(reason));
+      }
+    }
+    /* The DECODE's field fence: the validateEdit strings refuse the whole
+       reply (apply-stage gates — evidence, versions — stay per-edit). */
+    char* verdict = refine_edit_validate(&e);
+    if (verdict != NULL) {
+      refine_edit_destroy(&e);
+      for (size_t j = 0; j < n; j++) refine_edit_destroy(&out[j]);
+      free(out);
+      *error_out = verdict;
+      return -1;
+    }
+    out[n++] = e;   /* moved: the caller owns the fields from here */
+  }
+  *edits_out = out;
+  *nedits_out = n;
+  return 0;
+}
+
+char* refine_review_call(frame_t* f, const refine_fold_t* fold,
+                         const char* scope_root, const char* instructions,
+                         char** trajectory_json,
+                         refine_edit_t** edits, size_t* nedits,
+                         char** summary, char** rationale) {
+  if (trajectory_json != NULL) *trajectory_json = NULL;
+  if (edits != NULL) *edits = NULL;
+  if (nedits != NULL) *nedits = 0;
+  if (summary != NULL) *summary = NULL;
+  if (rationale != NULL) *rationale = NULL;
+  if (f == NULL || fold == NULL || scope_root == NULL || scope_root[0] == '\0' ||
+      trajectory_json == NULL || edits == NULL || nedits == NULL ||
+      summary == NULL || rationale == NULL) {
+    log_error("refine_review_call: NULL input — refused loud");
+    return _refine_error("refine review: the frame, fold, scope root, and "
+                         "every out-slot are required");
+  }
+
+  /* The frame's own configured backend (spec §6): the frame-injected
+     override wins, else the once-built default. The SYNC complete() is the
+     review's shape — a bounded one-shot on the caller's thread (the demo
+     CLI thread in production; the model.c complete contract's documented
+     bounded caller-side block). */
+  model_backend_t* mb = _frame_backend_get(f);
+  if (mb == NULL || mb->complete == NULL) {
+    log_error("refine_review_call: '%s' has no usable model backend",
+              frame_sid(f));
+    return _refine_error("refine review: no usable model backend");
+  }
+
+  char* user_text = NULL;
+  char* traj = NULL;
+  if (_refine_review_compose(f, fold, scope_root, instructions, &user_text,
+                             &traj) != 0) {
+    return _refine_error("refine review: the review compose refused (the "
+                         "specific cause is logged)");
+  }
+
+  /* The messages DOM: system = the review contract, user = the composed
+     recipe. The tools argument is a JSON NULL VALUE — EXPLICITLY no tools
+     (the request build omits both tool keys; spec §7). */
+  json_value_t* messages = json_new_array();
+  json_value_t* system = json_new_object();
+  json_object_set(system, "role", json_new_string("system"));
+  json_object_set(system, "content", json_new_string(REFINE_REVIEW_SYSTEM));
+  json_array_append(messages, system);
+  json_value_t* user = json_new_object();
+  json_object_set(user, "role", json_new_string("user"));
+  json_object_set(user, "content", json_new_string(user_text));
+  free(user_text);   /* the DOM now owns the text's copy */
+  json_array_append(messages, user);
+  json_value_t* no_tools = json_new_null();
+
+  model_reply_t* reply = NULL;
+  char* model_err = NULL;
+  int crc = mb->complete(mb, messages, no_tools, NULL, &reply, &model_err);
+  json_value_destroy(messages);
+  json_value_destroy(no_tools);
+  if (crc != 0) {
+    free(traj);
+    char* refusal = (model_err != NULL)
+                        ? model_err
+                        : _refine_error("refine review: the model call failed");
+    log_error("refine_review_call: %s", refusal);
+    return refusal;
+  }
+
+  /* The DECODE (the reply's content only — no tool surface ever exists to
+     carry a refine call): fence trim -> parse -> the field fence + the
+     output cap. */
+  char* decode_err = NULL;
+  json_value_t* proposal = _refine_parse_proposal(reply->content, &decode_err);
+  if (proposal == NULL) {
+    model_reply_destroy(reply);
+    free(traj);
+    log_error("refine_review_call: the proposal decode refused: %s", decode_err);
+    return decode_err;
+  }
+  refine_edit_t* out_edits = NULL;
+  size_t out_n = 0;
+  char* edits_err = NULL;
+  int drc = _refine_decode_edits(proposal, &out_edits, &out_n, &edits_err);
+  if (drc != 0) {
+    json_value_destroy(proposal);
+    model_reply_destroy(reply);
+    free(traj);
+    log_error("refine_review_call: the proposal decode refused: %s", edits_err);
+    return edits_err;
+  }
+
+  /* The proposal's top-level fields (PA's normalize defaults ported). */
+  json_value_t* v = json_get(proposal, "summary");
+  *summary = _refine_dup(v != NULL && json_type(v) == JSON_STRING
+                             ? json_as_string(v)
+                             : "Refined continual harness state");
+  v = json_get(proposal, "rationale");
+  *rationale = _refine_dup(v != NULL && json_type(v) == JSON_STRING
+                               ? json_as_string(v)
+                               : "");
+  json_value_destroy(proposal);
+  model_reply_destroy(reply);
+  *trajectory_json = traj;
+  *edits = out_edits;
+  *nedits = out_n;
+  return NULL;
 }
 
 #endif /* SA_HAS_WDB */

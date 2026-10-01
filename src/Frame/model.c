@@ -12,9 +12,12 @@
 //
 //   - messages is BORROWED (caller owns the json_value_t) and must be a JSON
 //     array; tools may be NULL to get the canned single `execute` cell tool,
-//     or a caller-owned JSON array passed through in place (supersets like
-//     scripted test tools). Borrowed values are copied into the request via
-//     serialize -> re-parse; the caller never loses ownership.
+//     a caller-owned JSON array passed through in place (supersets like
+//     scripted test tools), or a JSON NULL value to send EXPLICITLY no tools
+//     at all (both request keys omitted — the refine review's shape, spec §7:
+//     the model sees refine only as a prompt, never as a tool surface).
+//     Borrowed values are copied into the request via serialize -> re-parse;
+//     the caller never loses ownership.
 //   - `tool_calls[0].function.arguments` arrives in TWO shapes across
 //     OpenAI-compatible servers: a JSON STRING containing the argument
 //     object ({"code": "..."}) — the OpenAI shape Ollama emits — or, in
@@ -509,12 +512,26 @@ typedef struct _model_http_backend_t {
   streams_loop_thread_t* loop;   /* borrowed; pinned by _model_loop_acquire */
 } _model_http_backend_t;
 
-/* Fills *body_out with the serialized request document. Caller frees. */
-static int _model_request_text(const _model_http_backend_t* b,
-                              json_value_t* messages, json_value_t* tools,
-                              char** body_out, char** error_out) {
+/* Fills *body_out with the serialized request document. Caller frees.
+   model_internal.h's exported builder — one body builder, one truth (the
+   backend wrapper below and the refine slice's no-tools contract test both
+   reach it).
+
+   tools semantics (the refine slice's ONE new shape, spec §7): a NULL
+   POINTER is the turn loop's unchanged execute-tool shape; a JSON array
+   rides verbatim with tool_choice "auto"; a JSON NULL value means
+   EXPLICITLY no tools — both the "tools" and "tool_choice" keys are
+   OMITTED from the request document, so the model sees the refine review
+   ONLY as a prompt, never as a tool surface. Everything else in the
+   request contract is unchanged. */
+int _model_request_body(const char* model_name, json_value_t* messages,
+                        json_value_t* tools, char** body_out, char** error_out) {
   *body_out = NULL;
   *error_out = NULL;
+  if (model_name == NULL || model_name[0] == '\0') {
+    *error_out = _model_error("model client: request build: model name missing");
+    return -1;
+  }
   if (json_type(messages) != JSON_ARRAY) {
     *error_out = _model_error("model client: request build: messages must be "
                               "a JSON array");
@@ -522,7 +539,8 @@ static int _model_request_text(const _model_http_backend_t* b,
   }
   if (tools != NULL && json_type(tools) != JSON_ARRAY && json_type(tools) != JSON_NULL) {
     *error_out = _model_error("model client: request build: tools must be a "
-                              "JSON array or NULL");
+                              "JSON array, JSON null (no tools), or NULL "
+                              "(the execute tool)");
     return -1;
   }
   json_value_t* owned_messages = _model_owned_copy(messages, error_out);
@@ -531,24 +549,37 @@ static int _model_request_text(const _model_http_backend_t* b,
   json_value_t* owned_tools = NULL;
   if (tools != NULL && json_type(tools) == JSON_ARRAY) {
     owned_tools = _model_owned_copy(tools, error_out);
+    if (owned_tools == NULL) {
+      json_value_destroy(owned_messages);
+      return -1;
+    }
+  } else if (tools != NULL && json_type(tools) == JSON_NULL) {
+    /* Explicitly no tools: both keys stay out of the request document. */
   } else {
     owned_tools = _model_execute_tool();
   }
-  if (owned_tools == NULL) {
-    json_value_destroy(owned_messages);
-    return -1;
-  }
 
   json_value_t* req = json_new_object();
-  json_object_set(req, "model", json_new_string(b->model_name));
+  json_object_set(req, "model", json_new_string(model_name));
   json_object_set(req, "messages", owned_messages);    /* takes value */
-  json_object_set(req, "tools", owned_tools);          /* takes value */
-  /* tool_choice is part of the request contract, whatever tools carry it. */
-  json_object_set(req, "tool_choice", json_new_string("auto"));
+  if (owned_tools != NULL) {
+    json_object_set(req, "tools", owned_tools);        /* takes value */
+    /* tool_choice is part of the request contract when tools ride it. */
+    json_object_set(req, "tool_choice", json_new_string("auto"));
+  }
   char* text = json_serialize(req);
   json_value_destroy(req);
   *body_out = text;
   return 0;
+}
+
+/* The backend-variant call: the builder above under the backend's model
+   name (the wrapper keeps the internal call sites unchanged). */
+static int _model_request_text(const _model_http_backend_t* b,
+                              json_value_t* messages, json_value_t* tools,
+                              char** body_out, char** error_out) {
+  return _model_request_body(b->model_name, messages, tools, body_out,
+                             error_out);
 }
 
 /* <base>/v1/chat/completions with trailing slashes on base trimmed. */
