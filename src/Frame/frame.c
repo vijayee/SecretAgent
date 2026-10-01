@@ -729,14 +729,12 @@ static int _frame_sync_store_refused(frame_t* f, const char* op) {
    and the frame teardown ends with it. */
 static void _frame_sync_slot_reset(frame_t* f) {
   if (f == NULL) return;
+  /* The frees run BEFORE the memset — they read the fields the memset zeroes. */
   free(f->sync.text);
-  f->sync.text = NULL;
   if (f->sync.records != NULL) {
     for (size_t i = 0; i < f->sync.n; i++) free(f->sync.records[i]);
     free(f->sync.records);
-    f->sync.records = NULL;
   }
-  f->sync.n = 0;
   memset(&f->sync, 0, sizeof(f->sync));
 }
 
@@ -2302,11 +2300,6 @@ int _frame_sync_scan(frame_t* f, const char* start, const char* end,
   char* text = json_serialize(arr);
   json_value_destroy(arr);
   _frame_sync_slot_reset(f);   /* the join copied the texts; the ride dies */
-  if (text == NULL) {
-    log_error("frame: sync scan at '%s' — the records join failed",
-              f->sid_path);
-    return -1;
-  }
   *text_out = text;
   return 0;
 }
@@ -3965,8 +3958,7 @@ int frame_join(frame_t* child) {
   bp->ops[0].value = (uint8_t*)parent_text;  /* OWNED */
   bp->ops[0].value_len = strlen(parent_text);
   bp->op_name = "frame.join";                /* BORROWED literal */
-  free(parent->sync.text);
-  memset(&parent->sync, 0, sizeof(parent->sync));
+  _frame_sync_slot_reset(parent);   /* a prior recall's leftover records die here too */
   parent->sync.in_use = 1;
   parent->sync.corr = ++parent->store_corr_seq;
   bp->reply_to = &parent->actor;

@@ -288,6 +288,35 @@ TEST(TestFrame, TestReportBindsOneEventIntoParent) {
   wave_db_close(db);
 }
 
+TEST(TestFrame, TestJoinResetsARecallLeftoverSlot) {
+  /* A successful direct recall routes the reply's records WHOLE into the
+     parent's sync slot — the recall transfers out only records[0]'s copy as
+     its text. The later frame_join reuses that same slot for its own batch,
+     so it must reset it WHOLE (the leftover records die there, not just the
+     text): under the ASan config a text-only reset fails loud with the leaked
+     records array. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = test_config();
+  frame_t* parent = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(parent, nullptr);
+  frame_t* child = frame_spawn(parent, "leaf", NULL);
+  ASSERT_NE(child, nullptr);
+
+  EXPECT_EQ(frame_remember_ctx(parent, "mode", "\"sync\""), 0);
+  char* v = frame_recall(parent, "mode");   /* the reply's records ride the slot */
+  ASSERT_NE(v, nullptr);
+  EXPECT_STREQ(v, "\"sync\"");
+  free(v);
+
+  EXPECT_EQ(frame_report(child, "found it"), 0);
+  EXPECT_EQ(frame_join(child), 0) << "the join survives the leftover slot records";
+
+  frame_destroy(child);
+  frame_destroy(parent);
+  wave_db_close(db);
+}
+
 /* --- Task 6: bridge behaviors ---------------------------------------------- */
 
 /* Completion record (the py_frame pattern from test_pyrt.cpp): the test's own
@@ -886,8 +915,8 @@ TEST(TestFrame, TestSyncScanAndBatchRefuseOnPooledStore) {
       << "the sync batch refuses loud on a pooled store";
 
   frame_destroy(f);
-  wave_db_close(db);            /* documented order: stop, close, destroy */
-  scheduler_pool_stop(pool);
+  scheduler_pool_stop(pool);       /* documented order: stop, close, destroy */
+  wave_db_close(db);
   scheduler_pool_destroy(pool);
 }
 

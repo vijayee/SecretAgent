@@ -301,12 +301,15 @@ int _frame_sync_scan(frame_t* f, const char* start, const char* end,
                      size_t cap, char** text_out);
 
 /* ONE atomic root batch (refine.c composes; this owns the round trip).
-   op ownership TRANSFERS: the ops array and every op's heap fields are all
-   freed here on the success AND the refusal path — the composer never
-   frees them itself. `op_name` is BORROWED (a literal or caller-owned
-   string the round trip only logs). Returns 0 committed, the refusal code
-   otherwise (loud either way; nothing half-committed — the store's ONE
-   atomic batch). */
+   op ownership TRANSFERS into the round trip (TRUE ownership — frame.c's
+   inline contract): past the post, its payload destroyer frees the ops
+   array and every op's heap fields on EVERY path (success, store refusal,
+   deadline, late routing, dropped post); on the helper's own pre-post
+   refusals the helper frees them directly. The composer never frees an op
+   itself. `op_name` is BORROWED (a literal or caller-owned string the
+   round trip only logs). Returns 0 committed, the refusal code otherwise
+   (loud either way; nothing half-committed — the store's ONE atomic
+   batch). */
 int _frame_sync_batch(frame_t* f, frm_store_op_t* ops, size_t nops,
                       const char* op_name);
 
