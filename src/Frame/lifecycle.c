@@ -317,7 +317,13 @@ static void _life_fold_record(size_t index, const char* type,
                 "int corr — skipped loud", index);
       return;
     }
-    if (!c->cell_inflight) return;    /* nothing pending — nothing to pair */
+    if (!c->cell_inflight) {
+      /* orphan result — never silently dropped (the fold's loud rule) */
+      log_error("lifecycle_cursor_fold: cell.result record %zu (corr %llu) "
+                "has no open cell.run to pair — folded loud",
+                index, (unsigned long long)corr);
+      return;
+    }
     if (corr != c->inflight_corr) {
       /* A mismatched result never acknowledges the open cell.run (the
          repair.spec:79-97 discipline, corr-mapped): the crash may have

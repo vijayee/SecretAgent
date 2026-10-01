@@ -74,7 +74,8 @@ typedef struct lifecycle_cursor_t {
    record's payload skips. Unknown types pass through (they move nothing);
    malformed lifecycle records log loud + skip (the render-not-crash rule);
    turn/step numbers come from the records' OWN payloads.
-   Returns 0, or -1 with a loud log on NULL input. */
+   Returns 0; -1 with a loud log on NULL input or an unparseable/non-array
+   tail (every refusal is loud — never a silent empty fold). */
 int lifecycle_cursor_fold(const char* events_array_json, lifecycle_cursor_t* c);
 
 /* The cursor's lifecycle (the folded heap fields). The fold initializes the
