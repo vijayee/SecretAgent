@@ -47,6 +47,12 @@ if (BUILD_TESTING)
     # tests share that gate.
     if(SA_HAS_WDB)
       target_sources(testsecretagent PRIVATE test_frame.cpp)
+      # The refine slice rides the same WDB gate as test_frame (its types live
+      # on frame.h's surface); the review-call tests also need the streams
+      # gate, added with Task 4's step.
+      if(SA_HAS_STREAMS)
+        target_sources(testsecretagent PRIVATE test_refine.cpp)
+      endif()
       # The model client's real-http tests drive model_http_backend_create —
       # which rides the streams transport in model.c — so they need the
       # streams gate too, not just the WDB gate their fixtures share.
