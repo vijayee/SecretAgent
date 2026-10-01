@@ -305,12 +305,14 @@ static int _entry_newest_cmp(const void* a, const void* b) {
 }
 
 char* refine_fold_fingerprint(const refine_fold_t* fold) {
+  if (fold == NULL) {
+    log_error("refine_fold_fingerprint: NULL fold — refused loud");
+    return NULL;
+  }
   uint64_t hash = _refine_fnv64(REFINE_FNV64_BASIS, REFINE_FINGERPRINT_SALT,
                                 sizeof(REFINE_FINGERPRINT_SALT) - 1);
   size_t nlive = 0;
-  const refine_entry_t** rows =
-      fold != NULL ? _fold_live_rows(fold, &nlive)
-                   : get_memory(sizeof(*rows));
+  const refine_entry_t** rows = _fold_live_rows(fold, &nlive);
   qsort(rows, nlive, sizeof(*rows), _entry_material_cmp);
   for (size_t i = 0; i < nlive; i++) {
     const refine_entry_t* e = rows[i];
@@ -338,7 +340,7 @@ char* refine_fold_fingerprint(const refine_fold_t* fold) {
     }
   }
   free(rows);
-  size_t nrecords = fold != NULL ? fold->nrecords : 0;
+  size_t nrecords = fold->nrecords;
   for (size_t i = 0; i < nrecords; i++) {
     hash = _refine_hash_string(hash, "l;");
     hash = _refine_hash_string(hash, fold->record_lines[i]);
@@ -379,19 +381,16 @@ static void _refine_buf_add(_refine_buf_t* buf, const char* fmt, ...) {
 
 /* One record line's digest form: a stored "<seq>;<trigger>;" line renders
    "- <seq> <trigger>"; a malformed record's skip line already carries its
-   "- " label and renders verbatim (refinement.ts:479-483's render rule). */
+   "- " label and renders verbatim (refinement.ts:479-483's render rule).
+   Every stored line is one of exactly those two shapes (the skip-line
+   helper's "- " prefix, or fold-parse's "%llu;<trigger>;" fmt), so the
+   first ';' is always present on a trigger line. */
 static void _refine_digest_record_line(_refine_buf_t* buf, const char* line) {
   if (strncmp(line, "- ", 2) == 0) {
     _refine_buf_add(buf, "%s\n", line);
     return;
   }
   const char* semi = strchr(line, ';');
-  if (semi == NULL) {
-    char* compacted = _refine_compact(line, SA_REFINE_DIGEST_CONTENT_CHARS);
-    _refine_buf_add(buf, "- %s\n", compacted);
-    free(compacted);
-    return;
-  }
   size_t seq_len = (size_t) (semi - line);
   char seq[24];
   if (seq_len >= sizeof(seq)) seq_len = sizeof(seq) - 1;
@@ -410,9 +409,13 @@ static void _refine_digest_record_line(_refine_buf_t* buf, const char* line) {
 }
 
 char* refine_fold_digest(const refine_fold_t* fold) {
+  if (fold == NULL) {
+    log_error("refine_fold_digest: NULL fold — refused loud");
+    return NULL;
+  }
   _refine_buf_t buf = {NULL, 0, 0};
-  size_t nentries = fold != NULL ? fold->nentries : 0;
-  size_t nrecords = fold != NULL ? fold->nrecords : 0;
+  size_t nentries = fold->nentries;
+  size_t nrecords = fold->nrecords;
   size_t live_total = 0;
   for (size_t i = 0; i < nentries; i++) {
     if (!fold->entries[i].deleted) live_total++;
@@ -463,7 +466,7 @@ char* refine_fold_digest(const refine_fold_t* fold) {
       _refine_digest_record_line(&buf, fold->record_lines[i]);
     }
   }
-  if (buf.text == NULL) return _refine_dup("");
+  /* The "harness: ..." header always lands first, so buf.text is set. */
   if (buf.text[buf.len - 1] == '\n') buf.text[buf.len - 1] = '\0';
   return buf.text;
 }

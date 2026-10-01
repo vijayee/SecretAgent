@@ -90,7 +90,8 @@ int refine_fold_parse(const char* records_array_json, refine_fold_t* fold);
 void refine_fold_destroy(refine_fold_t* fold);
 
 /* FNV-1a-64 of the fold's canonical material, as 16 lowercase hex chars
-   (malloc'd 17 bytes; caller frees). Material (the spec §4's port of
+   (malloc'd 17 bytes; caller frees). A NULL fold refuses loud (log_error)
+   and returns NULL. Material (the spec §4's port of
    refinement.ts:777-843 — covered fields ONLY, order normalized):
    "refine-fingerprint-v1;" then per entry in (kind,id) sort order:
      "e;<kind>;<id>;<version>;<path>;<content>;" and ONLY the skill entries
@@ -99,7 +100,8 @@ void refine_fold_destroy(refine_fold_t* fold);
    label, so equality implies identical renders). */
 char* refine_fold_fingerprint(const refine_fold_t* fold);
 
-/* The bounded digest render (malloc'd; caller frees):
+/* The bounded digest render (malloc'd; caller frees). A NULL fold refuses
+   loud (log_error) and returns NULL.
 
    harness: <entries in scope | "empty">
    <kind>: <count>

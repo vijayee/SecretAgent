@@ -548,16 +548,25 @@ static void refi_parse_no_edit_records(refine_fold_t* fold, uint64_t first_seq,
   ASSERT_EQ(refine_fold_parse(records.c_str(), fold), 0);
 }
 
+/* Both canonical views refuse a NULL fold loud and return NULL — the same
+   posture as refine_fold_parse and refine_edit_apply. */
+TEST(TestRefine, TestCanonicalViewsRefuseNullFold) {
+  EXPECT_EQ(refine_fold_fingerprint(NULL), nullptr);
+  EXPECT_EQ(refine_fold_digest(NULL), nullptr);
+}
+
 /* port of refinement.ts:777-843 (the covered-fields doc) + the delivery
-   gate's precondition agent-session.ts:7238-7245: two folds that render
-   the same digest produce the SAME fingerprint. Entry order is normalized
-   to (kind,id) sort, so an equal content set planted in a different put
-   order stays equal; a non-skill entry whose reference changed STAYS equal
-   (the render never prints the contract off-skill); a metadata-only change
-   is not possible in our fold (title/seq are not carried into a digest
-   byte) — we assert the fold's fields ARE the fingerprint's coverage
-   instead: unprinted fields move nothing, printed ones differ (the
-   differs-test below). */
+   gate's precondition agent-session.ts:7238-7245: for log-derived folds
+   the fingerprint's hashed set covers the digest's printed fields, so the
+   gate's precondition inverts safely — equal fingerprint implies equal
+   render, and render unequal only when content truly differs. Entry order
+   is normalized to (kind,id) sort, so an equal content set planted in a
+   different put order stays equal; a non-skill entry whose reference
+   changed STAYS equal (the render never prints the contract off-skill); a
+   metadata-only change is not possible in our fold (title/seq are not
+   carried into a digest byte) — we assert the fold's fields ARE the
+   fingerprint's coverage instead: unprinted fields move nothing, printed
+   ones differ (the differs-test below). */
 TEST(TestRefine, TestFingerprintStableForEqualFold) {
   const char* memory_reference = "{\"note\":\"not rendered off-skill\"}";
   const char* memory_arguments = "{\"also\":\"not rendered off-skill\"}";
