@@ -19,12 +19,20 @@
 // signal handler cannot safely post FRM_STOP through frame_dispatch (it
 // allocates and takes locks). The plan's sanctioned path (print a notice,
 // exit cleanly) applies; committed state is durable in the store.
+//
+// REFINE (the refine slice): --refine/--refine-global review a run's
+// trajectory after the loop and apply evidence-backed supplemental lessons;
+// --refine-sid resumes a PAST session's subtree instead (no turn loop);
+// --refine-rollback rolls one stored refinement back. The library never
+// prints — every summary rides out of the demo here, verbatim.
 
 #include "../../src/Frame/frame.h"
 #include "../../src/Frame/loop.h"
+#include "../../src/Frame/refine.h"
 #include "../../src/Util/json.h"
 #include "../../src/Util/log.h"
 
+#include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -54,7 +62,19 @@ static const char SA_DEMO_USAGE[] =
     "  --base-url  OpenAI-compatible endpoint (default "
     "http://127.0.0.1:11434)\n"
     "  --model     model tag, required (e.g. llama3)\n"
-    "  --goal      goal text for the top frame, required\n";
+    "  --goal      goal text for the top frame, required for a loop run\n"
+    "  --refine       after the frame run, review this run's trajectory and "
+    "apply evidence-backed supplemental lessons (the /refine "
+    "command; prints the summary; a no-op prints loudly too)\n"
+    "  --refine-global  same, but into the SHARED root harness subtree (the "
+    "session subtree stays read-only context on shared runs; "
+    "the shared scope is read-only context on local runs)\n"
+    "  --refine-sid <sid>  run refine against a PAST session's stored "
+    "trajectory (a sessions/<hex> path — the frame-demo "
+    "printout at create time carries it); NO turn loop runs\n"
+    "  --refine-rollback <seq>  roll back the refinement recorded at that "
+    "harness-log seq (append-only: a NEW rollback record)\n"
+    "  --refine and --refine-rollback are mutually exclusive\n";
 
 /* Log-hook formatter: one line per event ("<level> <message>"), flushed so
    the stream is live even with stdout piped. */
@@ -155,11 +175,61 @@ static int _demo_print_outcome(frame_t* f) {
   return rc;
 }
 
+/* The refine summary print: the summary rides out VERBATIM (fputs, exact
+   bytes — the library never prints; the demo is its printing surface) on a
+   commit or a loud no-op (rr 0 or 1). On rr -1 the summary is NULL by the
+   refine.h contract and the log hook already carried the failure — the demo
+   mirrors its existing engine-failure convention (a stderr line, exit 1)
+   and prints nothing. Returns 0 for rr >= 0, 1 for the failure. */
+static int _demo_print_refine_summary(int rr, char** summary) {
+  if (rr < 0) {
+    fprintf(stderr,
+            "frame-demo: refine failed (the log carries the failure)\n");
+    return 1;
+  }
+  if (*summary != NULL) {
+    fputs(*summary, stdout);
+    free(*summary);
+    *summary = NULL;
+    fflush(stdout);
+  }
+  return 0;
+}
+
+/* The --refine-sid value's frame path: frame_resume opens the FULL subtree
+   path ("sessions/<hex>" — what frame_sid prints at create time), so a BARE
+   hex is framed into "sessions/<hex>" here; anything containing '/' rides
+   through as the path it claims to be. *framed_out carries the heap copy to
+   free when a bare hex was framed. Returns 0 (with *path_out NULL when no
+   --refine-sid was given — a fresh top frame) or -1 on out of memory. */
+static int _demo_refine_sid_path(const char* refine_sid, const char** path_out,
+                                 char** framed_out) {
+  *framed_out = NULL;
+  *path_out = NULL;
+  if (refine_sid == NULL) return 0;
+  if (strchr(refine_sid, '/') != NULL) {
+    *path_out = refine_sid;
+    return 0;
+  }
+  size_t len = strlen("sessions/") + strlen(refine_sid) + 1;
+  char* framed = malloc(len);
+  if (framed == NULL) return -1;
+  snprintf(framed, len, "sessions/%s", refine_sid);
+  *framed_out = framed;
+  *path_out = framed;
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const char* location = "sa-demo-db";
   const char* base_url = "http://127.0.0.1:11434";
   const char* model = NULL;
   const char* goal = NULL;
+  int want_refine = 0;          /* --refine */
+  uint8_t refine_global = 0;    /* --refine-global (the SHARED harness root) */
+  const char* refine_sid = NULL;  /* --refine-sid: the past session's subtree */
+  int has_rollback = 0;         /* --refine-rollback */
+  uint64_t rollback_seq = 0;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--location") == 0 && i + 1 < argc) {
@@ -170,15 +240,50 @@ int main(int argc, char** argv) {
       model = argv[++i];
     } else if (strcmp(argv[i], "--goal") == 0 && i + 1 < argc) {
       goal = argv[++i];
+    } else if (strcmp(argv[i], "--refine") == 0) {
+      want_refine = 1;
+    } else if (strcmp(argv[i], "--refine-global") == 0) {
+      refine_global = 1;
+    } else if (strcmp(argv[i], "--refine-sid") == 0 && i + 1 < argc) {
+      refine_sid = argv[++i];
+    } else if (strcmp(argv[i], "--refine-rollback") == 0 && i + 1 < argc) {
+      const char* text = argv[++i];
+      char* end = NULL;
+      errno = 0;
+      unsigned long long seq = strtoull(text, &end, 10);
+      if (text[0] == '\0' || text[0] == '-' || end == text || *end != '\0' ||
+          errno == ERANGE) {
+        fprintf(stderr, "frame-demo: --refine-rollback needs a nonnegative "
+                "harness-log seq (got '%s')\n%s", text, SA_DEMO_USAGE);
+        return 2;
+      }
+      has_rollback = 1;
+      rollback_seq = (uint64_t)seq;
     } else {
       fprintf(stderr, "frame-demo: unknown or incomplete argument '%s'\n%s",
               argv[i], SA_DEMO_USAGE);
       return 2;
     }
   }
-  if (model == NULL || goal == NULL) {
-    fprintf(stderr, "frame-demo: --model and --goal are required\n%s",
-            SA_DEMO_USAGE);
+  /* The two refine ACTIONS are mutually exclusive (stated in the usage
+     text): --refine is a review-and-apply of a fresh run's trajectory,
+     --refine-rollback un-does one recorded refinement. */
+  if (want_refine && has_rollback) {
+    fprintf(stderr, "frame-demo: --refine and --refine-rollback are mutually "
+            "exclusive\n%s", SA_DEMO_USAGE);
+    return 2;
+  }
+  if (model == NULL) {
+    fprintf(stderr, "frame-demo: --model is required\n%s", SA_DEMO_USAGE);
+    return 2;
+  }
+  /* --goal is optional only when the refine action supplies the session
+     (a --refine-sid resume, or a --refine-rollback vehicle frame —
+     frame_create's NULL goal is legal, frame.h's contract). A --refine
+     without --goal and without --refine-sid has no session to review. */
+  if (goal == NULL && refine_sid == NULL && !has_rollback) {
+    fprintf(stderr, "frame-demo: --goal is required (or supply --refine-sid "
+            "<sid>/<--refine-rollback <seq>'s session)\n%s", SA_DEMO_USAGE);
     return 2;
   }
 
@@ -211,20 +316,82 @@ int main(int argc, char** argv) {
   cfg.model_base_url = base_url;  /* api key — none for Ollama */
   cfg.model_name = model;
   cfg.max_depth = 4;
-  frame_t* f = frame_create(db, NULL, goal, &cfg);
-  if (f == NULL) {
-    fprintf(stderr, "frame-demo: cannot create the top frame\n");
+
+  /* The refine session: a --refine-sid resume (framed to the subtree path),
+     or a fresh top frame (goal may be NULL). */
+  char* framed_sid = NULL;
+  const char* resume_path = NULL;
+  if (_demo_refine_sid_path(refine_sid, &resume_path, &framed_sid) != 0) {
+    fprintf(stderr, "frame-demo: out of memory framing the --refine-sid "
+            "session path\n");
     wave_db_close(db);
     return 1;
   }
-  printf("frame-demo: %s goal '%s' -> model %s at %s\n", frame_sid(f), goal,
-         model, base_url);
+  frame_t* f = NULL;
+  if (resume_path != NULL) {
+    f = frame_resume(db, resume_path, &cfg);
+    if (f == NULL) {
+      fprintf(stderr, "frame-demo: cannot resume the '%s' subtree "
+              "(the frame layer's log carries the reason)\n", resume_path);
+      free(framed_sid);
+      wave_db_close(db);
+      return 1;
+    }
+  } else {
+    f = frame_create(db, NULL, goal, &cfg);
+    if (f == NULL) {
+      fprintf(stderr, "frame-demo: cannot create the top frame\n");
+      wave_db_close(db);
+      return 1;
+    }
+  }
+  if (goal != NULL) {
+    printf("frame-demo: %s goal '%s' -> model %s at %s\n", frame_sid(f), goal,
+           model, base_url);
+  } else {
+    printf("frame-demo: %s (no goal) -> model %s at %s\n", frame_sid(f), model,
+           base_url);
+  }
   fflush(stdout);
+
+  /* ROLLBACK (--refine-rollback, with the session from --refine-sid or the
+     fresh frame above): no turn loop — the exact-record scan rides the
+     stored refinement record alone. */
+  if (has_rollback) {
+    char* summary = NULL;
+    int rr = refine_rollback(f, rollback_seq, refine_global, &summary);
+    int rc = _demo_print_refine_summary(rr, &summary);
+    frame_destroy(f);
+    wave_db_close(db);
+    free(framed_sid);
+    return rc;
+  }
+
+  /* REFINE AGAINST A PAST SESSION (--refine-sid): no turn loop — refine's
+     review rides the same configured endpoint over the stored trajectory. */
+  if (refine_sid != NULL) {
+    char* summary = NULL;
+    int rr = refine_run(f, NULL, refine_global, &summary);
+    int rc = _demo_print_refine_summary(rr, &summary);
+    frame_destroy(f);
+    wave_db_close(db);
+    free(framed_sid);
+    return rc;
+  }
 
   int loop_rc = frame_run_loop(f);
   int outcome_rc = _demo_print_outcome(f);
+  int rc = (loop_rc == 0 && outcome_rc == 0) ? 0 : 1;
+
+  /* --refine: review THIS run's trajectory (instructions NULL = the
+     built-in review contract) after the loop, whatever the loop's exit. */
+  if (want_refine) {
+    char* summary = NULL;
+    int rr = refine_run(f, NULL, refine_global, &summary);
+    if (_demo_print_refine_summary(rr, &summary) != 0) rc = 1;
+  }
 
   frame_destroy(f);
   wave_db_close(db);
-  return (loop_rc == 0 && outcome_rc == 0) ? 0 : 1;
+  return rc;
 }
