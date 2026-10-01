@@ -195,7 +195,12 @@ int main(int argc, char** argv) {
   py_agent_init();
 #endif
 
-  wave_database_root_t* db = wave_db_open(location);
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = location;   /* the demo's store stays INLINE — the engine's
+                               driver pumps it (wave_db_open_config's NULL
+                               store_pool shape) */
+  wave_database_root_t* db = wave_db_open_config(&sc);
   if (db == NULL) {
     fprintf(stderr, "frame-demo: cannot open the root db at '%s'\n", location);
     return 1;

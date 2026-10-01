@@ -32,8 +32,34 @@ typedef struct frame_config_t {
   scheduler_pool_t* pool;
 } frame_config_t;
 
+/* Store-actor configuration (the root's OWN pool): NULL = the inline shape
+   (tests/demos pump the store actor by hand via wave_db_pump; wave_db_open
+   below is this with NULL). A POOLED FRAME REQUIRES a POOLED STORE —
+   frame_create/frame_resume refuse loud otherwise (a pooled frame posting
+   into an un-pumped inline store mailbox would hang, not fail). */
+typedef struct wave_database_config_t {
+  const char* location;          /* NULL = in-memory */
+  scheduler_pool_t* store_pool;  /* BORROWED; never owned/freed by the root */
+} wave_database_config_t;
+
+/* Open (or boot-restore onto) a root database with the store actor attached.
+   SAME database lifecycle as wave_db_open (database_create_with_config,
+   sync_only=0, fail-loud on failure) — the store actor just OWNS the
+   single-serializer role now. */
+wave_database_root_t* wave_db_open_config(const wave_database_config_t* cfg);
+
+/* Open (or boot-restore onto) a root database: the inline-store shape of
+   wave_db_open_config (a NULL store pool — tests/demos pump via wave_db_pump). */
 wave_database_root_t* wave_db_open(const char* location /* NULL = in-memory */);
 void wave_db_close(wave_database_root_t* db);
+
+/* Test/dual-driver accessors:
+   - the store actor embedded in the root (actor_t-first state; BORROWED);
+   - the inline pump: runs ONE actor_run batch over the store actor's
+     mailbox; returns 0 after pumping. On a POOLED store it refuses loud
+     (workers own pacing) and returns nonzero. */
+actor_t* wave_db_store_actor(wave_database_root_t* db);
+int wave_db_pump(wave_database_root_t* db);
 
 typedef struct frame_t frame_t;
 

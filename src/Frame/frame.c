@@ -65,6 +65,54 @@ void frm_child_report_payload_destroy(void* p) {
   free(rp);
 }
 
+void frm_store_batch_payload_destroy(void* p) {
+  frm_store_batch_payload_t* bp = (frm_store_batch_payload_t*)p;
+  if (bp == NULL) return;
+  if (bp->ops != NULL) {
+    for (size_t i = 0; i < bp->nops; i++) {
+      free(bp->ops[i].key);
+      free(bp->ops[i].value);
+    }
+    free(bp->ops);
+  }
+  free(bp);
+}
+
+void frm_store_scan_payload_destroy(void* p) {
+  frm_store_scan_payload_t* sp = (frm_store_scan_payload_t*)p;
+  if (sp == NULL) return;
+  free(sp->start);
+  free(sp->end);
+  free(sp);
+}
+
+void frm_store_recall_payload_destroy(void* p) {
+  frm_store_recall_payload_t* rp = (frm_store_recall_payload_t*)p;
+  if (rp == NULL) return;
+  free(rp->key);
+  free(rp->sid_path);
+  free(rp);
+}
+
+void frm_store_reply_payload_destroy(void* p) {
+  frm_store_reply_payload_t* rp = (frm_store_reply_payload_t*)p;
+  if (rp == NULL) return;
+  if (rp->records != NULL) {
+    for (size_t i = 0; i < rp->n; i++) free(rp->records[i]);
+    free(rp->records);
+  }
+  free(rp);
+}
+
+void frm_report_bind_payload_destroy(void* p) {
+  frm_report_bind_payload_t* bp = (frm_report_bind_payload_t*)p;
+  if (bp == NULL) return;
+  free(bp->child_sid);
+  free(bp->child_event_text);
+  free(bp->text);
+  free(bp);
+}
+
 #ifdef SA_HAS_WDB
 
 #include "model.h"
@@ -93,6 +141,61 @@ void frm_child_report_payload_destroy(void* p) {
    approaching that limit up front so rejection is loud and early. */
 #define SA_FRAME_MAX_BATCH_BYTES (120 * 1024)
 
+/* --- the store round trips (frame.c-internal; §5's seq discipline) --------
+
+   Every store touch is a MESSAGE to the root's store actor. A frame composes
+   on its own dispatch thread (single-runner discipline — no lock), PRE-
+   ALLOCATES its seq at compose time, and awaits the corr-matched reply
+   through ONE of the slots below (or lets the FRM_STORE_REPLY router answer
+   a registered bridge corr). All slots are single-flight: fully overwritten
+   at compose, cleared by their awaiter.
+
+   frame_sync_slot_t: the DIRECT sync API's slot (remember/append/join/
+   status/recall) — one call awaits it on the caller's (pump-wait) thread. */
+typedef struct frame_sync_slot_t {
+  uint8_t in_use, done;    /* in_use = a direct sync call awaits; done = the
+                              reply landed */
+  uint64_t corr;           /* the awaited corr */
+  int rc;                  /* the store's refusal code (0 = committed) */
+  char* text;              /* a recall reply's resolved text (transfer) */
+} frame_sync_slot_t;
+
+/* The spawn admission: the parent awaits the store's commit; the router
+   fills the child (and the bridge corr's cell answer when cell-side). */
+typedef struct frame_spawn_slot_t {
+  uint8_t in_use, done;
+  uint64_t corr;
+  uint64_t bridge_corr;    /* 0 = the direct sync caller awaits; nonzero = a
+                              cell-verb spawn (the router answers + cleans) */
+  int rc;                  /* the store's refusal code (0 = committed) */
+  uint64_t own_seq;        /* the parent's PRE-ALLOCATED admission seq */
+  frame_t* child;          /* the allocated (not yet committed) child */
+} frame_spawn_slot_t;
+
+/* The report bind: the CHILD awaits its own store corr (the reply routes
+   back to the child's actor); the router releases the direct caller and
+   answers a cell-side bridge corr. */
+typedef struct frame_bind_slot_t {
+  uint8_t in_use, done;
+  uint64_t corr, bridge_corr;
+  uint8_t engine_driven;   /* 1 = post FRM_CHILD_REPORT on the reply (Task
+                              6's terminate wires its own binds with this) */
+  int rc;                  /* the store's refusal code (0 = committed) */
+  uint64_t own_seq;        /* the child's pre-allocated seq */
+} frame_bind_slot_t;
+
+/* The behavior-posted store round trips' registered corr answers: the
+   bridge corr of a cell verb waiting one store hop. Every mutation happens
+   on the frame's OWN dispatch thread (actor single-runner discipline) — a
+   list, no lock. */
+typedef struct frm_bridge_pending_t {
+  uint64_t corr;           /* the frame's OWN store round-trip corr */
+  uint64_t answer_corr;    /* the corr the reply must be answered under (the
+                              bridge verb's py-agent corr) */
+  uint8_t is_recall;       /* 1 = the answer carries the resolved text */
+  struct frm_bridge_pending_t* next;
+} frm_bridge_pending_t;
+
 /* sid layout: 8 hex chars = 20 random bits (top) | 10 counter bits (bits
    2-11; the 0xFFC mask forces the low 2 bits to 0). That leaves ~1024
    distinct counter slots per root, so uniqueness rests on the random top
@@ -119,11 +222,17 @@ static const char SA_FRAME_STATUS_DONE[] = "done";
 #define SA_FRAME_DEBUG_MAX_EVENTS 512
 
 struct wave_database_root_t {
+  actor_t store_actor;        /* FIRST member (house rule: actor states lead
+                                 with actor_t) — the ONE serializer: every
+                                 frame-layer store op executes inside this
+                                 actor's behavior, ONE message at a time */
   database_t* db;             /* the ONE root database */
   graph_layer_t* lineage;     /* subtree-mode graph layer over lineage_st */
   database_subtree_t* lineage_st;  /* reserved "lineage" subtree (open for life) */
   uint32_t rng;               /* xorshift32 state for sid randomness */
   ATOMIC(uint64_t) counter;   /* sid uniqueness counter */
+  scheduler_pool_t* store_pool;  /* BORROWED; NULL = inline (tests/demo pump
+                                    by hand) — the dual-driver rule's knob */
 };
 
 struct frame_t {
@@ -173,6 +282,14 @@ struct frame_t {
      discipline like the cell slot: every access is on the frame's dispatch
      thread (an inline frame's owner thread) or before the actor runs. */
   uint8_t engine_live;
+  /* --- the store round trip (Task 2; §5) --------------------------------- */
+  uint64_t store_corr_seq;          /* the frame's OWN round-trip key space:
+                                       a nonzero allocator (0 = fire-and-post) */
+  frm_bridge_pending_t* bridge_pending;   /* corr answers waiting one store
+                                             hop (registered pre-post) */
+  frame_sync_slot_t sync;           /* the direct sync API's awaited reply */
+  frame_spawn_slot_t spawn_slot;    /* the spawn admission's awaited commit */
+  frame_bind_slot_t bind_slot;      /* the report bind's awaited commit */
 };
 
 /* --- bridge reply hook (frame_bridge.h contract) ---------------------------
@@ -373,28 +490,485 @@ static char* _frame_state_key(const char* state_prefix, const char* key) {
   return out;
 }
 
-/* One raw event record write (frame_internal.h contract): at the NEXT seq,
-   record + ONE root batch; seq bumped only after the batch commits. Nothing
-   is written before the batch, so a refusal never half-applies. CONSUMES the
-   payload on every path. */
-int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload) {
+/* The recall resolve walk (own local/ -> own ctx/ -> the meta/parent hops'
+   ctx/): a pure store computation over the walk's subtree reads. It runs in
+   the STORE actor's behavior (the serialized read); `own` is the already-
+   opened starting subtree, `max_hops` the frame's depth budget. Bounded
+   always: a corrupt/looped meta/parent chain cannot spin forever; every
+   per-hop subtree is closed again on every path. */
+static char* _frame_recall_walk(database_subtree_t* own, const char* key,
+                                unsigned max_hops) {
+  /* 1) Own local scratch — private, so this is the shadowing top layer. */
+  char* state_key = _frame_state_key("state/local/", key);
+  if (state_key == NULL) return NULL;
+  char* text = _frame_subtree_text(own, state_key);
+  free(state_key);
+  if (text != NULL) return text;
+
+  /* 2) Own ctx. */
+  state_key = _frame_state_key("state/ctx/", key);
+  if (state_key == NULL) return NULL;
+  text = _frame_subtree_text(own, state_key);
+  free(state_key);
+  if (text != NULL) return text;
+
+  /* 3) Lineage walk: read meta/parent, open that subtree, read ONLY its
+     state/ctx/<key>; repeat upward until resolved, exhausted, or the hop
+     budget (max_depth + 1 ancestor reads) is spent. */
+  database_subtree_t* prev = NULL;      /* per-hop subtree owed a close */
+  database_subtree_t* cur = own;        /* borrowed until the first hop */
+  for (unsigned hop = 0; hop <= max_hops; hop++) {
+    char* parent_path = _frame_subtree_text(cur, "meta/parent");
+    if (parent_path == NULL) {
+      database_subtree_close(prev);
+      return NULL;                       /* root of the lineage: unresolvable */
+    }
+    database_subtree_t* p = database_subtree_open(cur->db, parent_path, '/');
+    free(parent_path);
+    if (p == NULL) {
+      database_subtree_close(prev);
+      return NULL;
+    }
+    state_key = _frame_state_key("state/ctx/", key);
+    if (state_key == NULL) {
+      database_subtree_close(p);
+      database_subtree_close(prev);
+      return NULL;
+    }
+    text = _frame_subtree_text(p, state_key);
+    free(state_key);
+    database_subtree_close(prev);
+    if (text != NULL) {
+      database_subtree_close(p);
+      return text;
+    }
+    prev = p;
+    cur = p;
+  }
+  database_subtree_close(prev);
+  return NULL;                           /* hop budget spent */
+}
+
+/* --- the store round-trip machinery (§5) ---------------------------------- */
+
+/* Seq PRE-ALLOCATION (the lock's replacement): the frame's seq lives in its
+   OWN actor (single-runner discipline — no atomic, no lock); a composer
+   allocates seq = current + 1 AT COMPOSE TIME and never re-reads it. On a
+   store refusal the number is abandoned: when the frame was single-flight
+   the rollback restores today's no-gap discipline exactly; otherwise the
+   gap stays (a recorded consequence — the wrong key is impossible, the
+   store's atomic batch committed nothing half of). */
+static uint64_t _frame_seq_alloc(frame_t* f) {
+  f->seq = f->seq + 1;
+  return f->seq;
+}
+
+static void _frame_seq_rollback(frame_t* f, uint64_t abandoned) {
+  if (f == NULL || abandoned == 0) return;
+  if (f->seq == abandoned) {
+    f->seq = abandoned - 1;
+  } else {
+    log_error("frame: seq %llu of '%s' was not the latest allocation (%llu) "
+              "— the composer was not single-flight; the gap stays (the "
+              "store's batch committed nothing half of)",
+              (unsigned long long)abandoned, f->sid_path,
+              (unsigned long long)f->seq);
+  }
+}
+
+/* The bridge corr registry: a registered corr answer waits exactly one store
+   hop. Registered BEFORE the post, from the frame's own dispatch thread.
+   `corr` is the frame's OWN store corr (its reply's corr); `answer_corr` is
+   the call it must be answered under — the py-agent bridge's own corr space
+   (the two counters are UNRELATED: one mapped registration per round trip
+   keeps them from aliasing a slot's corr in the router). */
+static void _frame_bridge_pending_add(frame_t* f, uint64_t corr,
+                                      uint64_t answer_corr, uint8_t is_recall) {
+  if (f == NULL || corr == 0) return;
+  frm_bridge_pending_t* node = get_clear_memory(sizeof(frm_bridge_pending_t));
+  node->corr = corr;
+  node->answer_corr = answer_corr;
+  node->is_recall = is_recall;
+  node->next = f->bridge_pending;
+  f->bridge_pending = node;
+}
+
+/* 1 when `corr` was registered (and unlinks it: *answer_out carries the corr
+   to answer under, *is_recall_out the verb's answer shape). */
+static int _frame_bridge_pending_take(frame_t* f, uint64_t corr,
+                                      uint64_t* answer_out, uint8_t* is_recall_out) {
+  frm_bridge_pending_t** p = &f->bridge_pending;
+  while (*p != NULL) {
+    if ((*p)->corr == corr) {
+      frm_bridge_pending_t* hit = *p;
+      if (answer_out != NULL) *answer_out = hit->answer_corr;
+      if (is_recall_out != NULL) *is_recall_out = hit->is_recall;
+      *p = hit->next;
+      free(hit);
+      return 1;
+    }
+    p = &(*p)->next;
+  }
+  return 0;
+}
+
+/* A post that hands ownership to the actor system: the DESTROY/dropped-send
+   case is checked from the target's flag (actor_send's return value means
+   "was busy", not "refused" — a queued message at a busy mailbox is still
+   delivered). Refusals log loud. */
+static void _frame_post(actor_t* target, uint32_t type, void* payload,
+                        void (*destroy)(void*), const char* what) {
+  message_t m;
+  m.type = type;
+  m.payload = payload;
+  m.payload_destroy = destroy;
+  if (atomic_load(&target->flags) & ACTOR_FLAG_DESTROY) {
+    log_error("frame: %s dropped — the target actor is destroyed (a dying "
+              "requester loses only a wake-up it could not have used)", what);
+    if (destroy != NULL) destroy(payload);
+    return;
+  }
+  (void)actor_send(target, &m);
+}
+
+/* The store's outgoing reply: corr-matched to the requester's actor. records
+   ownership transfers (the payload destroyer frees them; on a refused send
+   the local destroy frees them here). */
+static void _store_reply_send(actor_t* reply_to, uint64_t corr, int rc,
+                              char** records, size_t n) {
+  if (reply_to == NULL) {
+    /* Fire-and-post: the store worker's own log carried the commit/refusal;
+       records die here. */
+    if (records != NULL) {
+      for (size_t i = 0; i < n; i++) free(records[i]);
+      free(records);
+    }
+    return;
+  }
+  frm_store_reply_payload_t* rp =
+      get_clear_memory(sizeof(frm_store_reply_payload_t));
+  rp->corr = corr;
+  rp->rc = rc;
+  rp->n = n;
+  rp->records = records;
+  _frame_post(reply_to, (uint32_t)FRM_STORE_REPLY, rp, frm_store_reply_payload_destroy,
+              "store reply");
+}
+
+/* The synchronous round-trip refusal (§5's inline-only rule): the direct
+   sync APIs pump-wait, and a POOLED store's pacing belongs to its workers —
+   mixing an arbitrary caller's thread into pool-driven serialization would
+   re-open the lock question. A pooled frame cannot even get here (the
+   create/resume guard); an inline frame posting at a pooled store refuses
+   loud. */
+static int _frame_sync_store_refused(frame_t* f, const char* op) {
+  if (f != NULL && f->root != NULL && f->root->store_pool != NULL) {
+    log_error("frame: %s at '%s' refuses loud — the root's store actor is "
+              "POOLED and the synchronous store API is inline-store-only "
+              "(production reaches this effect through the actor paths)",
+              op, f->sid_path != NULL ? f->sid_path : "?");
+    return 1;
+  }
+  return 0;
+}
+
+/* ONE pump cycle over an inline frame's whole round-trip surface
+   (frame_internal.h contract — the ONLY pump-order definition). */
+void _frame_pump(frame_t* f) {
+  if (f == NULL) return;
+  actor_run(&f->actor, ACTOR_BATCH_SIZE);
+  for (frame_t* a = f->parent; a != NULL; a = a->parent) {
+    if (a->st == NULL) continue;         /* live ancestors only */
+    if (a->pool != NULL) continue;       /* pooled: scheduler workers own it */
+    actor_run(&a->actor, ACTOR_BATCH_SIZE);
+  }
+  if (f->root != NULL && f->root->store_pool == NULL) {
+    actor_run(&f->root->store_actor, ACTOR_BATCH_SIZE);
+  }
+}
+
+/* Bounded pure-drain pump-wait (the _frame_cell_wait shape) until `done_slot`
+   flips. 0 = completed; nonzero = the deadline broke (the slot is abandoned —
+   the late reply becomes the router's loud drop). */
+static int _frame_slot_wait(frame_t* f, uint8_t* done_slot, unsigned timeout_ms) {
+  if (*done_slot) return 0;
+  uint64_t deadline =
+      platform_monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
+  for (;;) {
+    _frame_pump(f);
+    if (*done_slot) return 0;
+    if (platform_monotonic_ns() >= deadline) {
+      log_error("frame: store round trip corr %llu at '%s' still unanswered "
+                "after %u ms — the wait gives up (the store keeps the batch; "
+                "its reply routes whenever it lands)",
+                (unsigned long long)f->sync.corr, f->sid_path, timeout_ms);
+      return -1;
+    }
+    platform_sleep_ms(1);
+  }
+}
+
+/* The store actor's dispatch (§5): every frame-layer store operation —
+   atomic batches, the bounded events scan, the recall resolve walk —
+   executes HERE, one message at a time. Serialization comes from being ONE
+   actor; no platform lock exists anywhere in the frame layer (the owner's
+   amendment). All three behaviors are µs-scale (WaveDB's read path +
+   in-memory batch composition only happen in the store's own thread); the
+   store stays a PURE DRAIN — it never blocks on a resource. Payloads are
+   claimed (msg->payload = NULL) and consumed here on every path. */
+static void _store_behavior(void* state, message_t* msg) {
+  wave_database_root_t* root = (wave_database_root_t*)state;
+  if (msg == NULL) return;
+  switch (msg->type) {
+    case FRM_STORE_BATCH: {
+      /* ONE atomic root batch across every touched subtree: map the ops
+         (keys/values stay where the composer left them), cap-check per op
+         and in total (the composers' cap checks MIRRORED here — fail-loud,
+         no silent truncation), run, and corr-match the reply back. */
+      frm_store_batch_payload_t* bp = (frm_store_batch_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (bp == NULL) {
+        log_error("store: FRM_STORE_BATCH with no payload — dropping loud");
+        break;
+      }
+      int rc = 0;
+      raw_op_t* ops = (bp->nops > 0)
+          ? (raw_op_t*)get_clear_memory(bp->nops * sizeof(raw_op_t)) : NULL;
+      size_t total = 0;
+      for (size_t i = 0; i < bp->nops && rc == 0; i++) {
+        if (bp->ops[i].key == NULL) {
+          log_error("store: batch '%s' op %zu has no key — refused loud",
+                    bp->op_name != NULL ? bp->op_name : "?", i);
+          rc = -1;
+          break;
+        }
+        if (bp->ops[i].value_len > SA_FRAME_MAX_BATCH_BYTES) {
+          log_error("store: batch '%s' op %zu's value is %zu bytes, exceeding "
+                    "the %d-byte WAL batch cap — refusing, never truncating",
+                    bp->op_name != NULL ? bp->op_name : "?", i,
+                    bp->ops[i].value_len, (int)SA_FRAME_MAX_BATCH_BYTES);
+          rc = -3;
+          break;
+        }
+        ops[i].key = bp->ops[i].key;
+        ops[i].key_len = strlen(bp->ops[i].key);
+        /* WaveDB's puts need a NON-NULL value even at length 0 (presence
+           markers — the graph triple ops' empty marker); the composers heap
+           their values. */
+        if (bp->ops[i].value == NULL) {
+          log_error("store: batch '%s' op %zu has no value — refused loud",
+                    bp->op_name != NULL ? bp->op_name : "?", i);
+          rc = -1;
+          break;
+        }
+        ops[i].value = (const uint8_t*)bp->ops[i].value;
+        ops[i].value_len = bp->ops[i].value_len;
+        ops[i].type = 0;   /* all frame-layer writes are puts */
+        total += ops[i].key_len + ops[i].value_len;
+      }
+      if (rc == 0 && total > SA_FRAME_MAX_BATCH_BYTES) {
+        log_error("store: batch '%s' is %zu bytes, exceeding the %d-byte WAL "
+                  "batch cap — refusing, never truncating",
+                  bp->op_name != NULL ? bp->op_name : "?", total,
+                  (int)SA_FRAME_MAX_BATCH_BYTES);
+        rc = -3;
+      }
+      if (rc == 0) {
+        rc = database_batch_sync_raw(root->db, '/', ops, bp->nops);
+        if (rc != 0) {
+          log_error("store: batch '%s' failed (%d) at the root — nothing "
+                    "committed", bp->op_name != NULL ? bp->op_name : "?", rc);
+        } else if (bp->reply_to == NULL) {
+          log_info("store: batch '%s' committed (fire-and-post)",
+                   bp->op_name != NULL ? bp->op_name : "?");
+        }
+      }
+      actor_t* reply_to = bp->reply_to;         /* borrowed; survives the free */
+      uint64_t corr = bp->corr;
+      free(ops);                                /* the raw mapping array */
+      frm_store_batch_payload_destroy(bp);
+      /* The reply fires even on a refusal (the requester awaits corr-matched;
+         reply_to NULL = fire-and-post — nothing waits). */
+      _store_reply_send(reply_to, corr, rc, NULL, 0);
+      break;
+    }
+    case FRM_STORE_SCAN: {
+      /* The bounded reverse range read (the derive's store trip): the
+         ABSOLUTE composed bounds (WaveDB's subtree bounded scans are broken
+         in both directions — the root-level discipline, unchanged), the
+         newest-records materialization moved here, and the raw texts
+         REVERSED to ascending order in the reply. The store worker never
+         parses JSON. */
+      frm_store_scan_payload_t* sp = (frm_store_scan_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (sp == NULL) {
+        log_error("store: FRM_STORE_SCAN with no payload — dropping loud");
+        break;
+      }
+      path_t* start = (sp->start != NULL)
+          ? path_create_from_raw(sp->start, strlen(sp->start), '/', 0) : NULL;
+      path_t* end = (sp->end != NULL)
+          ? path_create_from_raw(sp->end, strlen(sp->end), '/', 0) : NULL;
+      int rc = 0;
+      size_t n = 0;
+      char** records = NULL;
+      if (start == NULL || end == NULL) {
+        log_error("store: scan '%s'..'%s' — bound composition failed",
+                  sp->start != NULL ? sp->start : "(null)",
+                  sp->end != NULL ? sp->end : "(null)");
+        if (start != NULL) path_destroy(start);
+        if (end != NULL) path_destroy(end);
+        rc = -1;
+      } else {
+        database_iterator_t* iter = database_scan_start_reverse(root->db, start, end);
+        if (iter == NULL) {
+          path_destroy(start);
+          path_destroy(end);
+          log_error("store: reverse scan failed — refusing the scan reply");
+          rc = -1;
+        } else {
+          char* texts[SA_FRAME_DEBUG_MAX_EVENTS];   /* newest-first (descending seq) */
+          n = 0;
+          int oom = 0;
+          path_t* key = NULL;
+          identifier_t* value = NULL;
+          while (n < SA_FRAME_DEBUG_MAX_EVENTS) {
+            path_t* k = NULL;
+            identifier_t* v = NULL;
+            int src = database_scan_prev(iter, &k, &v);
+            if (src != 0) break;                 /* -1: out of records, -2: error */
+            size_t len = 0;
+            uint8_t* data = identifier_get_data_copy(v, &len);
+            if (data != NULL) {
+              char* text = (char*)get_memory(len + 1);
+              if (text == NULL) {
+                free(data);
+                oom = 1;
+              } else {
+                memcpy(text, data, len);
+                text[len] = '\0';
+                texts[n++] = text;
+              }
+            } else {
+              log_error("store: scan record value copy failed");
+              oom = 1;
+            }
+            path_destroy(k);
+            identifier_destroy(v);
+          }
+          database_scan_end(iter);
+          /* The scan consumed the bounds' lifetime (they are not destroyed
+             again on this path). */
+          if (oom) {
+            log_error("store: scan materialization hit a bound — the reply "
+                      "carries the %zu records it got", n);
+          }
+          /* Emit ascending (the caller reads oldest -> newest). */
+          if (n > 0) {
+            records = (char**)get_clear_memory(n * sizeof(char*));
+            if (records == NULL) {
+              rc = -1;
+            } else {
+              for (size_t i = 0; i < n; i++) records[i] = texts[n - 1 - i];
+            }
+          }
+        }
+      }
+      if (rc != 0 && records != NULL) {
+        for (size_t i = 0; i < n; i++) free(records[i]);
+        free(records);
+        records = NULL;
+        n = 0;
+      }
+      _store_reply_send(sp->reply_to, sp->corr, rc, records, records != NULL ? n : 0);
+      frm_store_scan_payload_destroy(sp);
+      break;
+    }
+    case FRM_STORE_RECALL: {
+      /* The recall resolve walk, run INSIDE this dispatch = one serialized
+         read walk (the frame's behavior stays lock-free). The resolved text
+         rides records[0]; rc != 0 (walk refused / unresolvable / budget
+         spent) answers with no record — today's NULL shape. */
+      frm_store_recall_payload_t* rp = (frm_store_recall_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (rp == NULL) {
+        log_error("store: FRM_STORE_RECALL with no payload — dropping loud");
+        break;
+      }
+      int rc = 0;
+      char** records = NULL;
+      if (rp->key == NULL || rp->sid_path == NULL ||
+          _frame_key_valid(rp->key, "recall") == 0) {
+        log_error("store: recall request needs a valid key and a sid path — "
+                  "refused loud");
+        rc = -1;
+      } else {
+        database_subtree_t* own = database_subtree_open(root->db, rp->sid_path, '/');
+        if (own == NULL) {
+          log_error("store: the recall walk's start subtree '%s' is unopenable",
+                    rp->sid_path);
+          rc = -1;
+        } else {
+          char* resolved = _frame_recall_walk(own, rp->key, rp->max_hops);
+          database_subtree_close(own);
+          if (resolved != NULL) {
+            records = (char**)get_clear_memory(sizeof(char*));
+            if (records == NULL) {
+              free(resolved);
+              rc = -1;
+            } else {
+              records[0] = resolved;
+            }
+          } else {
+            rc = -1;   /* unresolvable: today's silent-NULL shape, corr-matched */
+          }
+        }
+      }
+      _store_reply_send(rp->reply_to, rp->corr, rc, records, rc == 0 ? 1 : 0);
+      if (rc != 0 && records != NULL) free(records);
+      frm_store_recall_payload_destroy(rp);
+      break;
+    }
+    case FRM_STORE_REPLY:   /* replies LEAVE the store; arriving = routing bug */
+    default:
+      if (msg->payload_destroy != NULL && msg->payload != NULL) {
+        msg->payload_destroy(msg->payload);
+        msg->payload = NULL;
+      }
+      log_error("store: unhandled message type %u at the store actor — "
+                "dropping loud", (unsigned)msg->type);
+      break;
+  }
+}
+
+/* One event record = ONE store round trip: the record composes against the
+   frame's PRE-ALLOCATED seq and the one-op batch is POSTED at the root's
+   store actor — no direct write happens at a frame thread any more. The
+   store's FIFO order also anchors causality (a fire-and-post control event
+   commits ahead of anything its frame posts after it). Nothing is written
+   before the batch, so a refusal never half-applies. CONSUMES the payload
+   on every path. seq_out carries the PRE-ALLOCATED seq (also on the
+   refusal paths — for a best-effort rollback). Returns 0 once POSTED;
+   -1/-3 on the pre-post refusals (already logged; nothing was posted). */
+static int _frame_event_post(frame_t* f, const char* type_name, json_value_t* payload,
+                             uint64_t corr, actor_t* reply_to, uint64_t* seq_out) {
+  if (seq_out != NULL) *seq_out = 0;
   if (f == NULL || f->st == NULL) {
     log_error("frame: event '%s' on a dead frame",
               type_name != NULL ? type_name : "?");
     json_value_destroy(payload);
     return -1;
   }
-  uint64_t seq = f->seq + 1;
+  uint64_t seq = _frame_seq_alloc(f);
+  if (seq_out != NULL) *seq_out = seq;
   char* text = _frame_event_json(f, seq, type_name, payload);   /* consumes payload */
   if (text == NULL) return -1;
 
-  char* evkey = get_memory(sizeof("events/00000000000000000000"));
+  char* evkey = _frame_event_key(f->sid_path, seq);
   if (evkey == NULL) {
     free(text);
     return -1;
   }
-  snprintf(evkey, sizeof("events/00000000000000000000"), "events/%020llu",
-           (unsigned long long)seq);
 
   size_t text_len = strlen(text);
   if (text_len > SA_FRAME_MAX_BATCH_BYTES) {
@@ -406,31 +980,87 @@ int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload)
     return -3;
   }
 
-  raw_op_t ops[1];
-  ops[0].key = evkey;
-  ops[0].key_len = strlen(evkey);
-  ops[0].value = (const uint8_t*)text;
-  ops[0].value_len = text_len;
-  ops[0].type = 0;
-
-  int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 1);
-  free(evkey);
-  free(text);
-  if (rc != 0) {
-    log_error("frame: '%s' event batch failed (%d); seq %llu of '%s' is "
-              "unwritten", type_name != NULL ? type_name : "?", rc,
-              (unsigned long long)seq, f->sid_path);
-    return rc;
-  }
-  f->seq = seq;
+  frm_store_batch_payload_t* bp =
+      get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = get_clear_memory(sizeof(frm_store_op_t));
+  bp->nops = 1;
+  bp->ops[0].key = evkey;              /* OWNED: the store behavior frees it */
+  bp->ops[0].value = (uint8_t*)text;   /* OWNED */
+  bp->ops[0].value_len = text_len;
+  bp->op_name = type_name;             /* BORROWED (a type literal) */
+  bp->reply_to = reply_to;
+  bp->corr = corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "event batch");
   return 0;
 }
 
-/* remember = the state put + the state.remember event in ONE root batch.
-   Failures happen BEFORE any write except the batch itself, so no effect
-   half-applies. */
-static int _frame_remember_variant(frame_t* f, const char* key, const char* json_value,
-                                   const char* state_prefix) {
+/* Fire-and-post event write (corr 0, reply_to NULL): nothing awaits the
+   reply; a pre-post refusal is rolled back in the frame's own seq, a
+   store-stage one leaves the recorded gap (the store worker logs it). */
+static void _frame_event_post_fire(frame_t* f, const char* type_name,
+                                   json_value_t* payload) {
+  uint64_t seq = 0;
+  int rc = _frame_event_post(f, type_name, payload, 0, NULL, &seq);
+  if (rc != 0) _frame_seq_rollback(f, seq);
+}
+
+/* The loop's SYNC-SEMANTICS write (frame_internal.h contract): post the
+   event batch with a sync corr and pump-wait the reply — the caller keeps
+   today's "rc 0 = committed" contract. POOLED store: refuse loud (the sync
+   store API is inline-only; the engine's own writes ride fire-and-post/round
+   trips instead). */
+int _frame_event_write(frame_t* f, const char* type_name, json_value_t* payload) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: event '%s' on a dead frame",
+              type_name != NULL ? type_name : "?");
+    json_value_destroy(payload);
+    return -1;
+  }
+  if (_frame_sync_store_refused(f, "event write")) {
+    json_value_destroy(payload);
+    return -1;
+  }
+  uint64_t seq = 0;
+  free(f->sync.text);
+  memset(&f->sync, 0, sizeof(f->sync));
+  f->sync.in_use = 1;
+  f->sync.corr = ++f->store_corr_seq;
+  int rc = _frame_event_post(f, type_name, payload, f->sync.corr,
+                             &f->actor, &seq);
+  if (rc != 0) {
+    f->sync.in_use = 0;
+    _frame_seq_rollback(f, seq);
+    return rc;
+  }
+  int wait_rc = _frame_slot_wait(f, &f->sync.done, SA_FRAME_STORE_WAIT_MS);
+  f->sync.in_use = 0;
+  if (wait_rc != 0) {
+    /* The DEADLINE broke, not the store: the batch may still commit, so the
+       seq stays pre-allocated (a gap) — rolling it back could duplicate a
+       seq key on the next compose. */
+    return -1;
+  }
+  rc = f->sync.rc;
+  if (rc != 0) {
+    _frame_seq_rollback(f, seq);
+    log_error("frame: '%s' event batch failed (%d); seq %llu of '%s' is "
+              "unwritten", type_name != NULL ? type_name : "?", rc,
+              (unsigned long long)seq, f->sid_path);
+  }
+  return rc;
+}
+
+/* remember = the state put + the state.remember event in ONE store batch
+   (the raw JSON value stored verbatim, today's shape). Failures happen
+   BEFORE any write except the batch itself, so no effect half-applies.
+   corr 0 / reply NULL = fire-and-post (the store's FIFO anchors causality).
+   CONSUMES nothing but its own composed keys; the seq is pre-allocated and
+   rolled back on every pre-post refusal. */
+static int _frame_remember_post(frame_t* f, const char* key, const char* json_value,
+                                const char* state_prefix, uint64_t corr,
+                                actor_t* reply_to, uint64_t* seq_out) {
+  if (seq_out != NULL) *seq_out = 0;
   if (f == NULL || f->st == NULL) {
     log_error("frame: remember on a dead frame");
     return -1;
@@ -444,7 +1074,8 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
   json_value_t* parsed = _frame_parse_or_null(json_value);
   if (parsed == NULL) return -1;
 
-  uint64_t seq = f->seq + 1;
+  uint64_t seq = _frame_seq_alloc(f);
+  if (seq_out != NULL) *seq_out = seq;
   size_t state_len = strlen(state_prefix) + strlen(key);
   if (state_len > SA_FRAME_MAX_BATCH_BYTES) {
     log_error("frame: remember '%s' — prefixed state key %zu chars + %zu-byte "
@@ -453,6 +1084,7 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
               key, state_len, (size_t)strlen(json_value),
               (int)SA_FRAME_MAX_BATCH_BYTES);
     json_value_destroy(parsed);
+    _frame_seq_rollback(f, seq);
     return -3;
   }
 
@@ -460,24 +1092,26 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
   if (payload == NULL) {
     json_value_destroy(parsed);
     log_error("frame: out of memory building remember payload");
+    _frame_seq_rollback(f, seq);
     return -1;
   }
   json_object_set(payload, "key", json_new_string(key));
   json_object_set(payload, "value", parsed);
 
-  char* state_key = get_memory(state_len + 1);
-  char* evkey = get_memory(sizeof("events/00000000000000000000"));
+  char* rel = _frame_state_key(state_prefix, key);
+  char* state_key = (rel != NULL) ? _frame_subkey(f->sid_path, rel) : NULL;
+  char* evkey = _frame_event_key(f->sid_path, seq);
   char* text = _frame_event_json(f, seq, "state.remember", payload);
-  if (state_key == NULL || evkey == NULL || text == NULL) {
+  if (rel == NULL || state_key == NULL || evkey == NULL || text == NULL) {
+    free(rel);
     free(state_key);
     free(evkey);
     free(text);
     log_error("frame: out of memory building remember batch");
+    _frame_seq_rollback(f, seq);
     return -1;
   }
-  snprintf(evkey, sizeof("events/00000000000000000000"), "events/%020llu",
-           (unsigned long long)seq);
-  snprintf(state_key, state_len + 1, "%s%s", state_prefix, key);
+  free(rel);
 
   size_t text_len = strlen(text);
   if (text_len > SA_FRAME_MAX_BATCH_BYTES) {
@@ -487,32 +1121,71 @@ static int _frame_remember_variant(frame_t* f, const char* key, const char* json
     free(state_key);
     free(evkey);
     free(text);
+    _frame_seq_rollback(f, seq);
     return -3;
   }
 
-  raw_op_t ops[2];
-  ops[0].key = evkey;
-  ops[0].key_len = strlen(evkey);
-  ops[0].value = (const uint8_t*)text;
-  ops[0].value_len = text_len;
-  ops[0].type = 0;
-  ops[1].key = state_key;
-  ops[1].key_len = state_len;
-  ops[1].value = (const uint8_t*)json_value;
-  ops[1].value_len = strlen(json_value);
-  ops[1].type = 0;
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = (frm_store_op_t*)get_clear_memory(2 * sizeof(frm_store_op_t));
+  bp->nops = 2;
+  bp->ops[0].key = evkey;              /* OWNED by the store round trip */
+  bp->ops[0].value = (uint8_t*)text;   /* OWNED */
+  bp->ops[0].value_len = text_len;
+  bp->ops[1].key = state_key;          /* OWNED */
+  bp->ops[1].value = (uint8_t*)get_memory(strlen(json_value) + 1); /* heap copy —
+      the store behavior frees it (the caller's text stays borrowed) */
+  if (bp->ops[1].value != NULL) {
+    memcpy(bp->ops[1].value, json_value, strlen(json_value) + 1);
+    bp->ops[1].value_len = strlen(json_value);
+  }
+  bp->op_name = "state.remember";      /* BORROWED literal */
+  bp->reply_to = reply_to;
+  bp->corr = corr;
+  if (bp->ops[1].value == NULL) {
+    frm_store_batch_payload_destroy(bp);
+    _frame_seq_rollback(f, seq);
+    log_error("frame: out of memory building remember batch");
+    return -1;
+  }
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "remember batch");
+  return 0;
+}
 
-  int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 2);
-  free(text);
-  free(state_key);
-  free(evkey);
+/* The sync public remember (pump-waits the corr-matched reply). */
+static int _frame_remember_sync(frame_t* f, const char* key, const char* json_value,
+                                const char* state_prefix) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: remember on a dead frame");
+    return -1;
+  }
+  if (_frame_sync_store_refused(f, "remember")) return -1;
+  uint64_t seq = 0;
+  free(f->sync.text);
+  memset(&f->sync, 0, sizeof(f->sync));
+  f->sync.in_use = 1;
+  f->sync.corr = ++f->store_corr_seq;
+  int rc = _frame_remember_post(f, key, json_value, state_prefix,
+                                f->sync.corr, &f->actor, &seq);
   if (rc != 0) {
-    log_error("frame: remember batch failed (%d); '%s' of %s is unwritten",
-              rc, key, f->sid_path);
+    f->sync.in_use = 0;
+    _frame_seq_rollback(f, seq);
     return rc;
   }
-  f->seq = seq;
-  return 0;
+  int wait_rc = _frame_slot_wait(f, &f->sync.done, SA_FRAME_STORE_WAIT_MS);
+  f->sync.in_use = 0;
+  if (wait_rc != 0) {
+    /* Deadline, not refusal: the batch may still commit — the seq gap stays. */
+    return -1;
+  }
+  rc = f->sync.rc;
+  if (rc != 0) {
+    _frame_seq_rollback(f, seq);
+    log_error("frame: remember batch failed (%d); '%s' of %s is unwritten",
+              rc, key, f->sid_path);
+  }
+  return rc;
 }
 
 /* msg.append = the conversation-turn event in ONE root batch (the general
@@ -542,28 +1215,41 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
    reporting frame done at EVERY depth; a child binds its report event into
    the parent's log, a top frame has no parent log and reports into its OWN
    log — payload shape unchanged, so child_sid carries the reportING frame's
-   own path). Own event + status done in ONE root batch. */
-static int _frame_report_top(frame_t* f, const char* text) {
-  if (f == NULL || f->st == NULL) {
+   own path). Own event + status done in ONE store batch, POSTED (never a
+   direct write at the frame's dispatch); the report verb's corr answer is
+   carried by the store reply through the bridge-pending registry, so the
+   cell-side caller keeps its corr-matched contract across the extra hop. A
+   refusal at the store leaves the pre-allocated seq as the recorded gap. */
+static void _frame_report_top_post(frame_t* f, uint64_t bridge_corr,
+                                   const char* text) {
+  if (f->st == NULL) {
     log_error("frame: report on a dead frame");
-    return -1;
+    _frame_bridge_reply(bridge_corr, 1, NULL);
+    return;
   }
   if (text == NULL) {
     log_error("frame_report: report text required");
-    return -1;
+    _frame_bridge_reply(bridge_corr, 1, NULL);
+    return;
   }
 
-  uint64_t seq = f->seq + 1;
+  uint64_t seq = _frame_seq_alloc(f);
   json_value_t* payload = json_new_object();   /* {child_sid, text} */
   if (payload == NULL) {
     log_error("frame: out of memory building report payload");
-    return -1;
+    _frame_seq_rollback(f, seq);
+    _frame_bridge_reply(bridge_corr, 1, NULL);
+    return;
   }
   json_object_set(payload, "child_sid", json_new_string(f->sid_path));
   json_object_set(payload, "text", json_new_string(text));
   char* event_text = _frame_event_json_full(f->sid_path, seq, "frame.report",
                                             payload);
-  if (event_text == NULL) return -1;
+  if (event_text == NULL) {
+    _frame_seq_rollback(f, seq);
+    _frame_bridge_reply(bridge_corr, 1, NULL);
+    return;
+  }
 
   char* k_ev = _frame_event_key(f->sid_path, seq);
   char* k_status = _frame_subkey(f->sid_path, "meta/status");
@@ -571,20 +1257,10 @@ static int _frame_report_top(frame_t* f, const char* text) {
     free(k_ev);
     free(k_status);
     free(event_text);
-    return -1;
+    _frame_seq_rollback(f, seq);
+    _frame_bridge_reply(bridge_corr, 1, NULL);
+    return;
   }
-
-  raw_op_t ops[2];
-  ops[0].key = k_ev;
-  ops[0].key_len = strlen(k_ev);
-  ops[0].value = (const uint8_t*)event_text;
-  ops[0].value_len = strlen(event_text);
-  ops[0].type = 0;
-  ops[1].key = k_status;
-  ops[1].key_len = strlen(k_status);
-  ops[1].value = (const uint8_t*)SA_FRAME_STATUS_DONE;
-  ops[1].value_len = strlen(SA_FRAME_STATUS_DONE);
-  ops[1].type = 0;
 
   size_t total_bytes = strlen(k_ev) + strlen(event_text) +
                        strlen(k_status) + strlen(SA_FRAME_STATUS_DONE);
@@ -595,45 +1271,193 @@ static int _frame_report_top(frame_t* f, const char* text) {
     free(k_ev);
     free(k_status);
     free(event_text);
-    return -3;
+    _frame_seq_rollback(f, seq);
+    _frame_bridge_reply(bridge_corr, 1, NULL);
+    return;
   }
 
-  int rc = database_batch_sync_raw(f->root->db, '/', ops, 2);
-  free(k_ev);
-  free(k_status);
-  free(event_text);
-  if (rc != 0) {
-    log_error("frame_report: top report batch failed (%d) at '%s' — nothing "
-              "committed", rc, f->sid_path);
-    return rc;
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = (frm_store_op_t*)get_clear_memory(2 * sizeof(frm_store_op_t));
+  bp->nops = 2;
+  bp->ops[0].key = k_ev;                    /* OWNED by the store round trip */
+  bp->ops[0].value = (uint8_t*)event_text;  /* OWNED */
+  bp->ops[0].value_len = strlen(event_text);
+  bp->ops[1].key = k_status;                /* OWNED */
+  bp->ops[1].value = (uint8_t*)get_memory(strlen(SA_FRAME_STATUS_DONE) + 1);
+  if (bp->ops[1].value != NULL) {
+    memcpy(bp->ops[1].value, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
+    bp->ops[1].value_len = strlen(SA_FRAME_STATUS_DONE);
   }
-  f->seq = seq;
-  return 0;
+  if (bp->ops[1].value == NULL) {
+    frm_store_batch_payload_destroy(bp);
+    _frame_seq_rollback(f, seq);
+    _frame_bridge_reply(bridge_corr, 1, NULL);
+    return;
+  }
+  bp->op_name = "frame.report (top)";       /* BORROWED literal */
+  bp->reply_to = &f->actor;                 /* the reply routes to the bridge corr */
+  bp->corr = ++f->store_corr_seq;
+  _frame_bridge_pending_add(f, bp->corr, bridge_corr, 0);   /* BEFORE the post */
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "top report batch");
 }
 
-/* Dispatch a queued FRM_* message. The behaviors run the SAME synchronous
-   store functions every caller uses (one batch per effect) and answer
-   corr-matched THROUGH the bridge hook (frame_bridge.h), never by queueing at
-   an actor: the awaiting python cell blocks on its own completion record,
-   woken synchronously from this dispatch. The frame never blocks beyond a µs
-   batch.
+/* Dispatch a queued FRM_* message. Every store write/read composes here and
+   POSTS at the root's store actor (§5: the ONE serializer); the corr-matched
+   reply routes back through _frame_store_reply_route, which answers THROUGH
+   the bridge hook (frame_bridge.h) for registered cell verbs or into the
+   direct sync caller's slot. The frame never blocks beyond a µs post; the
+   awaiting python cell blocks on its own completion record, woken when the
+   reply's router hands its corr to the bridge sink.
 
-   Payload ownership: FRM_REMEMBER / FRM_RECALL payloads are CONSUMED here
+   Payload ownership: the request payloads are CONSUMED here
    (msg->payload = NULL; the behavior destroys the payload itself), which
    makes both delivery paths (queue + actor_run, and the tests' direct
-   frame_dispatch) work without claiming it twice. FRM_REPLY is the OUTGOING
-   answer shape, so one arriving at a frame is a routing bug. The loop's
-   verbs are claimed here (Task 10): FRM_CELL_EXECUTE boots/feeds the frame's
-   own pyrt, PYRT_RESULT completes the one pending-cell slot, FRM_STOP sets
-   the drain-then-stop flag the turn loop reads; FRM_SPAWN / FRM_REPORT (the
-   cell-side bridge verbs posted by py_agent.c) run the same store operations
-   the direct API uses and answer corr-matched through the hook. Unknown
-   types are ignored. */
+   frame_dispatch) work without claiming it twice. FRM_REPLY never arrives at
+   a frame (the answers leave through the bridge hook — a routing bug).
+   The loop's verbs are claimed here: FRM_CELL_EXECUTE boots/feeds the
+   frame's own pyrt, PYRT_RESULT completes the one pending-cell slot,
+   FRM_STOP sets the drain-then-stop flag the loop reads; FRM_SPAWN /
+   FRM_REPORT (the cell-side bridge verbs posted by py_agent.c) compose the
+   same store operations the direct API uses — now as store round trips
+   answered by the reply router. Unknown types are ignored. */
+
+/* Forward (the store round trips live in the store-ops sections below):
+   the behaviors compose + post them. */
+static int _frame_recall_post(frame_t* f, const char* key, uint64_t corr,
+                              actor_t* reply_to);
+static frame_t* _frame_spawn_post(frame_t* parent, const char* goal,
+                                  const char* context_json,
+                                  uint64_t bridge_corr, uint64_t corr);
+static int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
+                                   uint8_t engine_driven, const char* text);
+static void _frame_report_bind_compose(frame_t* parent,
+                                       frm_report_bind_payload_t* b);
+
+/* The FRM_STORE_REPLY router (the frame's OWN reply path; consumes the
+   payload on every path). Priority order:
+     1. spawn_pending  — the admission's commit/refusal;
+     2. bind_pending   — the report bind's result (the child's seq rollback +
+       the cell's bridge answer live here);
+     3. f->sync + corr match — the DIRECT sync caller's slot (single slot:
+       direct sync calls are sequential on the pump owner's thread in the
+       only shape that supports them — the inline shape);
+     4. the engine's store round trips: Task 3's handlers route here;
+     5. the registered cell-verb bridge corrs — answered through the bridge
+       sink;
+     6. otherwise a LOUD drop (a routing bug / an abandoned slot's late
+       reply). */
+static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
+  if (f == NULL) {
+    if (r != NULL) frm_store_reply_payload_destroy(r);
+    return;
+  }
+  if (r == NULL) return;
+
+  /* 1. The spawn admission. */
+  if (f->spawn_slot.in_use && r->corr == f->spawn_slot.corr) {
+    f->spawn_slot.done = 1;
+    f->spawn_slot.rc = r->rc;
+    if (r->rc != 0) {
+      log_error("frame: the spawn admission for '%s' was refused by the store "
+                "(%d) — nothing committed",
+                (f->spawn_slot.child != NULL) ? frame_sid(f->spawn_slot.child)
+                                              : "?", r->rc);
+      _frame_seq_rollback(f, f->spawn_slot.own_seq);
+    }
+    if (f->spawn_slot.bridge_corr != 0) {
+      /* Cell-side: the router answers + cleans (the child is released here —
+         the admission is DURABLE, not a live process; Task 5 starts it
+         instead). */
+      char* sid = (r->rc == 0 && f->spawn_slot.child != NULL)
+                      ? strdup(frame_sid(f->spawn_slot.child)) : NULL;
+      _frame_bridge_reply(f->spawn_slot.bridge_corr, (r->rc == 0) ? 0 : 1, sid);
+      free(sid);
+      if (r->rc != 0) {
+        log_error("frame: the cell-verb spawn's child for corr %llu is "
+                  "released loud (the admission was refused)",
+                  (unsigned long long)f->spawn_slot.bridge_corr);
+      }
+      frame_destroy(f->spawn_slot.child);
+      f->spawn_slot.child = NULL;
+      f->spawn_slot.in_use = 0;
+    }
+    /* bridge_corr == 0: the direct sync caller reads + clears the slot. */
+    frm_store_reply_payload_destroy(r);
+    return;
+  }
+
+  /* 2. The report bind (routed back to the CHILD's actor). */
+  if (f->bind_slot.in_use && r->corr == f->bind_slot.corr) {
+    f->bind_slot.done = 1;
+    f->bind_slot.rc = r->rc;
+    if (r->rc != 0) {
+      log_error("frame: the report bind from '%s' was refused (%d) — its own "
+                "seq rolls back best-effort; the refusing batch committed "
+                "nothing", f->sid_path, r->rc);
+      _frame_seq_rollback(f, f->bind_slot.own_seq);
+    }
+    if (f->bind_slot.bridge_corr != 0) {
+      _frame_bridge_reply(f->bind_slot.bridge_corr, (r->rc == 0) ? 0 : 1, NULL);
+    }
+    /* f->bind_slot.engine_driven == 1 posts FRM_CHILD_REPORT to the parent
+       from this same reply (Task 6's terminate wires its binds with it). */
+    if (f->bind_slot.bridge_corr != 0) f->bind_slot.in_use = 0;
+    /* bridge_corr == 0: the direct sync caller reads + clears the slot. */
+    frm_store_reply_payload_destroy(r);
+    return;
+  }
+
+  /* 3. The direct sync caller's slot. */
+  if (f->sync.in_use && r->corr == f->sync.corr) {
+    f->sync.done = 1;
+    f->sync.rc = r->rc;
+    free(f->sync.text);
+    f->sync.text = NULL;
+    if (r->rc == 0 && r->n >= 1 && r->records != NULL && r->records[0] != NULL) {
+      f->sync.text = strdup(r->records[0]);   /* the recall's resolution */
+    }
+    frm_store_reply_payload_destroy(r);
+    return;
+  }
+
+  /* 4. The engine's store round trips (Task 3): loop.c's handlers route
+     here when a turn store trip is in flight. */
+
+  /* 5. The registered cell-verb bridge corrs. */
+  {
+    uint8_t is_recall = 0;
+    uint64_t answer_corr = 0;
+    if (_frame_bridge_pending_take(f, r->corr, &answer_corr, &is_recall)) {
+      uint8_t status = (r->rc == 0) ? 0 : 1;
+      char* text = NULL;
+      if (is_recall && status == 0 && r->n >= 1 && r->records != NULL &&
+          r->records[0] != NULL) {
+        text = strdup(r->records[0]);
+        if (text == NULL) status = 1;
+      }
+      _frame_bridge_reply(answer_corr, status, text);
+      free(text);
+      frm_store_reply_payload_destroy(r);
+      return;
+    }
+  }
+
+  /* 6. */
+  log_error("frame: unmatched store reply corr %llu at '%s' — dropped loud",
+            (unsigned long long)r->corr, f->sid_path);
+  frm_store_reply_payload_destroy(r);
+}
+
 static void _frame_behavior(void* state, message_t* msg) {
   frame_t* f = (frame_t*)state;
   if (msg == NULL) return;
   switch (msg->type) {
     case FRM_REMEMBER: {
+      /* The compose-and-POST shape (§5): the INHERITABLE ctx write posts at
+         the store actor; the corr answer comes from the FRM_STORE_REPLY
+         router via the bridge registry (registered BEFORE the post). */
       frm_remember_payload_t* rp = (frm_remember_payload_t*)msg->payload;
       msg->payload = NULL;
       uint64_t corr = 0;
@@ -645,58 +1469,58 @@ static void _frame_behavior(void* state, message_t* msg) {
         status = 1;
         log_error("frame: FRM_REMEMBER with corr 0 at '%s' — nothing to match",
                   f->sid_path);
-      } else if (frame_remember_ctx(f, rp->key, rp->json_value) != 0) {
-        /* The store already validated key + JSON + batch cap ("the same
-           validation as every remember") and failed LOUDLY before writing. */
-        status = 1;
-        log_error("frame: FRM_REMEMBER '%s' refused at '%s' (corr %llu)",
-                  rp->key ? rp->key : "(null)", f->sid_path,
-                  (unsigned long long)corr);
       } else {
-        status = 0;
+        /* Bridge verbs write the INHERITABLE layer: a cell's remember() is a
+           durable, shared-by-default write (state/ctx/); cells use the
+           ctx/local split only through the store API directly. */
+        uint64_t store_corr = ++f->store_corr_seq;
+        _frame_bridge_pending_add(f, store_corr, corr, 0);
+        if (_frame_remember_post(f, rp->key, rp->json_value, "state/ctx/",
+                                 store_corr, &f->actor, NULL) != 0) {
+          /* The compose refused loud (validation/cap) — nothing was posted,
+             so the corr answer comes NOW, not from the store. */
+          (void)_frame_bridge_pending_take(f, store_corr, NULL, NULL);
+          status = 1;
+          log_error("frame: FRM_REMEMBER '%s' refused at '%s' (corr %llu)",
+                    rp->key ? rp->key : "(null)", f->sid_path,
+                    (unsigned long long)corr);
+          _frame_bridge_reply(corr, status, NULL);
+        }
+        /* else: the router answers the corr at the store reply. */
       }
-      /* Bridge verbs write the INHERITABLE layer: a cell's remember() is a
-         durable, shared-by-default write (the frame_remember_ctx call above);
-         cells use the ctx/local split only through the store API directly. */
-      _frame_bridge_reply(corr, status, NULL);
       frm_remember_payload_destroy(rp);
       break;
     }
     case FRM_RECALL: {
+      /* The resolve walk is a store MESSAGE now: compose + post; the router
+         answers (the resolved text or the refusal status) at the reply. */
       frm_remember_payload_t* rp = (frm_remember_payload_t*)msg->payload;
       msg->payload = NULL;
       uint64_t corr = 0;
       uint8_t status;
-      char* text = NULL;
       if (rp == NULL) {
         status = 1;
         log_error("frame: FRM_RECALL with no payload at '%s'", f->sid_path);
+      } else if ((corr = rp->corr) == 0) {
+        status = 1;
+        log_error("frame: FRM_RECALL with corr 0 at '%s' — nothing to match",
+                  f->sid_path);
       } else {
-        corr = rp->corr;
-        if (corr != 0 && (text = frame_recall(f, rp->key)) != NULL) {
-          status = 0;
-        } else if (corr != 0) {
+        uint64_t store_corr = ++f->store_corr_seq;
+        _frame_bridge_pending_add(f, store_corr, corr, 1);
+        if (_frame_recall_post(f, rp->key, store_corr, &f->actor) != 0) {
+          (void)_frame_bridge_pending_take(f, store_corr, NULL, NULL);
           status = 1;
-          log_error("frame: FRM_RECALL '%s' unresolvable from '%s' (corr %llu)",
+          log_error("frame: FRM_RECALL '%s' refused at '%s' (corr %llu)",
                     rp->key ? rp->key : "(null)", f->sid_path,
                     (unsigned long long)corr);
-        } else {
-          status = 1;
-          log_error("frame: FRM_RECALL with corr 0 at '%s' — nothing to match",
-                    f->sid_path);
+          _frame_bridge_reply(corr, status, NULL);
         }
       }
-      _frame_bridge_reply(corr, status, text);
-      free(text);
       frm_remember_payload_destroy(rp);
       break;
     }
     case FRM_REPLY:
-      /* Replies LEAVE frames through the bridge hook; a frame cannot wait on
-         one. This only happens from a routing bug: loud, dropped. */
-      log_error("frame: FRM_REPLY received at '%s' — replies are bridge-hook "
-                "side effects, not queued messages; dropping", f->sid_path);
-      break;
       /* Replies LEAVE frames through the bridge hook; a frame cannot wait on
          one. This only happens from a routing bug: loud, dropped. */
       log_error("frame: FRM_REPLY received at '%s' — replies are bridge-hook "
@@ -797,11 +1621,11 @@ static void _frame_behavior(void* state, message_t* msg) {
           json_object_set(result_payload, "text",
                           (r->text != NULL) ? json_new_string(r->text)
                                             : json_new_null());
-          if (_frame_event_write(f, "cell.result", result_payload) != 0) {
-            log_error("frame: cell.result event refused for corr %llu at '%s'"
-                      " (the wait slot still completes)",
-                      (unsigned long long)f->cell_corr, f->sid_path);
-          }
+          /* FIRE-AND-POST (corr 0, reply_to NULL): the slot completes in
+             this same dispatch exactly as today, and the event's commitment
+             is FIFO-ahead of anything the frame posts after it (the next
+             derive's scan). */
+          _frame_event_post_fire(f, "cell.result", result_payload);
         }
         f->cell_status = r->status;
         f->cell_pending = 0;
@@ -832,74 +1656,97 @@ static void _frame_behavior(void* state, message_t* msg) {
       log_info("frame: stop requested at '%s'", f->sid_path);
       break;
     case FRM_SPAWN: {
-      /* The cell-side spawn verb, answered corr-matched: the admission-only
-         frame_spawn runs (birth batch + spawn event + lineage triple, one
-         root batch) and the reply text is the child's sid path. The child
-         frame_t is released immediately — the admission is DURABLE, not a
-         live process; driving a child (frame_resume + frame_run_loop) is the
-         tree-slices' job. */
+      /* The cell-side spawn verb, answered corr-matched: the admission
+         composes (the parent's PRE-ALLOCATED seq) and posts at the store
+         actor; the ROUTER answers this corr with the child's sid text when
+         the store reply lands (waiter's bounded py-agent wait covers the
+         extra hop). The child frame_t is released at the reply — the
+         admission is DURABLE, not a live process; Task 5's reply route
+         starts admitted children instead. */
       frm_spawn_payload_t* sp = (frm_spawn_payload_t*)msg->payload;
       msg->payload = NULL;
       if (sp == NULL) {
         log_error("frame: FRM_SPAWN with no payload at '%s'", f->sid_path);
         break;
       }
-      uint8_t status = 1;
-      char* sid_out = NULL;
       if (sp->corr == 0) {
         log_error("frame: FRM_SPAWN with corr 0 at '%s' — nothing to match",
                   f->sid_path);
       } else {
-        frame_t* child = frame_spawn(f, sp->goal, sp->context_json);
-        if (child != NULL) {
-          sid_out = strdup(child->sid_path);
-          if (sid_out != NULL) {
-            status = 0;
-          } else {
-            log_error("frame: out of memory copying the spawn reply");
-          }
-          frame_destroy(child);
-        } else {
+        uint64_t store_corr = ++f->store_corr_seq;
+        frame_t* child =
+            _frame_spawn_post(f, sp->goal, sp->context_json, sp->corr,
+                              store_corr);
+        if (child == NULL) {
           log_error("frame: spawn refused from a cell at '%s' (corr %llu) — "
                     "the child admission never happened", f->sid_path,
                     (unsigned long long)sp->corr);
+          _frame_bridge_reply(sp->corr, 1, NULL);
         }
+        /* else: the router answers the corr at the store reply. */
       }
-      _frame_bridge_reply(sp->corr, status, sid_out);
-      free(sid_out);
       frm_spawn_payload_destroy(sp);
       break;
     }
     case FRM_REPORT: {
       /* The cell-side report verb: the REPORTING frame ends here. Children
-         bind the report event into the parent's log (frame_report, one batch);
-         top frames report into their own log (_frame_report_top). Either way
-         the reporting frame's status flips to done. */
+         bind via FRM_REPORT_BIND (the parent composes the cross-subtree
+         batch; the router answers this corr at the store reply); top frames
+         post their own report + status in ONE store batch whose reply is
+         answered through the bridge registry. Either way the reporting
+         frame's status flips to done. */
       frm_report_payload_t* rp = (frm_report_payload_t*)msg->payload;
       msg->payload = NULL;
       if (rp == NULL) {
         log_error("frame: FRM_REPORT with no payload at '%s'", f->sid_path);
         break;
       }
-      uint8_t status = 1;
       if (rp->corr == 0) {
         log_error("frame: FRM_REPORT with corr 0 at '%s' — nothing to match",
                   f->sid_path);
       } else if (f->parent != NULL) {
-        status = (frame_report(f, rp->text) == 0) ? 0 : 1;
-        if (status != 0) {
-          log_error("frame: report batch failed for '%s' (corr %llu)",
-                    f->sid_path, (unsigned long long)rp->corr);
+        if (_frame_report_bind_post(f, rp->corr, 0, rp->text) != 0) {
+          log_error("frame: report batch failed for '%s' (corr %llu) — "
+                    "answered as a refusal before any post", f->sid_path,
+                    (unsigned long long)rp->corr);
+          _frame_bridge_reply(rp->corr, 1, NULL);
         }
+        /* else: the router answers the corr at the store reply. */
       } else {
-        status = (_frame_report_top(f, rp->text) == 0) ? 0 : 1;
-        if (status != 0) {
-          log_error("frame: top report batch failed for '%s' (corr %llu)",
-                    f->sid_path, (unsigned long long)rp->corr);
-        }
+        _frame_report_top_post(f, rp->corr, rp->text);
+        /* every refusal path answers the corr inside; the store reply
+           routes the commit through the bridge registry */
       }
-      _frame_bridge_reply(rp->corr, status, NULL);
       frm_report_payload_destroy(rp);
+      break;
+    }
+    case FRM_STORE_REPLY: {
+      /* The store's corr-matched reply: route it (consumes the payload on
+         every path). */
+      frm_store_reply_payload_t* r = (frm_store_reply_payload_t*)msg->payload;
+      msg->payload = NULL;
+      _frame_store_reply_route(f, r);
+      break;
+    }
+    case FRM_STORE_BATCH:
+    case FRM_STORE_SCAN:
+    case FRM_STORE_RECALL:
+      /* Store OPERATIONS at a frame actor: a routing bug (they belong at the
+         root's store actor). Loud drop; the payload retires here. */
+      log_error("frame: a store operation arrived at the FRAME actor of '%s' "
+                "— store ops belong at the root's store actor; dropping loud",
+                f->sid_path);
+      if (msg->payload != NULL) msg->payload_destroy(msg->payload);
+      msg->payload = NULL;
+      break;
+    case FRM_REPORT_BIND: {
+      /* child -> parent: compose the cross-subtree report batch HERE (the
+         parent's own seq is pre-allocated in this dispatch — the child could
+         never touch it) and post the ONE store batch whose reply routes back
+         to the child. */
+      frm_report_bind_payload_t* b = (frm_report_bind_payload_t*)msg->payload;
+      msg->payload = NULL;
+      _frame_report_bind_compose(f, b);
       break;
     }
     default:
@@ -1002,13 +1849,34 @@ int _frame_set_status_done(frame_t* f) {
     log_error("frame: status->done on a dead frame");
     return -1;
   }
-  raw_op_t ops[1];
-  ops[0].key = "meta/status";
-  ops[0].key_len = strlen("meta/status");
-  ops[0].value = (const uint8_t*)SA_FRAME_STATUS_DONE;
-  ops[0].value_len = strlen(SA_FRAME_STATUS_DONE);
-  ops[0].type = 0;
-  int rc = database_subtree_batch_sync_raw(f->st, '/', ops, 1);
+  if (_frame_sync_store_refused(f, "status->done")) return -1;
+  char* k_status = _frame_subkey(f->sid_path, "meta/status");
+  if (k_status == NULL) return -1;
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  bp->nops = 1;
+  bp->ops[0].key = k_status;    /* OWNED by the store round trip */
+  bp->ops[0].value = (uint8_t*)get_memory(strlen(SA_FRAME_STATUS_DONE) + 1);
+  if (bp->ops[0].value == NULL) {
+    frm_store_batch_payload_destroy(bp);
+    return -1;
+  }
+  memcpy(bp->ops[0].value, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
+  bp->ops[0].value_len = strlen(SA_FRAME_STATUS_DONE);
+  bp->op_name = "status->done"; /* BORROWED literal */
+  free(f->sync.text);
+  memset(&f->sync, 0, sizeof(f->sync));
+  f->sync.in_use = 1;
+  f->sync.corr = ++f->store_corr_seq;
+  bp->reply_to = &f->actor;
+  bp->corr = f->sync.corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "status batch");
+  int wait_rc = _frame_slot_wait(f, &f->sync.done, SA_FRAME_STORE_WAIT_MS);
+  f->sync.in_use = 0;
+  if (wait_rc != 0) return -1;   /* deadline: the batch may still commit */
+  int rc = f->sync.rc;
   if (rc != 0) {
     log_error("frame: status->done batch failed (%d) at '%s'", rc, f->sid_path);
     return rc;
@@ -1097,11 +1965,14 @@ int _frame_cell_wait(frame_t* f, unsigned timeout_ms, uint8_t* status_out) {
 
   uint64_t deadline = platform_monotonic_ns() + (uint64_t)timeout_ms * 1000000ULL;
   for (;;) {
-    /* The pump runs EVERYTHING the inbound inbox holds: the running cell's
-       bridge verbs (FRM_REMEMBER/FRM_RECALL/...) — each answering corr-matched
-       through the bridge hook and thereby waking the pyrt thread — then the
-       PYRT_RESULT completing the slot. */
-    actor_run(&f->actor, ACTOR_BATCH_SIZE);
+    /* The pump runs EVERYTHING the inbound inbox holds (frame_internal.h's
+       ONE pump order): the running cell's bridge verbs (each composes + posts
+       a store message), the live ancestors' mailboxes (a bind must reach the
+       parent's composition), the inline store actor (whose execution of the
+       batch routes the corr answers back — waking the pyrt thread), then the
+       PYRT_RESULT completing the slot. A round trip completes within
+       consecutive pump cycles; the deadline is the only bound that breaks. */
+    _frame_pump(f);
     if (f->cell_pending == 0) {
       *status_out = f->cell_status;
       return 0;
@@ -1119,10 +1990,13 @@ int _frame_cell_wait(frame_t* f, unsigned timeout_ms, uint8_t* status_out) {
 
 /* --- lifecycle ----------------------------------------------------------- */
 
-wave_database_root_t* wave_db_open(const char* location) {
+wave_database_root_t* wave_db_open_config(const wave_database_config_t* cfg) {
+  const char* location = (cfg != NULL) ? cfg->location : NULL;
+  scheduler_pool_t* store_pool = (cfg != NULL) ? cfg->store_pool : NULL;
+
   database_config_t* wcfg = database_config_default();
   if (wcfg == NULL) {
-    log_error("wave_db_open: no config memory");
+    log_error("wave_db_open_config: no config memory");
     return NULL;
   }
   /* Concurrent mode is the frame tree's ground state (sync_only does not
@@ -1134,7 +2008,8 @@ wave_database_root_t* wave_db_open(const char* location) {
   database_t* db = database_create_with_config(location, wcfg, &err);
   database_config_destroy(wcfg);
   if (db == NULL) {
-    log_error("wave_db_open: database_create_with_config failed (err %d)", err);
+    log_error("wave_db_open_config: database_create_with_config failed (%d)",
+              err);
     return NULL;
   }
 
@@ -1147,6 +2022,13 @@ wave_database_root_t* wave_db_open(const char* location) {
   root->rng = (uint32_t)((uintptr_t)db ^ (uint32_t)time(NULL) ^ 0x9e3779b9u);
   if (root->rng == 0) root->rng = 0x2545f491u;
   atomic_store(&root->counter, 0);
+  root->store_pool = store_pool;   /* BORROWED; NULL = the inline shape */
+
+  /* The store actor owns the single-serializer role (§5): every frame-layer
+     store op — batches, scans, the recall walk — runs inside its behavior,
+     one message at a time, so the frame layer needs no lock at all. A NULL
+     pool = the inline shape: tests/demos pace it via wave_db_pump. */
+  actor_init(&root->store_actor, root, _store_behavior, store_pool);
 
   /* Lineage graph layer: ONE per root db, in the reserved "lineage" subtree.
      Subtree mode keeps it namespace-isolated (no layer-type collision at root
@@ -1160,8 +2042,8 @@ wave_database_root_t* wave_db_open(const char* location) {
     int gerr = 0;
     root->lineage = graph_layer_create(NULL, NULL, root->lineage_st, &gerr);
     if (root->lineage == NULL) {
-      log_error("wave_db_open: lineage graph layer create failed (%d) — "
-                "spawns will be refused", gerr);
+      log_error("wave_db_open_config: lineage graph layer create failed (%d) "
+                "— spawns will be refused", gerr);
       database_subtree_close(root->lineage_st);
       root->lineage_st = NULL;
     }
@@ -1170,8 +2052,43 @@ wave_database_root_t* wave_db_open(const char* location) {
   return root;
 }
 
+/* The inline-store wrapper (wave_database_config_t{location, NULL}). */
+wave_database_root_t* wave_db_open(const char* location) {
+  wave_database_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.location = location;
+  return wave_db_open_config(&cfg);
+}
+
+actor_t* wave_db_store_actor(wave_database_root_t* db) {
+  return (db != NULL) ? &db->store_actor : NULL;
+}
+
+int wave_db_pump(wave_database_root_t* db) {
+  if (db == NULL) {
+    log_error("wave_db_pump: NULL root");
+    return -1;
+  }
+  if (db->store_pool != NULL) {
+    /* The dual-driver rule's other half: a POOLED store's pacing belongs to
+       its scheduler workers; pumping it by hand would steal a mailbox run
+       out from under their dispatches. Refuse loud, never steal. */
+    log_error("wave_db_pump: the store actor is POOLED — its workers own the "
+              "pacing; the manual pump refuses loud");
+    return -2;
+  }
+  actor_run(&db->store_actor, ACTOR_BATCH_SIZE);
+  return 0;
+}
+
 void wave_db_close(wave_database_root_t* root) {
   if (root == NULL) return;
+  /* The store actor's teardown IS the front of the db lifecycle: its queue
+     drains (retiring any pending round-trip payloads), the RUNNING/queue
+     waits break out once a stop has put the pool into `stopped` (documented
+     caller order: stop the pool, then close the db, then destroy the pool).
+     Inline: no-op waits, then the drain. */
+  actor_destroy(&root->store_actor);
   if (root->lineage != NULL) {
     /* Layer teardown: schema snapshot + drop the layer's lineage-subtree
        reference. It never destroys the shared database (subtree mode). */
@@ -1282,6 +2199,17 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
     goto fail;
   }
 
+  /* The pool guard (§5): a POOLED frame REQUIRES a POOLED store — a pooled
+     frame posting into an un-pumped inline store mailbox is a hang posing as
+     an API call, and hangs lie. Loud, before anything else happens. */
+  if (f->pool != NULL && root->store_pool == NULL) {
+    log_error("frame: a POOLED frame on '%s' requires a POOLED store — "
+              "open the root with wave_db_open_config and a store pool "
+              "(the inline store would never be pumped); refusing loud",
+              f->sid_path);
+    goto fail;
+  }
+
   /* Boot: continue the seq counter past any persisted events (restart-safe).
      (No events in this task — Task 10's restart/replay test depends on this.) */
   f->seq = _frame_restore_seq(f);
@@ -1385,6 +2313,14 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
   if (f->st == NULL) {
     log_error("frame_resume: no subtree at '%s' — not a resumable frame",
               f->sid_path);
+    goto fail;
+  }
+  /* The same pool guard as frame_create: a resumed POOLED frame on an
+     inline-store root is a mailbox nobody pumps. */
+  if (f->pool != NULL && db->store_pool == NULL) {
+    log_error("frame_resume: a POOLED frame on '%s' requires a POOLED store "
+              "— open the root with wave_db_open_config and a store pool; "
+              "refusing loud", f->sid_path);
     goto fail;
   }
   /* The birth record is the resume gate: a path without meta/created is not
@@ -1524,6 +2460,30 @@ void frame_destroy(frame_t* f) {
     actor_detach_pool(&f->actor);
     message_queue_destroy(&f->actor.queue);   /* drains; the queue retires payloads */
   }
+  /* The store round trip's leftovers (a wait that never saw its reply —
+     e.g. the store died first): registry nodes + a transferred text die
+     here; an uncommitted admission's child dies loud with the frame. */
+  {
+    frm_bridge_pending_t* p = f->bridge_pending;
+    while (p != NULL) {
+      frm_bridge_pending_t* next = p->next;
+      log_error("frame: a registered store reply for corr %llu never landed "
+                "at '%s' (corrs are retired at teardown)",
+                (unsigned long long)p->corr, f->sid_path);
+      free(p);
+      p = next;
+    }
+    f->bridge_pending = NULL;
+  }
+  free(f->sync.text);
+  f->sync.text = NULL;
+  if (f->spawn_slot.child != NULL) {
+    log_error("frame: an uncommitted spawn admission for '%s' is abandoned "
+              "at teardown of '%s'", frame_sid(f->spawn_slot.child),
+              f->sid_path);
+    frame_destroy(f->spawn_slot.child);
+    f->spawn_slot.child = NULL;
+  }
   if (f->st != NULL) database_subtree_close(f->st);
   free(f->sid_path);
   free(f->parent_path);
@@ -1541,66 +2501,59 @@ void frame_destroy(frame_t* f) {
 /* --- store operations ---------------------------------------------------- */
 
 int frame_remember_local(frame_t* f, const char* key, const char* json_value) {
-  return _frame_remember_variant(f, key, json_value, "state/local/");
+  return _frame_remember_sync(f, key, json_value, "state/local/");
 }
 
 int frame_remember_ctx(frame_t* f, const char* key, const char* json_value) {
-  return _frame_remember_variant(f, key, json_value, "state/ctx/");
+  return _frame_remember_sync(f, key, json_value, "state/ctx/");
+}
+
+/* Compose + post FRM_STORE_RECALL: the walk runs inside the store actor's
+   dispatch (serialized with every write). 0 = posted; -1 = refused before
+   any post (the reply never comes — the caller must answer its corr). */
+static int _frame_recall_post(frame_t* f, const char* key, uint64_t corr,
+                              actor_t* reply_to) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: recall on a dead frame");
+    return -1;
+  }
+  frm_store_recall_payload_t* rp =
+      (frm_store_recall_payload_t*)get_clear_memory(sizeof(frm_store_recall_payload_t));
+  rp->key = strdup(key);
+  rp->sid_path = strdup(f->sid_path);
+  if (rp->key == NULL || rp->sid_path == NULL) {
+    frm_store_recall_payload_destroy(rp);
+    return -1;
+  }
+  rp->max_hops = f->max_depth;
+  rp->reply_to = reply_to;
+  rp->corr = corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_RECALL, rp,
+              frm_store_recall_payload_destroy, "recall walk");
+  return 0;
 }
 
 char* frame_recall(frame_t* f, const char* key) {
+  /* The sync public recall: compose + post the walk + pump-wait the
+     corr-matched reply (§5: synchronous by PUMPING, never by locking). */
   if (f == NULL || f->st == NULL || !_frame_key_valid(key, "recall")) return NULL;
-
-  /* 1) Own local scratch — private, so this is the shadowing top layer. */
-  char* state_key = _frame_state_key("state/local/", key);
-  if (state_key == NULL) return NULL;
-  char* text = _frame_subtree_text(f->st, state_key);
-  free(state_key);
-  if (text != NULL) return text;
-
-  /* 2) Own ctx. */
-  state_key = _frame_state_key("state/ctx/", key);
-  if (state_key == NULL) return NULL;
-  text = _frame_subtree_text(f->st, state_key);
-  free(state_key);
-  if (text != NULL) return text;
-
-  /* 3) Lineage walk: read meta/parent, open that subtree, read ONLY its
-     state/ctx/<key>; repeat upward until resolved, exhausted, or the hop
-     budget (max_depth + 1 ancestor reads) is spent. Bounded always: a
-     corrupt/looped meta/parent chain cannot spin forever. */
-  database_subtree_t* prev = NULL;      /* per-hop subtree owed a close */
-  database_subtree_t* cur = f->st;      /* borrowed from the frame at first */
-  for (unsigned hop = 0; hop <= f->max_depth; hop++) {
-    char* parent_path = _frame_subtree_text(cur, "meta/parent");
-    if (parent_path == NULL) {
-      database_subtree_close(prev);
-      return NULL;                       /* root of the lineage: unresolvable */
-    }
-    database_subtree_t* p = database_subtree_open(cur->db, parent_path, '/');
-    free(parent_path);
-    if (p == NULL) {
-      database_subtree_close(prev);
-      return NULL;
-    }
-    state_key = _frame_state_key("state/ctx/", key);
-    if (state_key == NULL) {
-      database_subtree_close(p);
-      database_subtree_close(prev);
-      return NULL;
-    }
-    text = _frame_subtree_text(p, state_key);
-    free(state_key);
-    database_subtree_close(prev);
-    if (text != NULL) {
-      database_subtree_close(p);
-      return text;
-    }
-    prev = p;
-    cur = p;
+  if (_frame_sync_store_refused(f, "recall")) return NULL;
+  free(f->sync.text);
+  memset(&f->sync, 0, sizeof(f->sync));
+  f->sync.in_use = 1;
+  f->sync.corr = ++f->store_corr_seq;
+  int rc = _frame_recall_post(f, key, f->sync.corr, &f->actor);
+  if (rc != 0) {
+    f->sync.in_use = 0;
+    return NULL;
   }
-  database_subtree_close(prev);
-  return NULL;                           /* hop budget spent */
+  int wait_rc = _frame_slot_wait(f, &f->sync.done, SA_FRAME_STORE_WAIT_MS);
+  f->sync.in_use = 0;
+  if (wait_rc != 0) return NULL;         /* deadline: the walk still lands */
+  if (f->sync.rc != 0) return NULL;      /* unresolvable — today's NULL shape */
+  char* out = f->sync.text;              /* transfer */
+  f->sync.text = NULL;
+  return out;
 }
 
 int frame_append_msg(frame_t* f, const char* role, const char* content) {
@@ -1609,17 +2562,26 @@ int frame_append_msg(frame_t* f, const char* role, const char* content) {
 
 /* --- spawn / report / join ----------------------------------------------- */
 
-/* Admission-only spawn. Nothing is written before the batch, and the batch
-   is ONE root `database_batch_sync_raw` combining three sources of keys:
+/* Admission-only spawn, POSTED. Nothing is written before the batch, and the
+   batch is ONE atomic root transaction executed by the store actor,
+   combining three sources of keys:
      - the child's birth meta (meta/created, meta/status, meta/depth,
        meta/parent) — composed as full root paths,
      - the child's ctx handoff key (state/ctx/handoff) when context_json is
        non-NULL,
-     - the parent's frame.spawn event,
+     - the parent's frame.spawn event (at the parent's PRE-ALLOCATED seq),
      - the lineage triple index ops (graph_triple_expand_ops on the root's
        reserved lineage layer — full root-database paths via the subtree
-       wrapper's prepend). All one transaction / one WAL record. */
-frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json) {
+       wrapper's prepend).
+   The composition is the spawn slice's shape UNCHANGED (the child subtree is
+   fresh, so the single-live-writer condition held already); only WHERE the
+   batch executes moved — into the store actor's behavior — and the caller
+   learns the outcome from its corr-matched reply through `spawn_slot` (the
+   direct sync caller pump-waits; a cell-verb spawn is answered by the
+   router at the reply). bridge_corr != 0 marks the cell-side round trip. */
+static frame_t* _frame_spawn_post(frame_t* parent, const char* goal,
+                                  const char* context_json,
+                                  uint64_t bridge_corr, uint64_t corr) {
   if (parent == NULL || parent->st == NULL) {
     log_error("frame_spawn: no live parent frame");
     return NULL;
@@ -1644,11 +2606,12 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
   frame_t* child = _frame_alloc(parent->root, parent, goal, NULL);
   if (child == NULL) return NULL;
 
-  uint64_t pseq = parent->seq + 1;
+  uint64_t pseq = _frame_seq_alloc(parent);   /* the lock's replacement */
 
   json_value_t* payload = json_new_object();
   if (payload == NULL) {
     log_error("frame_spawn: out of memory building spawn payload");
+    _frame_seq_rollback(parent, pseq);
     frame_destroy(child);
     return NULL;
   }
@@ -1659,6 +2622,7 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
   char* event_text = _frame_event_json_full(parent->sid_path, pseq,
                                             "frame.spawn", payload);
   if (event_text == NULL) {
+    _frame_seq_rollback(parent, pseq);
     frame_destroy(child);
     return NULL;
   }
@@ -1686,6 +2650,7 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
     free(k_handoff);
     free(k_event);
     free(event_text);
+    _frame_seq_rollback(parent, pseq);
     frame_destroy(child);
     return NULL;
   }
@@ -1751,6 +2716,7 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
     free(k_handoff);
     free(k_event);
     free(event_text);
+    _frame_seq_rollback(parent, pseq);
     frame_destroy(child);
     return NULL;
   }
@@ -1774,6 +2740,7 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
     free(k_handoff);
     free(k_event);
     free(event_text);
+    _frame_seq_rollback(parent, pseq);
     frame_destroy(child);
     return NULL;
   }
@@ -1794,28 +2761,96 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
     free(k_handoff);
     free(k_event);
     free(event_text);
+    _frame_seq_rollback(parent, pseq);
     frame_destroy(child);
     return NULL;
   }
   nops += ngo;
 
-  int rc = database_batch_sync_raw(parent->root->db, '/', ops, nops);
-  for (size_t i = 0; i < nops; i++) free((void*)ops[i].key);
-  free(event_text);
-  if (rc != 0) {
-    log_error("frame_spawn: admission batch failed (%d) for '%s' under '%s' — "
-              "nothing committed", rc, child->sid_path, parent->sid_path);
-    frame_destroy(child);
-    return NULL;
+  /* The ONE store round trip: the composed ops move into a store batch
+     (every key/value OWNED by the payload — the store behavior frees them
+     after it acts; the graph ops' borrowed static empty value gets a heap
+     twin), the parent's own store corr + the frame_spawn reply target are
+     set, and the admission posts. The store's rc arrives as a corr-matched
+     reply — today's "refused → destroy the child" contract moves to the
+     reply. */
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = (frm_store_op_t*)get_clear_memory(nops * sizeof(frm_store_op_t));
+  bp->nops = nops;
+  for (size_t i = 0; i < nops; i++) {
+    bp->ops[i].key = (char*)ops[i].key;              /* OWNED: transferred */
+    size_t vlen = ops[i].value_len;
+    uint8_t* v = (uint8_t*)get_memory(vlen + 1);
+    if (ops[i].value != NULL) memcpy(v, ops[i].value, vlen);
+    v[vlen] = '\0';
+    bp->ops[i].value = v;                            /* OWNED (heap twin) */
+    bp->ops[i].value_len = vlen;
   }
-  parent->seq = pseq;
+  free(event_text);   /* the working array's ONLY heap-owed value (the graph
+                         ops carry a static marker; the rest are stack) —
+                         the payload owns the copies now. The keys were
+                         TRANSFERRED (freed by the store round trip). */
+  bp->op_name = "spawn-admission";                   /* BORROWED literal */
+  bp->reply_to = &parent->actor;                     /* today's reply contract */
+  bp->corr = corr;
+  parent->spawn_slot.in_use = 1;
+  parent->spawn_slot.done = 0;
+  parent->spawn_slot.corr = corr;
+  parent->spawn_slot.bridge_corr = bridge_corr;
+  parent->spawn_slot.own_seq = pseq;
+  parent->spawn_slot.child = child;
+  _frame_post(&parent->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "spawn admission");
   return child;
 }
 
-/* Report: the child's frame.report event, the parent's bound frame.report
-   event, and the child's status → done, in ONE root batch. Both events carry
-   payload {child_sid, text}; each keeps its own frame's seq cause chain. */
-int frame_report(frame_t* child, const char* text) {
+/* The public admission: compose + post + pump-wait the store's commit — the
+   child is returned only after the admission COMMITS (today's contract, now
+   confirmed by the store reply). A refusal destroys the child exactly as
+   today. */
+frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json) {
+  if (parent == NULL || parent->st == NULL) {
+    log_error("frame_spawn: no live parent frame");
+    return NULL;
+  }
+  if (_frame_sync_store_refused(parent, "spawn")) return NULL;
+  uint64_t corr = ++parent->store_corr_seq;
+  frame_t* child = _frame_spawn_post(parent, goal, context_json, 0, corr);
+  if (child == NULL) return NULL;
+  (void)_frame_slot_wait(parent, &parent->spawn_slot.done,
+                         SA_FRAME_STORE_WAIT_MS);
+  uint8_t ok = (parent->spawn_slot.done && parent->spawn_slot.rc == 0);
+  int rc = parent->spawn_slot.rc;
+  parent->spawn_slot.in_use = 0;
+  parent->spawn_slot.child = NULL;   /* the caller ADOPTS the child either way */
+  if (!ok) {
+    if (parent->spawn_slot.done) {
+      log_error("frame_spawn: admission for '%s' under '%s' refused (%d) — "
+                "nothing committed; the child was never born",
+                frame_sid(child), parent->sid_path, rc);
+    } else {
+      log_error("frame_spawn: the admission reply never arrived in time at "
+                "'%s' — the child is abandoned loud", parent->sid_path);
+    }
+    frame_destroy(child);
+    return NULL;
+  }
+  return child;
+}
+
+/* Report: the CROSS-SUBTREE round trip (§5). The CHILD composes ONLY its own
+   frame.report record (its own pre-allocated seq) and posts FRM_REPORT_BIND
+   to the parent's actor; the PARENT composes the whole three-op batch — the
+   child's record + the child's meta/status=done + the parent's bound
+   frame.report event at the parent's own pre-allocated seq — and the store
+   actor executes it as ONE atomic commit, corr-matched back to the CHILD.
+   Both events keep payload {child_sid, text}; each keeps its own frame's seq
+   cause chain. engine_driven (Task 6's terminate path) posts FRM_CHILD_REPORT
+   from the same reply route; a cell-verb report or a direct sync-API report
+   only binds. */
+static int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
+                                   uint8_t engine_driven, const char* text) {
   if (child == NULL || child->st == NULL) {
     log_error("frame_report: dead frame");
     return -1;
@@ -1831,96 +2866,189 @@ int frame_report(frame_t* child, const char* text) {
     return -1;
   }
 
-  uint64_t cseq = child->seq + 1;
-  uint64_t pseq = parent->seq + 1;
-
+  uint64_t cseq = _frame_seq_alloc(child);
   json_value_t* child_payload = json_new_object();
   if (child_payload == NULL) {
     log_error("frame_report: out of memory building report payload");
+    _frame_seq_rollback(child, cseq);
     return -1;
   }
   json_object_set(child_payload, "child_sid", json_new_string(child->sid_path));
   json_object_set(child_payload, "text", json_new_string(text));
   char* child_text = _frame_event_json_full(child->sid_path, cseq,
                                             "frame.report", child_payload);
-  if (child_text == NULL) return -1;
-
-  json_value_t* parent_payload = json_new_object();
-  if (parent_payload == NULL) {
-    log_error("frame_report: out of memory building bound report payload");
-    free(child_text);
+  if (child_text == NULL) {
+    _frame_seq_rollback(child, cseq);
     return -1;
   }
-  json_object_set(parent_payload, "child_sid", json_new_string(child->sid_path));
-  json_object_set(parent_payload, "text", json_new_string(text));
-  char* parent_text = _frame_event_json_full(parent->sid_path, pseq,
-                                             "frame.report", parent_payload);
-  if (parent_text == NULL) {
-    free(child_text);
-    return -1;
-  }
-
-  char* k_cev = _frame_event_key(child->sid_path, cseq);
-  char* k_pev = _frame_event_key(parent->sid_path, pseq);
-  char* k_status = _frame_subkey(child->sid_path, "meta/status");
-  if (k_cev == NULL || k_pev == NULL || k_status == NULL) {
-    free(k_cev);
-    free(k_pev);
-    free(k_status);
-    free(child_text);
-    free(parent_text);
-    return -1;
-  }
-
-  raw_op_t ops[3];
-  ops[0].key = k_cev;
-  ops[0].key_len = strlen(k_cev);
-  ops[0].value = (const uint8_t*)child_text;
-  ops[0].value_len = strlen(child_text);
-  ops[0].type = 0;
-  ops[1].key = k_pev;
-  ops[1].key_len = strlen(k_pev);
-  ops[1].value = (const uint8_t*)parent_text;
-  ops[1].value_len = strlen(parent_text);
-  ops[1].type = 0;
-  ops[2].key = k_status;
-  ops[2].key_len = strlen(k_status);
-  ops[2].value = (const uint8_t*)SA_FRAME_STATUS_DONE;
-  ops[2].value_len = strlen(SA_FRAME_STATUS_DONE);
-  ops[2].type = 0;
-
-  size_t total_bytes = strlen(k_cev) + strlen(child_text) +
-                       strlen(k_pev) + strlen(parent_text) +
-                       strlen(k_status) + strlen(SA_FRAME_STATUS_DONE);
-  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+  size_t child_total = strlen(child_text) + strlen("events/%020llu");
+  if (child_total > SA_FRAME_MAX_BATCH_BYTES) {
     log_error("frame_report: report batch from '%s' is %zu bytes, exceeding "
               "the %d-byte WAL batch cap — refusing, never truncating",
-              child->sid_path, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
-    free(k_cev);
-    free(k_pev);
-    free(k_status);
+              child->sid_path, child_total, (int)SA_FRAME_MAX_BATCH_BYTES);
     free(child_text);
-    free(parent_text);
+    _frame_seq_rollback(child, cseq);
     return -3;
   }
 
-  int rc = database_batch_sync_raw(child->root->db, '/', ops, 3);
-  free(k_cev);
-  free(k_pev);
-  free(k_status);
-  free(child_text);
-  free(parent_text);
-  if (rc != 0) {
-    log_error("frame_report: report batch failed (%d) for '%s' into '%s' — "
-              "nothing committed", rc, child->sid_path, parent->sid_path);
-    return rc;
+  /* The child's own store round trip + the composed cross-subtree request. */
+  uint64_t corr = ++child->store_corr_seq;
+  frm_report_bind_payload_t* b =
+      (frm_report_bind_payload_t*)get_clear_memory(sizeof(frm_report_bind_payload_t));
+  b->reply_to = &child->actor;   /* the CHILD's actor receives the store reply */
+  b->corr = corr;
+  b->bridge_corr = bridge_corr;
+  b->engine_driven = engine_driven;
+  b->child_sid = strdup(child->sid_path);
+  b->child_seq = cseq;
+  b->child_event_text = child_text;   /* OWNED: transferred to the parent */
+  b->text = strdup(text);
+  if (b->child_sid == NULL || b->text == NULL) {
+    frm_report_bind_payload_destroy(b);
+    _frame_seq_rollback(child, cseq);
+    return -1;
   }
-  child->seq = cseq;
-  parent->seq = pseq;
+  /* The bind slot is filled BEFORE the post (the reply routes by corr). */
+  child->bind_slot.in_use = 1;
+  child->bind_slot.done = 0;
+  child->bind_slot.corr = corr;
+  child->bind_slot.bridge_corr = bridge_corr;
+  child->bind_slot.engine_driven = engine_driven;
+  child->bind_slot.own_seq = cseq;
+  _frame_post(&parent->actor, (uint32_t)FRM_REPORT_BIND, b,
+              frm_report_bind_payload_destroy, "report bind");
   return 0;
 }
 
-/* Join: ONE frame.join event in the parent's log {child_sid}; the child's
+/* The parent's half: the FRM_REPORT_BIND behavior composes the WHOLE
+   three-op batch (the parent's own seq is pre-allocated HERE — the child
+   could never touch it) and posts it to the store actor with the reply
+   addressed back to the CHILD's actor (carried). On its own COMPOSE-stage
+   refusal the parent rolls its seq back and releases the child with a
+   refusal reply; a store-stage refusal is the store worker's loud log (the
+   parent learns nothing from the store — its own seq was pre-allocated at
+   compose). CONSUMES the bind payload on every path. */
+static void _frame_report_bind_compose(frame_t* f, frm_report_bind_payload_t* b) {
+  int rc = 0;
+  uint64_t pseq = 0;
+  if (f == NULL || f->st == NULL || b == NULL) {
+    log_error("frame_report: report bind at a dead parent");
+    if (b != NULL) {
+      _store_reply_send(b->reply_to, b->corr, -1, NULL, 0);
+      frm_report_bind_payload_destroy(b);
+    }
+    return;
+  }
+  if (b->corr == 0 || b->child_sid == NULL || b->child_seq == 0 ||
+      b->child_event_text == NULL || b->text == NULL) {
+    log_error("frame_report: an incomplete report bind payload at '%s' — "
+              "refused (the child's corr still gets its refusal reply)",
+              f->sid_path);
+    _store_reply_send(b->reply_to, b->corr, -1, NULL, 0);
+    frm_report_bind_payload_destroy(b);
+    return;
+  }
+
+  pseq = _frame_seq_alloc(f);
+  json_value_t* parent_payload = json_new_object();
+  if (parent_payload == NULL) {
+    log_error("frame_report: out of memory building bound report payload");
+    _frame_seq_rollback(f, pseq);
+    _store_reply_send(b->reply_to, b->corr, -1, NULL, 0);
+    frm_report_bind_payload_destroy(b);
+    return;
+  }
+  json_object_set(parent_payload, "child_sid", json_new_string(b->child_sid));
+  json_object_set(parent_payload, "text", json_new_string(b->text));
+  char* parent_text = _frame_event_json_full(f->sid_path, pseq,
+                                             "frame.report", parent_payload);
+  char* k_cev = _frame_event_key(b->child_sid, b->child_seq);
+  char* k_pev = _frame_event_key(f->sid_path, pseq);
+  char* k_status = _frame_subkey(b->child_sid, "meta/status");
+  if (parent_text == NULL || k_cev == NULL || k_pev == NULL || k_status == NULL) {
+    free(parent_text);
+    free(k_cev);
+    free(k_pev);
+    free(k_status);
+    _frame_seq_rollback(f, pseq);
+    _store_reply_send(b->reply_to, b->corr, -1, NULL, 0);
+    frm_report_bind_payload_destroy(b);
+    return;
+  }
+
+  size_t total_bytes = strlen(k_cev) + strlen(k_pev) + strlen(k_status) +
+                       strlen(parent_text) + strlen(b->child_event_text) +
+                       strlen(b->text);
+  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame_report: report batch from '%s' into '%s' is %zu bytes, "
+              "exceeding the %d-byte WAL batch cap — refusing, never "
+              "truncating", b->child_sid, f->sid_path, total_bytes,
+              (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(k_cev);
+    free(k_pev);
+    free(k_status);
+    free(parent_text);
+    _frame_seq_rollback(f, pseq);
+    _store_reply_send(b->reply_to, b->corr, -3, NULL, 0);
+    frm_report_bind_payload_destroy(b);
+    return;
+  }
+
+  frm_store_batch_payload_t* bp =
+      get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = get_clear_memory(3 * sizeof(frm_store_op_t));
+  bp->nops = 3;
+  bp->ops[0].key = k_cev;                    /* OWNED by the store round trip */
+  bp->ops[0].value = b->child_event_text;    /* OWNED: transferred in */
+  bp->ops[0].value_len = strlen(b->child_event_text);
+  b->child_event_text = NULL;                /* consumed */
+  bp->ops[1].key = k_pev;                    /* OWNED */
+  bp->ops[1].value = parent_text;            /* OWNED */
+  bp->ops[1].value_len = strlen(parent_text);
+  bp->ops[2].key = k_status;                 /* OWNED */
+  bp->ops[2].value = (uint8_t*)get_memory(strlen(SA_FRAME_STATUS_DONE) + 1);
+  if (bp->ops[2].value == NULL) {
+    frm_store_batch_payload_destroy(bp);
+    _frame_seq_rollback(f, pseq);
+    _store_reply_send(b->reply_to, b->corr, -1, NULL, 0);
+    frm_report_bind_payload_destroy(b);
+    return;
+  }
+  memcpy(bp->ops[2].value, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
+  bp->ops[2].value_len = strlen(SA_FRAME_STATUS_DONE);
+  bp->op_name = "frame.report (bind)";       /* BORROWED literal */
+  bp->reply_to = b->reply_to;                /* BORROWED: the CHILD's actor */
+  bp->corr = b->corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "report bind batch");
+  frm_report_bind_payload_destroy(b);
+}
+
+/* The public bind (pump-waits the corr-matched store reply at the child). */
+int frame_report(frame_t* child, const char* text) {
+  if (child == NULL || child->st == NULL) {
+    log_error("frame_report: dead frame");
+    return -1;
+  }
+  if (_frame_sync_store_refused(child, "report")) return -1;
+  int rc = _frame_report_bind_post(child, 0, 0, text);
+  if (rc != 0) {
+    child->bind_slot.in_use = 0;
+    return rc;
+  }
+  (void)_frame_slot_wait(child, &child->bind_slot.done, SA_FRAME_STORE_WAIT_MS);
+  if (!child->bind_slot.done) {
+    /* Deadline: the bind may still commit — the seq stays pre-allocated. */
+    child->bind_slot.in_use = 0;
+    return -1;
+  }
+  rc = child->bind_slot.rc;                  /* the seq rollback ran there */
+  child->bind_slot.in_use = 0;
+  return rc;
+}
+
+/* Join: ONE frame.join event in the parent's log {child_sid}, posted as a
+   single-op store batch with the parent's PRE-ALLOCATED seq; the child's
    status stays "done" (report already marked it) and the frame_t destruction
    remains the caller's job — join only logs the close in the parent. */
 int frame_join(frame_t* child) {
@@ -1934,30 +3062,29 @@ int frame_join(frame_t* child) {
               child->sid_path);
     return -1;
   }
+  if (_frame_sync_store_refused(parent, "join")) return -1;
 
-  uint64_t pseq = parent->seq + 1;
+  uint64_t pseq = _frame_seq_alloc(parent);
   json_value_t* payload = json_new_object();
   if (payload == NULL) {
     log_error("frame_join: out of memory building join payload");
+    _frame_seq_rollback(parent, pseq);
     return -1;
   }
   json_object_set(payload, "child_sid", json_new_string(child->sid_path));
   char* parent_text = _frame_event_json_full(parent->sid_path, pseq,
                                              "frame.join", payload);
-  if (parent_text == NULL) return -1;
+  if (parent_text == NULL) {
+    _frame_seq_rollback(parent, pseq);
+    return -1;
+  }
 
   char* k_pev = _frame_event_key(parent->sid_path, pseq);
   if (k_pev == NULL) {
     free(parent_text);
+    _frame_seq_rollback(parent, pseq);
     return -1;
   }
-
-  raw_op_t ops[1];
-  ops[0].key = k_pev;
-  ops[0].key_len = strlen(k_pev);
-  ops[0].value = (const uint8_t*)parent_text;
-  ops[0].value_len = strlen(parent_text);
-  ops[0].type = 0;
 
   size_t total_bytes = strlen(k_pev) + strlen(parent_text);
   if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
@@ -1966,18 +3093,37 @@ int frame_join(frame_t* child) {
               child->sid_path, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
     free(k_pev);
     free(parent_text);
+    _frame_seq_rollback(parent, pseq);
     return -3;
   }
 
-  int rc = database_batch_sync_raw(child->root->db, '/', ops, 1);
-  free(k_pev);
-  free(parent_text);
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  bp->nops = 1;
+  bp->ops[0].key = k_pev;                    /* OWNED by the store round trip */
+  bp->ops[0].value = (uint8_t*)parent_text;  /* OWNED */
+  bp->ops[0].value_len = strlen(parent_text);
+  bp->op_name = "frame.join";                /* BORROWED literal */
+  free(parent->sync.text);
+  memset(&parent->sync, 0, sizeof(parent->sync));
+  parent->sync.in_use = 1;
+  parent->sync.corr = ++parent->store_corr_seq;
+  bp->reply_to = &parent->actor;
+  bp->corr = parent->sync.corr;
+  _frame_post(&child->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "join batch");
+  int wait_rc = _frame_slot_wait(parent, &parent->sync.done,
+                                 SA_FRAME_STORE_WAIT_MS);
+  parent->sync.in_use = 0;
+  if (wait_rc != 0) return -1;   /* the seq stays (the batch may still commit) */
+  int rc = parent->sync.rc;
   if (rc != 0) {
+    _frame_seq_rollback(parent, pseq);
     log_error("frame_join: join batch failed (%d) for '%s' out of '%s' — "
               "nothing committed", rc, child->sid_path, parent->sid_path);
     return rc;
   }
-  parent->seq = pseq;
   return 0;
 }
 

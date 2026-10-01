@@ -33,14 +33,25 @@ TEST(TestFrame, TestPoolAttachAndInheritance) {
   scheduler_pool_t* pool = scheduler_pool_create(2);
   ASSERT_NE(pool, nullptr);
   cfg.pool = pool;
-  wave_database_root_t* db = wave_db_open(NULL);
+  /* A POOLED frame requires a POOLED store (the Task-2 guard refuses the
+     mixed shape at create — a pooled frame posting into an un-pumped inline
+     store mailbox would hang): the store actor rides the SAME pool. */
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
   frame_t* parent = frame_create(db, NULL, "tree root", &cfg);
   ASSERT_NE(parent, nullptr);
   EXPECT_EQ(frame_pool(parent), pool) << "frame_create attaches the config's pool";
 
-  frame_t* child = frame_spawn(parent, "leaf", NULL);
+  /* frame_spawn is a synchronous store API — inline-store-only (§5): on this
+     pooled store it refuses loud, so the CHILD-inherits-pool assertion rides
+     frame_create's parent link instead (the same _frame_alloc inheritance). */
+  frame_t* child = frame_create(db, parent, "leaf", &cfg);
   ASSERT_NE(child, nullptr);
-  EXPECT_EQ(frame_pool(child), pool) << "spawned children inherit the parent's pool";
+  EXPECT_EQ(frame_pool(child), pool) << "children inherit the pool down the lineage";
 
   /* An inline default is unchanged: a pool-less config means pool NULL. */
   frame_config_t plain = test_config();
@@ -51,9 +62,9 @@ TEST(TestFrame, TestPoolAttachAndInheritance) {
   frame_destroy(child);
   frame_destroy(inline_frame);
   frame_destroy(parent);
-  scheduler_pool_stop(pool);
-  scheduler_pool_destroy(pool);
+  scheduler_pool_stop(pool);      /* documented order: stop, close, destroy */
   wave_db_close(db);
+  scheduler_pool_destroy(pool);
 }
 
 TEST(TestFrame, TestFrameStartQueuesOneTurnContinuation) {
@@ -236,8 +247,11 @@ TEST(TestFrame, TestReportBindsOneEventIntoParent) {
 /* Completion record (the py_frame pattern from test_pyrt.cpp): the test's own
    dispatch shape — here the frame's reply leaves via the bridge hook, so the
    completion record is a recording sink passed to frame_bridge_register_...
-   (frame_dispatch delivers replies to it synchronously on this same thread,
-   so plain members are fine). */
+   Since Task 2 (the store actor) a bridge verb's corr answer is routed by the
+   FRM_STORE_REPLY router: the dispatch composes and posts the store message,
+   the pump runs the store actor, and ONE more frame pump routes the reply —
+   so plain members are still fine (every hop lands on the caller's thread),
+   but a store round trip is now TWO pump lines after frame_dispatch. */
 typedef struct bridge_completion_t {
   std::vector<uint64_t> corrs;
   std::vector<uint8_t> statuses;
@@ -275,6 +289,30 @@ static message_t bridge_request(frame_message_type_e type, uint64_t corr,
   msg.payload = rp;
   msg.payload_destroy = frm_remember_payload_destroy;
   return msg;
+}
+
+/* The audit-trail surface (test_loop.cpp's helpers, verbatim): load
+   frame_debug_events and search it. */
+static json_value_t* load_events(frame_t* f) {
+  char* json = frame_debug_events(f);
+  EXPECT_NE(json, nullptr);
+  if (json == NULL) return nullptr;
+  char* err = NULL;
+  json_value_t* arr = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  EXPECT_NE(arr, nullptr);
+  if (arr != nullptr) EXPECT_EQ(json_type(arr), JSON_ARRAY);
+  if (arr == nullptr || json_type(arr) != JSON_ARRAY) {
+    if (arr != nullptr) json_value_destroy(arr);
+    return nullptr;
+  }
+  return arr;
+}
+
+static bool event_is(json_value_t* rec, const char* type_name) {
+  json_value_t* type_v = json_get(rec, "type");
+  return type_v != NULL && strcmp(json_as_string(type_v), type_name) == 0;
 }
 
 /* Load the frame's debug events and locate the FIRST state.remember payload.
@@ -326,12 +364,18 @@ TEST(TestFrame, TestBridgeRememberRecallCorrMatched) {
   bridge_completion_t completion;
   bridge_completion_mount(&completion);
 
-  /* FRM_REMEMBER{corr=77} → the behavior applies frame_remember_ctx (the
+  /* FRM_REMEMBER{corr=77} → the behavior composes the ctx write (the
      INHERITABLE layer: a cell's remember() is a durable shared-by-default
-     write) and answers FRM_REPLY corr-matched. */
+     write) and posts it to the store actor; the store reply is corr-matched
+     by the FRAME's router (the bridge answer is no longer synchronous with
+     the dispatch — the store actor is the reply source now). */
   message_t req = bridge_request(FRM_REMEMBER, 77, "mode", "\"fast\"");
   frame_dispatch(f, &req);
   EXPECT_EQ(req.payload, nullptr) << "behavior consumed the payload";
+  EXPECT_EQ(completion.corrs.size(), 0u)
+      << "no synchronous bridge answer anymore — the store reply routes it";
+  wave_db_pump(db);                       /* the store actor commits the batch */
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);   /* the reply router answers */
 
   ASSERT_EQ(completion.corrs.size(), 1u);
   EXPECT_EQ(completion.corrs[0], 77u) << "corr-matched to the request";
@@ -358,12 +402,15 @@ TEST(TestFrame, TestBridgeRememberRecallCorrMatched) {
   EXPECT_STREQ(v, "\"fast\"") << "raw JSON text, stored verbatim";
   free(v);
 
-  /* FRM_RECALL{corr=78} → replies with the resolved JSON text. */
+  /* FRM_RECALL{corr=78} → the walk is a store message now; the router
+     replies with the resolved JSON text. */
   completion.corrs.clear();
   completion.statuses.clear();
   completion.texts.clear();
   message_t req2 = bridge_request(FRM_RECALL, 78, "mode", NULL);
   frame_dispatch(f, &req2);
+  wave_db_pump(db);                       /* the store actor runs the walk */
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);   /* the reply router answers */
   ASSERT_EQ(completion.corrs.size(), 1u);
   EXPECT_EQ(completion.corrs[0], 78u);
   EXPECT_EQ(completion.statuses[0], 0u);
@@ -373,6 +420,8 @@ TEST(TestFrame, TestBridgeRememberRecallCorrMatched) {
      python waiter is never stranded silently. */
   message_t req3 = bridge_request(FRM_RECALL, 79, "absent", NULL);
   frame_dispatch(f, &req3);
+  wave_db_pump(db);
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
   ASSERT_EQ(completion.corrs.size(), 2u);
   EXPECT_EQ(completion.corrs[1], 79u);
   EXPECT_EQ(completion.statuses[1], 1u);
@@ -415,9 +464,12 @@ TEST(TestFrame, TestBridgeInvalidPayloadAnswersFailure) {
   json_value_destroy(events);
 
   /* A recall whose key never resolves is a corr-matched failure too (NULL
-     text — the bridge registry reads status, not text, for a failure). */
+     text — the bridge registry reads status, not text, for a failure; the
+     refusal rides the store's reply through the router). */
   message_t req2 = bridge_request(FRM_RECALL, 91, "alsomissing", NULL);
   frame_dispatch(f, &req2);
+  wave_db_pump(db);
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
   ASSERT_EQ(completion.corrs.size(), 2u);
   EXPECT_EQ(completion.corrs[1], 91u);
   EXPECT_EQ(completion.statuses[1], 1u);
@@ -425,6 +477,222 @@ TEST(TestFrame, TestBridgeInvalidPayloadAnswersFailure) {
 
   bridge_completion_mount(NULL);
   frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* --- Task 2: the store actor (WaveDB behind ONE mailbox — no locks) -------- */
+
+TEST(TestStore, TestStoreActorBatchIsAtomicAndAnswered) {
+  /* The store actor inline: a batch posted to ITS mailbox is executed as ONE
+     root transaction, and its corr-matched reply lands in the requester's
+     mailbox. The test plays the requester by posting a batch whose reply_to
+     is a frame actor it drains by hand. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  actor_t* store = wave_db_store_actor(db);
+  ASSERT_NE(store, nullptr);
+
+  frame_config_t cfg = test_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);   /* inline frame = the reply target */
+  ASSERT_NE(f, nullptr);
+
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*bp));
+  bp->ops = (frm_store_op_t*)get_clear_memory(2 * sizeof(frm_store_op_t));
+  bp->nops = 2;
+  /* The composed FULL root-database paths (the store batch's contract) ride
+     the reply target's own subtree. */
+  bp->ops[0].key =
+      strdup((std::string(frame_sid(f)) + "/state/local/k1").c_str());
+  bp->ops[0].value = (uint8_t*)strdup("\"one\"");
+  bp->ops[0].value_len = strlen("\"one\"");
+  bp->ops[1].key =
+      strdup((std::string(frame_sid(f)) + "/state/ctx/k2").c_str());
+  bp->ops[1].value = (uint8_t*)strdup("\"two\"");
+  bp->ops[1].value_len = strlen("\"two\"");
+  bp->op_name = "store-test";
+  bp->reply_to = _frame_actor(f);
+  bp->corr = 4242;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_BATCH;
+  m.payload = bp;
+  m.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &m));
+
+  /* Nothing is committed outside the store actor's runs — and from the
+     caller thread there IS no observation before a run: an inline sync store
+     call (frame_recall) posts and PUMPS, and its pump cycle runs the whole
+     queued store actor (the batch rides FIFO ahead of the probe's own
+     recall). So the contract is asserted as the two-pump routing: the
+     explicit pump commits the batch, the frame's actor routes the corr
+     4242 reply (dropped loud — the test plays an external requester), and
+     the recalls below observe exactly the committed state. */
+  EXPECT_EQ(wave_db_pump(db), 0);          /* the store actor runs the batch */
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);   /* the reply dispatches on the frame actor */
+
+  /* The batch committed atomically (both keys or neither), and the frame's
+     OWN log is untouched by the unrelated store batch. */
+  char* v = frame_recall(f, "k1");
+  ASSERT_NE(v, nullptr);
+  EXPECT_STREQ(v, "\"one\"");
+  free(v);
+  v = frame_recall(f, "k2");
+  ASSERT_NE(v, nullptr);
+  EXPECT_STREQ(v, "\"two\"");
+  free(v);
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(json_size(events), 0u);
+  json_value_destroy(events);
+
+  /* A store-level rejection: an oversized op posted straight to the store
+     actor is refused loud and commits NOTHING (fail-loud stays the store's
+     contract; the composers' cap checks are mirrored here). */
+  frm_store_batch_payload_t* bad =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*bad));
+  bad->ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  bad->nops = 1;
+  bad->ops[0].key =
+      strdup((std::string(frame_sid(f)) + "/state/local/big").c_str());
+  std::string blob(200 * 1024, 'x');       /* > SA_FRAME_MAX_BATCH_BYTES */
+  bad->ops[0].value = (uint8_t*)strdup(blob.c_str());
+  bad->ops[0].value_len = blob.size();
+  bad->op_name = "store-test-oversized";
+  bad->reply_to = _frame_actor(f);
+  bad->corr = 4243;
+  message_t bad_msg;
+  bad_msg.type = (uint32_t)FRM_STORE_BATCH;
+  bad_msg.payload = bad;
+  bad_msg.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &bad_msg));
+  wave_db_pump(db);
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);   /* the refusal reply routes (dropped loud
+                                                   — an unmatched corr — but observable via
+                                                   the recall below) */
+  char* big_after = frame_recall(f, "big");
+  EXPECT_EQ(big_after, nullptr) << "the oversized batch committed nothing";
+  free(big_after);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestStore, TestPooledStorePumpRefusesLoud) {
+  /* The dual-driver rule's other half: a POOLED store's pacing belongs to its
+     workers; wave_db_pump must refuse loud, not steal a mailbox run. */
+  frame_config_t cfg = test_config();
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  cfg.pool = pool;
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  EXPECT_NE(wave_db_store_actor(db), nullptr);
+  EXPECT_NE(wave_db_pump(db), 0) << "pooled store: the pump refuses loud, it never pumps";
+  wave_db_close(db);            /* documented order: stop, close, destroy */
+  scheduler_pool_stop(pool);
+  scheduler_pool_destroy(pool);
+}
+
+TEST(TestStore, TestStoreRecallWalkRidesTheStoreActor) {
+  /* The resolve walk (own local/ -> own ctx/ -> ancestor ctx/) is now a
+     store MESSAGE, not a synchronous frame-side read: a cell's actor.recall
+     is answered from the FRM_STORE_REPLY router. Uses the test_frame
+     bridge harness (bridge_completion_mount). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  frame_config_t cfg = test_config();
+  frame_t* parent = frame_create(db, NULL, NULL, &cfg);
+  frame_t* child = frame_spawn(parent, NULL, NULL);
+  frame_remember_ctx(parent, "inherited", "\"hello\"");   /* ancestor state */
+  frame_remember_local(child, "local", "\"mine\"");
+
+  bridge_completion_t completion;
+  bridge_completion_mount(&completion);
+
+  /* The cell-verb shape: FRM_RECALL dispatched at the child is now
+     compose-and-post; the bridge corr answer waits for the store reply. */
+  message_t req = bridge_request(FRM_RECALL, 91, "inherited", NULL);
+  frame_dispatch(child, &req);      /* posts the store recall; no bridge reply YET */
+  EXPECT_EQ(completion.corrs.size(), 0u)
+      << "no synchronous bridge answer anymore — the store actor is the reply source";
+
+  wave_db_pump(db);                 /* the store actor runs the walk */
+  actor_run(_frame_actor(child), ACTOR_BATCH_SIZE);   /* the router answers the corr */
+  ASSERT_EQ(completion.corrs.size(), 1u);
+  EXPECT_EQ(completion.corrs[0], 91u);
+  EXPECT_EQ(completion.statuses[0], 0u) << "the walk resolved through the store actor";
+  EXPECT_EQ(completion.texts[0], "\"hello\"");
+  completion.corrs.clear(); completion.statuses.clear(); completion.texts.clear();
+
+  /* local/ shadows ctx/ within one frame (unchanged semantics, same path): */
+  message_t req2 = bridge_request(FRM_RECALL, 92, "local", NULL);
+  frame_dispatch(child, &req2);
+  wave_db_pump(db);
+  actor_run(_frame_actor(child), ACTOR_BATCH_SIZE);
+  ASSERT_EQ(completion.corrs.size(), 1u);
+  EXPECT_EQ(completion.corrs[0], 92u);
+  EXPECT_EQ(completion.texts[0], "\"mine\"");
+
+  bridge_completion_mount(NULL);
+  frame_destroy(child);
+  frame_destroy(parent);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestReportBindIsOneCrossSubtreeBatch) {
+  /* The cross-frame effect is ONE atomic batch, composed at the PARENT's
+     actor with the parent's PRE-ALLOCATED seq; the child only ever allocated
+     its own. Observable as exact per-log seq chains after the reply. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  frame_config_t cfg = test_config();
+  frame_t* parent = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(parent, nullptr);
+  frame_t* child = frame_spawn(parent, "leaf", NULL);   /* spawn = parent seq 1 */
+  ASSERT_NE(child, nullptr);
+
+  EXPECT_EQ(frame_report(child, "leaf's verdict"), 0);  /* the bind (sync shape pumps) */
+
+  /* Parent log: frame.spawn @ seq 1, bound frame.report @ seq 2 (the parent
+     allocated 2 at ITS actor — the child could not touch it). */
+  json_value_t* events = load_events(parent);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(json_size(events), 2u);
+  EXPECT_TRUE(event_is(json_at(events, 0), "frame.spawn"));
+  EXPECT_EQ(json_as_int(json_get(json_at(events, 1), "seq")), 2);
+  EXPECT_TRUE(event_is(json_at(events, 1), "frame.report"));
+  EXPECT_STREQ(json_as_string(json_get(json_get(json_at(events, 1), "payload"), "child_sid")),
+               frame_sid(child));
+  json_value_destroy(events);
+
+  /* Child log: exactly ONE frame.report @ seq 1, cause = spawn-free, status
+     done. */
+  json_value_t* cev = load_events(child);
+  ASSERT_NE(cev, nullptr);
+  ASSERT_EQ(json_size(cev), 1u);
+  EXPECT_TRUE(event_is(json_at(cev, 0), "frame.report"));
+  EXPECT_EQ(json_as_int(json_get(json_at(cev, 0), "seq")), 1);
+  json_value_destroy(cev);
+  EXPECT_EQ(frame_is_done(child), 1);
+
+  /* Refusal = NOTHING half-applies in EITHER log: an oversized report text is
+     refused at compose; both logs keep their exact prior state. */
+  std::string big(200 * 1024, 'x');        /* > SA_FRAME_MAX_BATCH_BYTES */
+  EXPECT_NE(frame_report(child, big.c_str()), 0) << "refused loud, never truncated";
+  json_value_t* p2 = load_events(parent);
+  ASSERT_NE(p2, nullptr);
+  ASSERT_EQ(json_size(p2), 2u) << "the parent's log did not half-apply";
+  json_value_destroy(p2);
+  json_value_t* c2 = load_events(child);
+  ASSERT_NE(c2, nullptr);
+  ASSERT_EQ(json_size(c2), 1u) << "the child's log did not half-apply";
+  json_value_destroy(c2);
+
+  frame_destroy(child);
+  frame_destroy(parent);
   wave_db_close(db);
 }
 

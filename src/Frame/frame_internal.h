@@ -100,6 +100,26 @@ int _frame_cell_wait(frame_t* f, unsigned timeout_ms, uint8_t* status_out);
    frame. */
 actor_t* _frame_actor(frame_t* f);
 
+/* Bounded wait for the frame's synchronous store round trips (the
+   _frame_cell_wait deadline family): a store round trip is µs–ms, so
+   breaking this deadline is a loud stall, never a hang. */
+#ifndef SA_FRAME_STORE_WAIT_MS
+#define SA_FRAME_STORE_WAIT_MS 30000
+#endif
+
+/* ONE pump cycle over an inline frame's whole round-trip surface: the frame's
+   mailbox, then each LIVE ANCESTOR's mailbox (child first — a bind request
+   must reach the parent's actor and its composition), then — when the ROOT's
+   store actor is inline — the store actor's mailbox. This is what makes every
+   inline round trip (bridge verb -> store batch -> store reply -> answer)
+   complete within one pump cycle, and it is the ONLY pump-order definition:
+   _frame_cell_wait, the sync store API and the Task-3 driver pump all lean on
+   it. Pooled surfaces (a pooled frame or a pooled store) are NEVER pumped
+   here — scheduler workers own them; an inline frame's pooled ancestors (only
+   possible via a mismatched frame_create cfg — the Task-2 guard refuses it)
+   are skipped by the live-ancestor walk. */
+void _frame_pump(frame_t* f);
+
 #endif /* SA_HAS_WDB */
 
 #ifdef __cplusplus
