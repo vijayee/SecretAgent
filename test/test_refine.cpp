@@ -15,9 +15,11 @@ extern "C" {
 #include "../src/Frame/refine.h"
 #include "../src/Frame/frame_internal.h"   /* Task 3's _frame_sync_* helpers */
 #include "../src/Frame/model_internal.h"   /* Task 4's _model_request_body */
+#include "../src/Scheduler/scheduler.h"    /* the pooled-store refusal's pool */
 }
 
 #include <string>
+#include <vector>
 
 /* Task 1's tests build folds in memory, so the seed helpers live here: the
    parse function's own round trips ride the store-actor tests (Task 3+).
@@ -1711,4 +1713,1201 @@ TEST(TestRefine, TestProposalDecodeCapsAndFences) {
   refine_fold_destroy(&fold);
   frame_destroy(f);
   wave_db_close(db);
+}
+/* ------------------------------------------------------------------ */
+/* Task 5: the whole cycles (refine_run + refine_rollback, the parity   */
+/* rows 10-17) — every test drives the REAL round trips through the     */
+/* store actor (the sync helpers pump themselves; no hand pumping).     */
+/* ------------------------------------------------------------------ */
+
+/* A bounded scan's reply as the raw record VALUE texts, ascending. Empty
+   vector when the range is empty (or the scan refused — the tests assert
+   the contents, never silently pass on an empty reply). */
+static std::vector<std::string> refi_scan_values(frame_t* f,
+                                                 const std::string& start,
+                                                 const std::string& end,
+                                                 size_t cap) {
+  std::vector<std::string> out;
+  char* raw = NULL;
+  if (_frame_sync_scan(f, start.c_str(), end.c_str(), cap, &raw) != 0) return out;
+  if (raw == NULL) return out;
+  char* err = NULL;
+  json_value_t* arr = json_parse(raw, strlen(raw), &err);
+  if (err != NULL) free(err);
+  free(raw);
+  if (arr == NULL || json_type(arr) != JSON_ARRAY) {
+    json_value_destroy(arr);
+    return out;
+  }
+  for (size_t i = 0; i < json_size(arr); i++) {
+    json_value_t* el = json_at(arr, i);
+    if (el != NULL && json_type(el) == JSON_STRING) {
+      out.emplace_back(json_as_string(el));
+    }
+  }
+  json_value_destroy(arr);
+  return out;
+}
+
+/* A meta key's stored text ("" = absent). */
+static std::string refi_stored_meta(frame_t* f, const std::string& scope_root,
+                                    const char* meta) {
+  std::string key = scope_root + "/meta/" + meta;
+  auto vals = refi_scan_values(f, key, key + "0", 1);
+  return vals.empty() ? std::string() : vals[0];
+}
+
+/* The harness log's key (the events discipline's zero pad — the SAME
+   composition refine.c's _refine_log_key rides; the test composes it to
+   read the store, never to write around it). */
+static std::string refi_log_key(const std::string& root, uint64_t seq) {
+  char buf[128];
+  snprintf(buf, sizeof(buf), "%s/log/%020llu", root.c_str(),
+           (unsigned long long) seq);
+  return buf;
+}
+
+/* One JSON field: the ""-default string form. */
+static std::string refi_str(json_value_t* obj, const char* key) {
+  json_value_t* v = json_get(obj, key);
+  return (v != NULL && json_type(v) == JSON_STRING) ? json_as_string(v) : "";
+}
+
+/* The parsed record DOM helper (the caller's to destroy). */
+static json_value_t* refi_parse_record(const std::string& text) {
+  return json_parse(text.c_str(), text.size(), NULL);
+}
+
+/* A seed record's text as the fold WOULD have composed from one applied
+   edit — the harness log's seed for the store-side tests (a REAL record
+   shape, not a fixture shortcut: the fold re-applies its edits through
+   refine_edit_apply). Plain string fields only (no escaping needed). */
+static std::string refi_seed_record(uint64_t seq, const char* id,
+                                    const char* trigger,
+                                    const char* edits_json) {
+  std::string rec = "{\"seq\":" + std::to_string(seq) + ",\"id\":\"" + id +
+                    "\",\"trigger\":\"" + trigger + "\",\"rollbackOf\":null,"
+                    "\"evidence\":{\"session\":\"s\",\"first_seq\":1,"
+                    "\"last_seq\":2,\"summary\":\"the seed\"},\"edits\":[" +
+                    (edits_json != NULL ? edits_json : "") +
+                    "],\"at\":\"2026-10-01T12:00:00Z\"}";
+  return rec;
+}
+
+/* One APPLIED edit element inside a seed record (expect + evidence + the
+   before snapshot explicit). before_json may be NULL = "null". */
+static std::string refi_seed_edit(const char* action, const char* kind,
+                                  const char* id, const char* title,
+                                  const char* content, const char* path,
+                                  unsigned expect_version,
+                                  uint64_t ev_first, uint64_t ev_last,
+                                  const char* reason, const char* before_json) {
+  std::string el = "{\"action\":\"" + std::string(action) + "\",\"kind\":\"" +
+                   kind + "\",\"id\":\"" + id + "\",";
+  if (title != NULL) el += std::string("\"title\":\"") + title + "\",";
+  if (content != NULL) el += std::string("\"content\":\"") + content + "\",";
+  if (path != NULL) el += std::string("\"path\":\"") + path + "\",";
+  if (strcmp(action, "create") != 0) {
+    el += "\"expect\":{\"version\":" + std::to_string(expect_version) + "},";
+  }
+  el += "\"evidence\":{\"first_seq\":" + std::to_string(ev_first) +
+        ",\"last_seq\":" + std::to_string(ev_last) + ",\"summary\":\"" +
+        reason + "\"},\"before\":" +
+        (before_json != NULL ? before_json : "null") +
+        ",\"applied\":true,\"error\":null}";
+  return el;
+}
+
+/* The create lesson many Task 5 tests re-use (the chunked-body id). */
+static const char* const kChunkedCreateProposal =
+    "{\"summary\":\"Chunked bodies decode in place\","
+    "\"rationale\":\"The chunked-body turn proved decoding happens in "
+    "place\",\"edits\":[{\"action\":\"create\",\"kind\":\"memory\","
+    "\"title\":\"Chunked bodies decode silently\","
+    "\"content\":\"A chunked body decodes in place\","
+    "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"the "
+    "chunked-body turn\"},\"reason\":\"the chunked turn proved it\"}]}";
+
+TEST(TestRefine, TestRefineRunCommitsOneAtomicBatch) {
+  /* A scripted review backend returns a canned proposal; one refine_run
+     call; the store then holds the record + entry + meta trio in ONE
+     batch — the seqs line up: the record's edits == the materialized
+     entries, and the stored meta derives EXACTLY from the log. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  std::string root = sid + "/harness";
+
+  ASSERT_EQ(frame_append_msg(f, "user", "the chunked body decoded in place"), 0);
+  ASSERT_EQ(frame_append_msg(f, "assistant", "noted the chunked-body lesson"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  sm.content = kChunkedCreateProposal;
+  frame_set_model_backend(f, &sm.base);
+
+  char* summary = NULL;
+  int rc = refine_run(f, "focus on chunked bodies", 0, &summary);
+  ASSERT_EQ(rc, 0) << "the commit path returns 0";
+  ASSERT_NE(summary, nullptr);
+  std::string sum(summary);
+  free(summary);
+
+  /* The frozen summary shape (the record id is the minted one — extract
+     it and pin the record to the SAME id). */
+  std::string committed_marker = " committed (1/1 edits applied)";
+  size_t id_at = sum.find("refine: refine_");
+  ASSERT_EQ(id_at, 0u) << "the header line: " << sum;
+  size_t committed_at = sum.find(committed_marker);
+  ASSERT_NE(committed_at, std::string::npos) << sum;
+  size_t id_begin = strlen("refine: ");
+  std::string record_id = sum.substr(id_begin, committed_at - id_begin);
+  EXPECT_EQ(record_id.find("refine_"), 0u) << "the mint: " << record_id;
+  EXPECT_NE(sum.find("  apply memory local:chunked_bodies_decode_silently "
+                     "v1: the chunked turn proved it"), std::string::npos)
+      << "the apply line: " << sum;
+  EXPECT_NE(sum.find("digest changed: yes"), std::string::npos) << sum;
+  EXPECT_EQ(sum.find("refuse "), std::string::npos) << sum;
+
+  /* The log record (one record; the trio's seqs line up): */
+  auto records = refi_scan_values(f, root + "/log", root + "/log0", 0);
+  ASSERT_EQ(records.size(), 1u);
+  json_value_t* rec = refi_parse_record(records[0]);
+  ASSERT_NE(rec, nullptr) << records[0];
+  EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)1);
+  EXPECT_EQ(refi_str(rec, "id"), record_id);
+  EXPECT_EQ(refi_str(rec, "scope"), "local");
+  EXPECT_EQ(refi_str(rec, "trigger"), "Chunked bodies decode in place");
+  EXPECT_EQ(json_type(json_get(rec, "rollbackOf")), JSON_NULL);
+  json_value_t* evidence = json_get(rec, "evidence");
+  ASSERT_NE(evidence, nullptr);
+  EXPECT_EQ(refi_str(evidence, "session"), sid);
+  EXPECT_EQ(json_as_int(json_get(evidence, "first_seq")), (int64_t)1);
+  EXPECT_EQ(json_as_int(json_get(evidence, "last_seq")), (int64_t)2);
+  EXPECT_EQ(refi_str(evidence, "summary"),
+            "The chunked-body turn proved decoding happens in place");
+  json_value_t* edits = json_get(rec, "edits");
+  ASSERT_NE(edits, nullptr);
+  ASSERT_EQ(json_size(edits), 1u);
+  json_value_t* el = json_at(edits, 0);
+  EXPECT_EQ(refi_str(el, "action"), "create");
+  EXPECT_EQ(refi_str(el, "kind"), "memory");
+  EXPECT_EQ(refi_str(el, "id"), "chunked_bodies_decode_silently");
+  EXPECT_EQ(refi_str(el, "path"), "general");
+  EXPECT_EQ(json_as_int(json_get(el, "version")), (int64_t)1);
+  EXPECT_EQ(json_as_bool(json_get(el, "applied")), 1);
+  ASSERT_EQ(json_type(json_get(el, "error")), JSON_NULL);
+  ASSERT_EQ(json_type(json_get(el, "before")), JSON_NULL);
+  json_value_t* el_ev = json_get(el, "evidence");
+  ASSERT_NE(el_ev, nullptr);
+  EXPECT_EQ(json_as_int(json_get(el_ev, "first_seq")), (int64_t)1);
+  EXPECT_EQ(json_as_int(json_get(el_ev, "last_seq")), (int64_t)2);
+  EXPECT_EQ(refi_str(el_ev, "summary"), "the chunked turn proved it");
+  json_value_destroy(rec);
+
+  /* The entry materialization (the full entry value, version 1, seq 1): */
+  auto entries = refi_scan_values(f, root + "/entry/memory",
+                                  root + "/entry/memory0", 0);
+  ASSERT_EQ(entries.size(), 1u);
+  json_value_t* entry = refi_parse_record(entries[0]);
+  ASSERT_NE(entry, nullptr) << entries[0];
+  EXPECT_EQ(refi_str(entry, "kind"), "memory");
+  EXPECT_EQ(refi_str(entry, "id"), "chunked_bodies_decode_silently");
+  EXPECT_EQ(refi_str(entry, "title"), "Chunked bodies decode silently");
+  EXPECT_EQ(refi_str(entry, "content"), "A chunked body decodes in place");
+  EXPECT_EQ(refi_str(entry, "path"), "general");
+  EXPECT_EQ(json_as_int(json_get(entry, "version")), (int64_t)1);
+  EXPECT_EQ(json_as_int(json_get(entry, "seq")), (int64_t)1);
+  json_value_destroy(entry);
+
+  /* The meta pair derives EXACTLY from the log (the fold re-read is the
+     truth): fold the log again and compare both meta values. */
+  refine_fold_t fold;
+  mk_fold_init(&fold);
+  std::string joint = "[";
+  for (size_t i = 0; i < records.size(); i++) {
+    if (i > 0) joint += ",";
+    joint += refi_json_quote(records[i]);
+  }
+  joint += "]";
+  ASSERT_EQ(refine_fold_parse(joint.c_str(), &fold), 0);
+  char* fp = refine_fold_fingerprint(&fold);
+  ASSERT_NE(fp, nullptr);
+  std::string stored_fp = refi_stored_meta(f, root, "fingerprint");
+  EXPECT_EQ(stored_fp.size(), 16u) << "the fingerprint is 16 hex chars";
+  EXPECT_EQ(stored_fp, std::string(fp)) << "the stored fingerprint folds";
+  free(fp);
+  char* digest = refine_fold_digest(&fold);
+  ASSERT_NE(digest, nullptr);
+  EXPECT_EQ(refi_stored_meta(f, root, "digest"), std::string(digest))
+      << "the stored digest folds";
+  free(digest);
+  refine_fold_destroy(&fold);
+
+  /* ONE batch = ONE store trip: the record's edits == the materialized
+     entries + meta both present (a non-atomic shape would be observable
+     whenever ANY member is missing). */
+  EXPECT_EQ(sm.calls, 1) << "the review ran once";
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestRefineRunNoopCommitsNothing) {
+  /* The no-op rule end to end (spec §3 step 5): a proposal whose edits all
+     refuse (no evidence) commits NOTHING — no record, no entry put, no
+     meta write; refine_run returns 1 and the summary is the frozen
+     banner. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  std::string root = sid + "/harness";
+
+  ASSERT_EQ(frame_append_msg(f, "user", "turn one text"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  sm.content =
+      "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":["
+      "{\"action\":\"create\",\"kind\":\"memory\",\"title\":\"Unevidenced\","
+      "\"content\":\"nothing evidences this\",\"reason\":\"why\"}]}";
+  frame_set_model_backend(f, &sm.base);
+
+  char* summary = NULL;
+  int rc = refine_run(f, NULL, 0, &summary);
+  ASSERT_EQ(rc, 1) << "the clean no-op returns 1";
+  ASSERT_NE(summary, nullptr);
+  EXPECT_STREQ(summary,
+               "refine: no refinement committed (no evidence-backed edits)");
+  free(summary);
+
+  /* NOTHING reached the store: the log, the entries, and the meta are all
+     empty — and the ROOT (shared) harness is untouched too. */
+  EXPECT_EQ(refi_scan_values(f, root + "/log", root + "/log0", 0).size(), 0u);
+  for (int k = 0; k < REFINE_KINDS_COUNT; k++) {
+    std::string base = std::string(root) + "/entry/" + REFINE_KINDS[k];
+    EXPECT_EQ(refi_scan_values(f, base, base + "0", 0).size(), 0u) << REFINE_KINDS[k];
+  }
+  EXPECT_EQ(refi_stored_meta(f, root, "fingerprint"), "");
+  EXPECT_EQ(refi_stored_meta(f, root, "digest"), "");
+  EXPECT_EQ(refi_scan_values(f, "harness/log", "harness/log0", 0).size(), 0u);
+  EXPECT_EQ(sm.calls, 1) << "the review still ran (the caller learns "
+                            "nothing was kept)";
+
+  /* The record-compose evidence bound (refine.h's contract, spec §4): a
+     citation PAST the trajectory's scanned newest event is unprovable —
+     the gate's one string, nothing commits. */
+  sm.content =
+      "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":["
+      "{\"action\":\"create\",\"kind\":\"memory\",\"id\":\"future_lesson\","
+      "\"title\":\"Future\",\"content\":\"cites unscanned events\","
+      "\"evidence\":{\"first_seq\":50,\"last_seq\":60,\"summary\":\"why\"},"
+      "\"reason\":\"unprovable\"}]}";
+  char* future_summary = NULL;
+  int future_rc = refine_run(f, NULL, 0, &future_summary);
+  EXPECT_EQ(future_rc, 1) << "the unprovable citation is the same no-op";
+  EXPECT_NE(future_summary, nullptr);
+  EXPECT_STREQ(future_summary,
+               "refine: no refinement committed (no evidence-backed edits)");
+  free(future_summary);
+  EXPECT_EQ(refi_scan_values(f, root + "/log", root + "/log0", 0).size(), 0u);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestRepeatedRefineWithNoChangeCommitsNothing) {
+  /* The fingerprint gate at refine time (spec §4's gate list item 2; the
+     PA delivery gate's agent-session.ts:7238-7245 semantics ported): a
+     SECOND refine over an unchanged fold + trajectory still reviews, but
+     with the same create rejected as a duplicate nothing commits — the
+     stored meta/fingerprint is BYTE-STABLE. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string root = frame_sid(f) + std::string("/harness");
+
+  ASSERT_EQ(frame_append_msg(f, "user", "turn one text"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  sm.content = kChunkedCreateProposal;   /* the SAME proposal both times */
+  frame_set_model_backend(f, &sm.base);
+
+  char* summary = NULL;
+  ASSERT_EQ(refine_run(f, NULL, 0, &summary), 0);
+  free(summary);
+  ASSERT_EQ(sm.calls, 1);
+  std::string fp1 = refi_stored_meta(f, root, "fingerprint");
+  std::string digest1 = refi_stored_meta(f, root, "digest");
+  ASSERT_EQ(fp1.size(), 16u);
+  auto records1 = refi_scan_values(f, root + "/log", root + "/log0", 0);
+  ASSERT_EQ(records1.size(), 1u);
+
+  /* The SAME proposal again: the create refuses "entry already exists",
+     nothing applies, nothing commits — the stored meta is byte-stable and
+     the log gains no record (the record-skip gate). */
+  int rc2 = refine_run(f, NULL, 0, &summary);
+  ASSERT_EQ(rc2, 1) << "the record-skip no-op returns 1";
+  ASSERT_NE(summary, nullptr);
+  EXPECT_STREQ(summary,
+               "refine: no refinement committed (no evidence-backed edits)");
+  free(summary);
+  EXPECT_EQ(sm.calls, 2) << "the gate does not skip the REVIEW — it skips "
+                            "the RECORD";
+  EXPECT_EQ(refi_scan_values(f, root + "/log", root + "/log0", 0).size(), 1u)
+      << "no second record: the fold is unchanged";
+  EXPECT_EQ(refi_stored_meta(f, root, "fingerprint"), fp1)
+      << "the stored meta/fingerprint is byte-stable";
+  EXPECT_EQ(refi_stored_meta(f, root, "digest"), digest1);
+  auto entries = refi_scan_values(f, root + "/entry/memory",
+                                  root + "/entry/memory0", 0);
+  ASSERT_EQ(entries.size(), 1u);
+  json_value_t* entry = refi_parse_record(entries[0]);
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(json_as_int(json_get(entry, "version")), (int64_t)1)
+      << "the version never moved";
+  json_value_destroy(entry);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestTrajectoryScanNewestCapHolds) {
+  /* The review's bounded view (spec §3 step 3): 300 seeded msg.append
+     events, one refine_run; the store-side scan handed the review EXACTLY
+     the newest SA_REFINE_SCAN_EVENTS records asked for and NO more. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+
+  for (int i = 1; i <= 300; i++) {
+    std::string content = "turn " + std::to_string(i) + " text";
+    ASSERT_EQ(frame_append_msg(f, "user", content.c_str()), 0);
+  }
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  sm.content = "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":[]}";
+  frame_set_model_backend(f, &sm.base);
+
+  char* summary = NULL;
+  int rc = refine_run(f, NULL, 0, &summary);
+  ASSERT_EQ(rc, 1) << "the empty proposal is the clean no-op";
+  free(summary);
+  ASSERT_EQ(sm.calls, 1);
+
+  /* The captured user text's <trajectory> section rides EXACTLY the
+     newest-capped event records (each record text once). */
+  char* err = NULL;
+  json_value_t* seen = json_parse(sm.captured_messages.c_str(),
+                                  sm.captured_messages.size(), &err);
+  if (err != NULL) free(err);
+  ASSERT_NE(seen, nullptr) << sm.captured_messages;
+  ASSERT_EQ(json_size(seen), 2u);
+  const char* user_text = json_as_string(json_get(json_at(seen, 1), "content"));
+  ASSERT_NE(user_text, nullptr);
+  std::string user(user_text);
+  json_value_destroy(seen);
+
+  size_t traj_open = user.find("<trajectory>");
+  size_t traj_close = user.find("</trajectory>");
+  ASSERT_NE(traj_open, std::string::npos);
+  ASSERT_NE(traj_close, std::string::npos);
+  ASSERT_LT(traj_open, traj_close);
+  std::string traj = user.substr(traj_open, traj_close - traj_open);
+
+  size_t events = 0;
+  for (size_t at = traj.find("msg.append"); at != std::string::npos;
+       at = traj.find("msg.append", at + 1)) {
+    events++;
+  }
+  EXPECT_EQ(events, (size_t) SA_REFINE_SCAN_EVENTS)
+      << "EXACTLY the newest cap, no more";
+  EXPECT_NE(traj.find("turn 300 text"), std::string::npos)
+      << "the newest event rides";
+  EXPECT_NE(traj.find("turn 173 text"), std::string::npos)
+      << "the block's OLDEST kept event rides (300 - 127)";
+  EXPECT_EQ(traj.find("turn 172 text"), std::string::npos)
+      << "the FIRST event past the cap does not ride";
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestSharedScopeSeparateAndReadOnlyFromLocal) {
+  /* The scopes (spec §1; refinement.ts:380-407's merge discipline): a
+     local run composes sessions/<sid>/harness/... and reads the ROOT
+     harness/ entries as READ-ONLY context; an edit naming a SHARED entry
+     from a LOCAL run refuses loud; a shared run writes the ROOT subtree
+     and never the session subtree. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  std::string root = sid + "/harness";
+
+  ASSERT_EQ(frame_append_msg(f, "user", "turn one text"), 0);
+
+  /* Seed the SHARED log: one applied memory create (a REAL record shape
+     the fold re-applies; the record composes the whole entry contract). */
+  {
+    std::string shared_record = refi_seed_record(
+        1, "refine_shared_seed", "the shared memory seed",
+        refi_seed_edit("create", "memory", "shared_note", "Shared note",
+                       "Shared content", "general", 0, 1, 2, "the shared "
+                       "seed", NULL)
+            .c_str());
+    frm_store_op_t* ops =
+        (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+    ops[0].key = strdup(refi_log_key("harness", 1).c_str());
+    ops[0].value = (uint8_t*)strdup(shared_record.c_str());
+    ops[0].value_len = shared_record.size();
+    EXPECT_EQ(_frame_sync_batch(f, ops, 1, "shared log seed"), 0);
+  }
+
+  /* (a) THE CROSS-SCOPE REFUSAL: a shared entry is never an edit target
+         from a local run — the edit refuses loud, nothing commits. */
+  {
+    scripted_review_model_t sm = {};
+    sm.base.complete = scripted_review_complete;
+    sm.base.submit = NULL;
+    sm.content =
+        "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":["
+        "{\"action\":\"update\",\"kind\":\"memory\",\"id\":\"shared_note\","
+        "\"title\":\"Hijack\",\"content\":\"stolen\","
+        "\"expect\":{\"version\":1},"
+        "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+        "\"reason\":\"the shared note should not be touched\"}]}";
+    frame_set_model_backend(f, &sm.base);
+    char* summary = NULL;
+    int rc = refine_run(f, NULL, 0, &summary);
+    ASSERT_EQ(rc, 1) << "every edit refused: nothing commits";
+    ASSERT_NE(summary, nullptr);
+    EXPECT_STREQ(summary,
+                 "refine: no refinement committed (no evidence-backed edits)");
+    free(summary);
+    EXPECT_EQ(refi_scan_values(f, root + "/log", root + "/log0", 0).size(), 0u)
+        << "the local log stays empty";
+    EXPECT_EQ(refi_scan_values(f, "harness/log", "harness/log0", 0).size(), 1u)
+        << "the shared log is untouched";
+    auto shared_records = refi_scan_values(f, "harness/log", "harness/log0", 0);
+    ASSERT_EQ(shared_records.size(), 1u);
+    EXPECT_EQ(shared_records[0], refi_seed_record(
+                    1, "refine_shared_seed", "the shared memory seed",
+                    refi_seed_edit("create", "memory", "shared_note",
+                                   "Shared note", "Shared content", "general",
+                                   0, 1, 2, "the shared seed", NULL).c_str()))
+        << "the shared record is BYTE-IDENTICAL after the refused read-only "
+           "context";
+  }
+
+  /* (b) THE LOCAL COMMIT: sessions/<sid>/harness/... only. */
+  {
+    scripted_review_model_t sm = {};
+    sm.base.complete = scripted_review_complete;
+    sm.base.submit = NULL;
+    sm.content =
+        "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":["
+        "{\"action\":\"create\",\"kind\":\"memory\",\"id\":\"local_lesson\","
+        "\"title\":\"Local lesson\",\"content\":\"the local lesson\","
+        "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+        "\"reason\":\"a session-specific lesson\"}]}";
+    frame_set_model_backend(f, &sm.base);
+    char* summary = NULL;
+    int rc = refine_run(f, NULL, 0, &summary);
+    ASSERT_EQ(rc, 0) << "the local commit returns 0";
+    ASSERT_NE(summary, nullptr);
+    free(summary);
+    auto local_records = refi_scan_values(f, root + "/log", root + "/log0", 0);
+    ASSERT_EQ(local_records.size(), 1u);
+    json_value_t* rec = refi_parse_record(local_records[0]);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(refi_str(rec, "scope"), "local") << "the record says local";
+    EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)1);
+    json_value_destroy(rec);
+    auto local_entries =
+        refi_scan_values(f, root + "/entry/memory", root + "/entry/memory0", 0);
+    ASSERT_EQ(local_entries.size(), 1u);
+    EXPECT_EQ(refi_stored_meta(f, root, "fingerprint").size(), 16u);
+    /* The shared scope is untouched by the local commit: */
+    EXPECT_EQ(refi_scan_values(f, "harness/log", "harness/log0", 0).size(), 1u);
+    EXPECT_EQ(refi_stored_meta(f, "harness", "fingerprint"), "")
+        << "the local run writes NO shared meta";
+  }
+
+  /* (c) THE SHARED RUN writes the ROOT subtree and never the local one. */
+  {
+    scripted_review_model_t sm = {};
+    sm.base.complete = scripted_review_complete;
+    sm.base.submit = NULL;
+    sm.content =
+        "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":["
+        "{\"action\":\"update\",\"kind\":\"memory\",\"id\":\"shared_note\","
+        "\"title\":\"Shared note\",\"content\":\"Shared content v2\","
+        "\"expect\":{\"version\":1},"
+        "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+        "\"reason\":\"the shared note matures\"}]}";
+    frame_set_model_backend(f, &sm.base);
+    char* summary = NULL;
+    int rc = refine_run(f, NULL, 1, &summary);
+    ASSERT_EQ(rc, 0);
+    std::string sum(summary);
+    free(summary);
+    EXPECT_NE(sum.find(" committed (1/1 edits applied)"), std::string::npos)
+        << sum;
+    EXPECT_NE(sum.find("  apply memory shared:shared_note v2: the shared "
+                       "note matures"), std::string::npos)
+        << "the shared run's apply line carries the SHARED scope: " << sum;
+    EXPECT_NE(sum.find("digest changed: yes"), std::string::npos) << sum;
+
+    auto shared_records = refi_scan_values(f, "harness/log", "harness/log0", 0);
+    ASSERT_EQ(shared_records.size(), 2u) << "the shared log gained the run";
+    json_value_t* rec = refi_parse_record(shared_records[1]);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(refi_str(rec, "scope"), "shared");
+    EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)2)
+        << "the shared log's own counter restored from the newest record";
+    json_value_destroy(rec);
+    auto shared_entries =
+        refi_scan_values(f, "harness/entry/memory", "harness/entry/memory0", 0);
+    ASSERT_EQ(shared_entries.size(), 1u);
+    json_value_t* entry = refi_parse_record(shared_entries[0]);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(json_as_int(json_get(entry, "version")), (int64_t)2);
+    EXPECT_EQ(refi_str(entry, "content"), "Shared content v2");
+    json_value_destroy(entry);
+    EXPECT_EQ(refi_stored_meta(f, "harness", "fingerprint").size(), 16u);
+
+    /* The session subtree's harness traffic is UNTOUCHED by the shared
+       run: the log still holds its one local record, the shared commit
+       wrote no local meta. */
+    auto local_records = refi_scan_values(f, root + "/log", root + "/log0", 0);
+    ASSERT_EQ(local_records.size(), 1u) << "the shared run wrote no local record";
+    EXPECT_EQ(refi_stored_meta(f, root, "fingerprint").size(), 16u)
+        << "the local meta is still the local run's one";
+  }
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestLocalRefineRendersSeededSharedContext) {
+  /* THE DEFERRED (from Task 4) positive branch: a local run over a
+     NON-EMPTY shared harness log renders the shared entries into the
+     digest's MARKED read-only section (spec §3 step 4's read-only-context
+     digest; refinement.ts:380-407's merge renders the other scope). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ASSERT_EQ(frame_append_msg(f, "user", "turn one text"), 0);
+
+  std::string shared_record = refi_seed_record(
+      3, "refine_shared_seed", "the shared memory seed",
+      refi_seed_edit("create", "memory", "shared_note", "Shared note",
+                     "Shared content", "shared/path", 0, 1, 2, "the shared "
+                     "seed", NULL)
+          .c_str());
+  frm_store_op_t* ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  ops[0].key = strdup(refi_log_key("harness", 3).c_str());
+  ops[0].value = (uint8_t*)strdup(shared_record.c_str());
+  ops[0].value_len = shared_record.size();
+  EXPECT_EQ(_frame_sync_batch(f, ops, 1, "shared log seed"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  sm.content = kChunkedCreateProposal;
+  frame_set_model_backend(f, &sm.base);
+
+  char* summary = NULL;
+  ASSERT_EQ(refine_run(f, NULL, 0, &summary), 0);
+  char* perr = NULL;
+  json_value_t* seen = json_parse(sm.captured_messages.c_str(),
+                                  sm.captured_messages.size(), &perr);
+  if (perr != NULL) free(perr);
+  ASSERT_NE(seen, nullptr);
+  const char* user_text = json_as_string(json_get(json_at(seen, 1), "content"));
+  ASSERT_NE(user_text, nullptr);
+  std::string user(user_text);
+  json_value_destroy(seen);
+  size_t ctx_open = user.find("<shared_harness_context>");
+  ASSERT_NE(ctx_open, std::string::npos)
+      << "the marked read-only section rides for a seeded shared log";
+  size_t ctx_close = user.find("</shared_harness_context>");
+  ASSERT_NE(ctx_close, std::string::npos);
+  std::string section = user.substr(ctx_open, ctx_close - ctx_open);
+  EXPECT_NE(section.find("read-only context: shared-scope entries are never "
+                         "edit targets from a local refinement"),
+            std::string::npos)
+      << "the marking prefix: " << section;
+  /* The shared entries render into the section (the digest's entry line). */
+  EXPECT_NE(section.find("memory: 1"), std::string::npos) << section;
+  EXPECT_NE(section.find("- shared_note shared/path v1: Shared content"),
+            std::string::npos)
+      << "the shared entry's line rides inside the marked section: "
+      << section;
+  free(summary);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* The rollback triple's fixture: refines create the memory + skill entries
+   (run 1), then create the prompt + update the memory + delete the skill
+   (run 2 — the row 10 target), leaving the harness log at 2 records. The
+   target record is the SECOND (seq 2). */
+static const std::string kRollbackCreateProposal =
+    "{\"summary\":\"Seed entries\","
+    "\"rationale\":\"seed two entries\",\"edits\":["
+    "{\"action\":\"create\",\"kind\":\"memory\",\"id\":\"kept_memory\","
+    "\"title\":\"Kept memory\",\"content\":\"memory content\","
+    "\"path\":\"memory/path\","
+    "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+    "\"reason\":\"seed\"},"
+    "{\"action\":\"create\",\"kind\":\"skill\",\"id\":\"deleted_skill\","
+    "\"title\":\"Skill title\",\"content\":\"skill content\","
+    "\"path\":\"skill/path\",\"reference\":" + std::string(kSkillReference) +
+    ",\"arguments\":" + std::string(kSkillArguments) + ","
+    "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+    "\"reason\":\"seed\"}]}";
+
+static const char* const kRollbackTargetProposal =
+    "{\"summary\":\"Target refinement\","
+    "\"rationale\":\"three edits\",\"edits\":["
+    "{\"action\":\"create\",\"kind\":\"prompt\",\"id\":\"created_prompt\","
+    "\"title\":\"Created\",\"content\":\"Created content\","
+    "\"evidence\":{\"first_seq\":3,\"last_seq\":4,\"summary\":\"why\"},"
+    "\"reason\":\"create\"},"
+    "{\"action\":\"update\",\"kind\":\"memory\",\"id\":\"kept_memory\","
+    "\"title\":\"Updated memory\",\"content\":\"Updated memory content\","
+    "\"path\":\"updated/path\",\"expect\":{\"version\":1},"
+    "\"evidence\":{\"first_seq\":3,\"last_seq\":4,\"summary\":\"why\"},"
+    "\"reason\":\"update\"},"
+    "{\"action\":\"delete\",\"kind\":\"skill\",\"id\":\"deleted_skill\","
+    "\"expect\":{\"version\":1},"
+    "\"evidence\":{\"first_seq\":3,\"last_seq\":4,\"summary\":\"why\"},"
+    "\"reason\":\"withdraw\"}]}";
+
+/* Seeds the two records above through refine_run (the REAL cycle) and
+   returns the log's record texts (2). The review never runs (each call's
+   backend is re-set before the run). */
+static void refi_seed_rollback_log(frame_t* f, scripted_review_model_t* sm,
+                                   char** summary_out1, char** summary_out2) {
+  sm->content = kRollbackCreateProposal;
+  ASSERT_EQ(refine_run(f, NULL, 0, summary_out1), 0);
+  ASSERT_NE(*summary_out1, nullptr) << "run 1 committed";
+  sm->content = kRollbackTargetProposal;
+  ASSERT_EQ(refine_run(f, NULL, 0, summary_out2), 0);
+  ASSERT_NE(*summary_out2, nullptr) << "run 2 committed";
+  free(*summary_out1);
+  free(*summary_out2);
+}
+
+TEST(TestRefine, TestRollbackComposesTheInverseFromTheRecord) {
+  /* Row 10 (refinement.test.ts:680-737's rollback): a full created/updated/
+     deleted refinement rolled back — the entry leaves the fold (the log
+     gains the rollbackOf record), the originals are BYTE-IDENTICAL after
+     (append-only — nothing mutated). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  std::string root = sid + "/harness";
+
+  ASSERT_EQ(frame_append_msg(f, "user", "turn one text"), 0);
+  ASSERT_EQ(frame_append_msg(f, "assistant", "turn two text"), 0);
+  ASSERT_EQ(frame_append_msg(f, "user", "turn three text"), 0);
+  ASSERT_EQ(frame_append_msg(f, "assistant", "turn four text"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  frame_set_model_backend(f, &sm.base);
+  char* s1 = NULL;
+  char* s2 = NULL;
+  refi_seed_rollback_log(f, &sm, &s1, &s2);
+
+  /* The target record (seq 2) BYTE-COPY before the rollback. */
+  std::string tlo = root + "/log";
+  auto before_records = refi_scan_values(f, tlo, tlo + "0", 0);
+  ASSERT_EQ(before_records.size(), 2u);
+  std::string record2_before = before_records[1];
+  json_value_t* target = refi_parse_record(record2_before);
+  ASSERT_NE(target, nullptr);
+  std::string target_id = refi_str(target, "id");
+  json_value_destroy(target);
+  EXPECT_EQ(target_id.find("refine_"), 0u)
+      << "sanity: the target id is a refine_ mint";
+
+  /* The pre-rollback materialization (the update applied, the skill
+     withdrawn): */
+  {
+    auto entries =
+        refi_scan_values(f, root + "/entry/memory", root + "/entry/memory0", 0);
+    ASSERT_EQ(entries.size(), 1u);
+    json_value_t* entry = refi_parse_record(entries[0]);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(json_as_int(json_get(entry, "version")), (int64_t)2);
+    EXPECT_EQ(refi_str(entry, "content"), "Updated memory content");
+    json_value_destroy(entry);
+    auto prompts =
+        refi_scan_values(f, root + "/entry/prompt", root + "/entry/prompt0", 0);
+    ASSERT_EQ(prompts.size(), 1u);
+    auto skills =
+        refi_scan_values(f, root + "/entry/skill", root + "/entry/skill0", 0);
+    ASSERT_EQ(skills.size(), 0u) << "the withdrawn skill's materialization "
+                                    "is gone (the DELETE op)";
+  }
+
+  char* summary = NULL;
+  int rc = refine_rollback(f, 2, 0, &summary);
+  ASSERT_EQ(rc, 0) << "the rollback commits a record: " << summary
+                   << (summary != NULL ? "" : "(null: check the log)");
+  ASSERT_NE(summary, nullptr);
+  std::string sum(summary);
+  free(summary);
+
+  /* The inverse order is REVERSED (PA's [.. target].reverse): create skill,
+     update memory, delete prompt — versions/final states pinned. */
+  std::string rollback_reason = "Rollback " + target_id;
+  EXPECT_NE(sum.find(" committed (3/3 edits applied)"), std::string::npos)
+      << sum;
+  EXPECT_NE(sum.find("  apply skill local:deleted_skill v1: " +
+                     rollback_reason), std::string::npos) << sum;
+  EXPECT_NE(sum.find("  apply memory local:kept_memory v3: " + rollback_reason),
+            std::string::npos) << sum;
+  EXPECT_NE(sum.find("  apply prompt local:created_prompt v1: " +
+                     rollback_reason), std::string::npos) << sum;
+  EXPECT_NE(sum.find("digest changed: yes"), std::string::npos) << sum;
+
+  /* The materialization after: the created prompt GONE (a real DELETE op),
+     the memory restored to the before snapshot at v3 (its restore edit
+     applied on top — PA's own expectation), the skill RECREATED at v1 with
+     the whole call contract. */
+  {
+    auto prompts =
+        refi_scan_values(f, root + "/entry/prompt", root + "/entry/prompt0", 0);
+    ASSERT_EQ(prompts.size(), 0u) << "the created_prompt is GONE";
+    auto memories =
+        refi_scan_values(f, root + "/entry/memory", root + "/entry/memory0", 0);
+    ASSERT_EQ(memories.size(), 1u);
+    json_value_t* entry = refi_parse_record(memories[0]);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(json_as_int(json_get(entry, "version")), (int64_t)3);
+    EXPECT_EQ(refi_str(entry, "content"), "memory content");
+    EXPECT_EQ(refi_str(entry, "title"), "Kept memory");
+    EXPECT_EQ(refi_str(entry, "path"), "memory/path");
+    json_value_destroy(entry);
+    auto skills =
+        refi_scan_values(f, root + "/entry/skill", root + "/entry/skill0", 0);
+    ASSERT_EQ(skills.size(), 1u) << "the skill is RECREATED";
+    json_value_t* skill = refi_parse_record(skills[0]);
+    ASSERT_NE(skill, nullptr);
+    EXPECT_EQ(json_as_int(json_get(skill, "version")), (int64_t)1);
+    EXPECT_EQ(refi_str(skill, "content"), "skill content");
+    /* The materialization stores reference/arguments as JSON OBJECTs
+       (the entry shape's parsed contract) — compare their serializations. */
+    char* ref_seen = json_serialize(json_get(skill, "reference"));
+    char* args_seen = json_serialize(json_get(skill, "arguments"));
+    ASSERT_NE(ref_seen, nullptr);
+    ASSERT_NE(args_seen, nullptr);
+    EXPECT_STREQ(ref_seen, kSkillReference);
+    EXPECT_STREQ(args_seen, kSkillArguments);
+    free(ref_seen);
+    free(args_seen);
+    json_value_destroy(skill);
+  }
+
+  /* The log holds 3 records; the rollback record carries the relation and
+     the reversed inverse edits, and the ORIGINAL record is BYTE-IDENTICAL
+     after (append-only — nothing mutated). */
+  {
+    auto after_records = refi_scan_values(f, tlo, tlo + "0", 0);
+    ASSERT_EQ(after_records.size(), 3u);
+    EXPECT_EQ(after_records[1], record2_before)
+        << "the original record's text is byte-identical after";
+    EXPECT_EQ(after_records[0], before_records[0]);
+    json_value_t* rb = refi_parse_record(after_records[2]);
+    ASSERT_NE(rb, nullptr) << after_records[2];
+    EXPECT_EQ(json_as_int(json_get(rb, "seq")), (int64_t)3);
+    EXPECT_EQ(refi_str(rb, "scope"), "local");
+    EXPECT_EQ(refi_str(rb, "trigger"), "Rollback refinement " + target_id);
+    json_value_t* rb_of = json_get(rb, "rollbackOf");
+    ASSERT_NE(rb_of, nullptr);
+    ASSERT_EQ(json_type(rb_of), JSON_INT);
+    EXPECT_EQ(json_as_int(rb_of), (int64_t)2);
+    json_value_t* rb_ev = json_get(rb, "evidence");
+    ASSERT_NE(rb_ev, nullptr);
+    EXPECT_EQ(refi_str(rb_ev, "kind"), "rollback");
+    EXPECT_EQ(json_as_int(json_get(rb_ev, "refineOf")), (int64_t)2);
+    json_value_t* rb_edits = json_get(rb, "edits");
+    ASSERT_NE(rb_edits, nullptr);
+    ASSERT_EQ(json_size(rb_edits), 3u);
+    /* [create skill, update memory, delete prompt] — the reversed order. */
+    json_value_t* e0 = json_at(rb_edits, 0);
+    EXPECT_EQ(refi_str(e0, "action"), "create");
+    EXPECT_EQ(refi_str(e0, "kind"), "skill");
+    EXPECT_EQ(refi_str(e0, "id"), "deleted_skill");
+    json_value_t* e1 = json_at(rb_edits, 1);
+    EXPECT_EQ(refi_str(e1, "action"), "update");
+    EXPECT_EQ(refi_str(e1, "kind"), "memory");
+    EXPECT_EQ(refi_str(e1, "id"), "kept_memory");
+    EXPECT_EQ(json_as_int(json_get(json_get(e1, "expect"), "version")),
+              (int64_t)2)
+        << "the restore's guard = the version the target left";
+    json_value_t* e2 = json_at(rb_edits, 2);
+    EXPECT_EQ(refi_str(e2, "action"), "delete");
+    EXPECT_EQ(refi_str(e2, "kind"), "prompt");
+    EXPECT_EQ(refi_str(e2, "id"), "created_prompt");
+    for (size_t i = 0; i < 3; i++) {
+      json_value_t* el = json_at(rb_edits, i);
+      ASSERT_EQ(json_as_bool(json_get(el, "applied")), 1);
+      json_value_t* el_ev = json_get(el, "evidence");
+      ASSERT_NE(el_ev, nullptr);
+      EXPECT_EQ(refi_str(el_ev, "kind"), "rollback")
+          << "the inverse edits carry the rollback evidence shape";
+      EXPECT_EQ(json_as_int(json_get(el_ev, "refineOf")), (int64_t)2);
+      EXPECT_EQ(refi_str(el, "reason"), rollback_reason);
+    }
+    json_value_destroy(rb);
+  }
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestRollbackMissingTargetRefused) {
+  /* Row 11 (refinement.test.ts:730-737's missing-target throw): the
+     rollback of a missing seq refuses — "rollback: no refinement record at
+     seq 5" — with the store untouched. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string root = frame_sid(f) + std::string("/harness");
+
+  ASSERT_EQ(frame_append_msg(f, "user", "turn one text"), 0);
+
+  char* summary = NULL;
+  int rc = refine_rollback(f, 5, 0, &summary);
+  ASSERT_EQ(rc, 1) << "the missing target refuses through the summary";
+  ASSERT_NE(summary, nullptr);
+  EXPECT_STREQ(summary, "rollback: no refinement record at seq 5");
+  free(summary);
+  EXPECT_EQ(refi_scan_values(f, root + "/log", root + "/log0", 0).size(), 0u)
+      << "the store is untouched";
+  EXPECT_EQ(refi_stored_meta(f, root, "fingerprint"), "");
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestRollbackAfterLaterEditRejectsStaleInverse) {
+  /* Row 12: a rollback AFTER a later edit to the same entry gets the
+     per-edit STALE rejection ("stale target: ...") on the inverse's report
+     line, and the roll-back record still commits the OTHER inverse edits
+     (refinement.test.ts:680-737's per-edit applied/rejected shape). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string root = frame_sid(f) + std::string("/harness");
+
+  for (int i = 1; i <= 4; i++) {
+    std::string content = "turn " + std::to_string(i) + " text";
+    ASSERT_EQ(frame_append_msg(f, "user", content.c_str()), 0);
+  }
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  /* Run 1: create the memory (v1). Run 2: update it (-> v2) + create the
+     prompt. Run 3: update it AGAIN (-> v3). The rollback of run 2 then
+     hits the stale guard. */
+  const char* run1 =
+      "{\"summary\":\"s1\",\"rationale\":\"r1\",\"edits\":["
+      "{\"action\":\"create\",\"kind\":\"memory\",\"id\":\"kept_memory\","
+      "\"title\":\"Kept\",\"content\":\"one\","
+      "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+      "\"reason\":\"create\"}]}";
+  const char* run2 =
+      "{\"summary\":\"s2\",\"rationale\":\"r2\",\"edits\":["
+      "{\"action\":\"update\",\"kind\":\"memory\",\"id\":\"kept_memory\","
+      "\"title\":\"Kept\",\"content\":\"two\","
+      "\"expect\":{\"version\":1},"
+      "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+      "\"reason\":\"first update\"},"
+      "{\"action\":\"create\",\"kind\":\"prompt\",\"id\":\"other_prompt\","
+      "\"title\":\"Other\",\"content\":\"the other lesson\","
+      "\"evidence\":{\"first_seq\":3,\"last_seq\":4,\"summary\":\"why\"},"
+      "\"reason\":\"create\"}]}";
+  const char* run3 =
+      "{\"summary\":\"s3\",\"rationale\":\"r3\",\"edits\":["
+      "{\"action\":\"update\",\"kind\":\"memory\",\"id\":\"kept_memory\","
+      "\"title\":\"Kept\",\"content\":\"third\","
+      "\"expect\":{\"version\":2},"
+      "\"evidence\":{\"first_seq\":3,\"last_seq\":4,\"summary\":\"why\"},"
+      "\"reason\":\"later update\"}]}";
+  char* summary = NULL;
+  sm.content = run1;
+  ASSERT_EQ(refine_run(f, NULL, 0, &summary), 0);
+  free(summary);
+  sm.content = run2;
+  ASSERT_EQ(refine_run(f, NULL, 0, &summary), 0);
+  free(summary);
+  sm.content = run3;
+  ASSERT_EQ(refine_run(f, NULL, 0, &summary), 0);
+  free(summary);
+
+  auto records = refi_scan_values(f, root + "/log", root + "/log0", 0);
+  ASSERT_EQ(records.size(), 3u) << "three refinement records";
+
+  int rc = refine_rollback(f, 2, 0, &summary);
+  ASSERT_EQ(rc, 0) << "the rollback still commits its OTHER inverse";
+  ASSERT_NE(summary, nullptr);
+  std::string sum(summary);
+  free(summary);
+  EXPECT_NE(sum.find(" committed (1/2 edits applied)"), std::string::npos)
+      << sum;
+  /* THE STALE REJECTION on the restore line (the version the target left
+     was 2; the fold moved to 3): */
+  EXPECT_NE(sum.find("  refuse memory kept_memory: stale target: entry "
+                     "version 3, review saw 2"), std::string::npos) << sum;
+  EXPECT_NE(sum.find("  apply prompt local:other_prompt"), std::string::npos)
+      << sum;
+  EXPECT_NE(sum.find("digest changed: yes"), std::string::npos) << sum;
+
+  /* The other inverse APPLIED (the prompt's materialization gone), the
+     stale target's content UNTOUCHED at v3, and the record's per-edit
+     shape carries both. */
+  {
+    auto prompts =
+        refi_scan_values(f, root + "/entry/prompt", root + "/entry/prompt0", 0);
+    ASSERT_EQ(prompts.size(), 0u) << "the other inverse applied";
+    auto memories =
+        refi_scan_values(f, root + "/entry/memory", root + "/entry/memory0", 0);
+    ASSERT_EQ(memories.size(), 1u);
+    json_value_t* entry = refi_parse_record(memories[0]);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(json_as_int(json_get(entry, "version")), (int64_t)3);
+    EXPECT_EQ(refi_str(entry, "content"), "third")
+        << "the stale inverse never touched the entry";
+    json_value_destroy(entry);
+  }
+  {
+    auto after = refi_scan_values(f, root + "/log", root + "/log0", 0);
+    ASSERT_EQ(after.size(), 4u);
+    json_value_t* rb = refi_parse_record(after[3]);
+    ASSERT_NE(rb, nullptr);
+    json_value_t* rb_edits = json_get(rb, "edits");
+    ASSERT_NE(rb_edits, nullptr);
+    ASSERT_EQ(json_size(rb_edits), 2u);
+    json_value_t* e0 = json_at(rb_edits, 0);   /* reversed: the prompt's */
+    EXPECT_EQ(json_as_bool(json_get(e0, "applied")), 1);
+    json_value_t* e1 = json_at(rb_edits, 1);   /* the stale restore */
+    EXPECT_EQ(json_as_bool(json_get(e1, "applied")), 0);
+    EXPECT_EQ(refi_str(e1, "error"),
+              "stale target: entry version 3, review saw 2");
+    json_value_destroy(rb);
+    /* The originals stayed byte-identical (append-only). */
+    EXPECT_EQ(after[0], records[0]);
+    EXPECT_EQ(after[1], records[1]);
+    EXPECT_EQ(after[2], records[2]);
+  }
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestRefineBatchOverBudgetRefusesNothingCommitted) {
+  /* The refuse-loud batch math (spec §5): a proposal whose entry value
+     exceeds the per-entry cap refuses BEFORE the post — nothing is
+     committed (the compose-time cap discipline). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string root = frame_sid(f) + std::string("/harness");
+
+  ASSERT_EQ(frame_append_msg(f, "user", "turn one text"), 0);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  sm.content =
+      "{\"summary\":\"s\",\"rationale\":\"r\",\"edits\":["
+      "{\"action\":\"create\",\"kind\":\"memory\",\"id\":\"big_lesson\","
+      "\"title\":\"Big\",\"content\":\"" + std::string(5000, 'x') + "\","
+      "\"evidence\":{\"first_seq\":1,\"last_seq\":2,\"summary\":\"why\"},"
+      "\"reason\":\"big\"}]}";
+  frame_set_model_backend(f, &sm.base);
+
+  char* summary = NULL;
+  int rc = refine_run(f, NULL, 0, &summary);
+  ASSERT_EQ(rc, -1) << "the over-budget batch refuses loud";
+  EXPECT_EQ(summary, nullptr) << "the failure path logs only";
+
+  /* NOTHING committed: no record, no entry, no meta. */
+  EXPECT_EQ(refi_scan_values(f, root + "/log", root + "/log0", 0).size(), 0u);
+  EXPECT_EQ(refi_scan_values(f, root + "/entry/memory", root + "/entry/memory0", 0)
+                .size(), 0u);
+  EXPECT_EQ(refi_stored_meta(f, root, "fingerprint"), "");
+  EXPECT_EQ(refi_stored_meta(f, root, "digest"), "");
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestRefine, TestRefinesOnPooledStoreRefuseLoud) {
+  /* Row 15: refine on a POOLED store refuses loud without hanging (both
+     runners — the direct sync APIs' inline-only rule; the store actor's
+     pacing belongs to its scheduler workers). */
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_config_t cfg = refi_frame_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+
+  scripted_review_model_t sm = {};
+  sm.base.complete = scripted_review_complete;
+  sm.base.submit = NULL;
+  sm.content = kChunkedCreateProposal;
+  frame_set_model_backend(f, &sm.base);
+
+  char* summary = NULL;
+  int rc = refine_run(f, NULL, 0, &summary);
+  EXPECT_EQ(rc, -1) << "refine_run refuses loud on a pooled store";
+  EXPECT_EQ(summary, nullptr);
+  rc = refine_rollback(f, 1, 0, &summary);
+  EXPECT_EQ(rc, -1) << "refine_rollback refuses loud on a pooled store";
+  EXPECT_EQ(summary, nullptr);
+  EXPECT_EQ(sm.calls, 0) << "the refusal precedes ANY review";
+
+  frame_destroy(f);
+  scheduler_pool_stop(pool);
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
+}
+
+TEST(TestRefine, TestFoldParsesRollbackEvidenceShape) {
+  /* THE T1 SHAPE (refine.h's evidence contract): the fold's record decode
+     accepts the record's rollback evidence {"kind":"rollback","refineOf":N}
+     beside the plain shape — the inverse edits fold (their evidence IS the
+     target), a rollback record renders its log line, and a malformed
+     refineOf stays refused loud. */
+  refine_fold_t fold;
+  mk_fold_init(&fold);
+  std::string target_edit =
+      refi_seed_edit("create", "memory", "evidence_target", "Target",
+                     "the target lesson", "general", 0, 11, 12, "why", NULL);
+  std::string rollback_record =
+      "{\"seq\":7,\"id\":\"refine_rollback_rec\","
+      "\"trigger\":\"Rollback refinement refine_target_rec\",\"rollbackOf\":5,"
+      "\"evidence\":{\"kind\":\"rollback\",\"refineOf\":5},\"edits\":["
+      "{\"action\":\"delete\",\"kind\":\"memory\","
+      "\"id\":\"evidence_target\",\"expect\":{\"version\":1},"
+      "\"evidence\":{\"kind\":\"rollback\",\"refineOf\":5},"
+      "\"before\":null,\"applied\":true,\"error\":null,"
+      "\"reason\":\"Rollback refine_target_rec\"}],"
+      "\"at\":\"2026-10-01T13:00:00Z\"}";
+  std::string records = "[" + refi_json_quote(refi_seed_record(
+                                  5, "refine_target_rec", "the target", target_edit.c_str())) +
+                        "," + refi_json_quote(rollback_record) + "]";
+  ASSERT_EQ(refine_fold_parse(records.c_str(), &fold), 0);
+  EXPECT_EQ(refine_entry_find(&fold, "memory", "evidence_target"), nullptr)
+      << "the inverse delete folded (the rollback evidence IS the target)";
+  EXPECT_EQ(fold.nrecords, 2u) << "the rollback record renders its log line";
+  char* digest = refine_fold_digest(&fold);
+  ASSERT_NE(digest, nullptr);
+  std::string rendered(digest);
+  free(digest);
+  EXPECT_NE(rendered.find("- 7 Rollback refinement refine_target_rec"),
+            std::string::npos)
+      << "the rollback record's line rides: " << rendered;
+
+  /* A malformed refineOf (wrong type) leaves the evidence empty — the
+     gate refuses the inverse loudly and the fold keeps the entry. */
+  refine_edit_t edit;
+  memset(&edit, 0, sizeof(edit));
+  edit.action = refi_dup("delete");
+  edit.kind = refi_dup("memory");
+  edit.id = refi_dup("ghost");
+  edit.expect_version = 1;
+  edit.evidence_first = 1;
+  edit.evidence_last = 1;
+  refine_fold_t fold2;
+  mk_fold_init(&fold2);
+  ASSERT_NE(refine_entry_put(&fold2, "memory", "ghost", "t", "c", "p", "{}",
+                             "{}", 1, 0, 1), nullptr);
+  EXPECT_EQ(refine_edit_apply(&fold2, &edit, 9), nullptr)
+      << "sanity: a well-formed inverse deletes";
+  refine_edit_destroy(&edit);
+  refine_fold_destroy(&fold2);
+
+  refine_fold_destroy(&fold);
+}
+
+/* The malformed-refineOf variant through the RECORD decode: the fold's
+   record parser leaves evidence 0/0 when refineOf is not an int — the
+   edit refuses "edit without evidence" and the entry survives (a corrupt
+   rollback never silently deletes). */
+TEST(TestRefine, TestFoldRefusesMalformedRollbackEvidence) {
+  std::string create_edit =
+      refi_seed_edit("create", "memory", "ghost", "t", "c", "general", 0, 11,
+                     12, "why", NULL);
+  std::string bad_rollback =
+      "{\"seq\":8,\"id\":\"refine_bad\",\"trigger\":\"Rollback refine_x\","
+      "\"rollbackOf\":7,"
+      "\"evidence\":{\"kind\":\"rollback\",\"refineOf\":\"seven\"},"
+      "\"edits\":[{\"action\":\"delete\",\"kind\":\"memory\",\"id\":\"ghost\","
+      "\"expect\":{\"version\":1},"
+      "\"evidence\":{\"kind\":\"rollback\",\"refineOf\":\"seven\"},"
+      "\"before\":null,\"applied\":true,\"error\":null}],"
+      "\"at\":\"2026-10-01T13:00:00Z\"}";
+  std::string records = "[" +
+                        refi_json_quote(refi_seed_record(7, "refine_x", "t",
+                                                         create_edit.c_str())) +
+                        "," + refi_json_quote(bad_rollback) + "]";
+  refine_fold_t fold;
+  mk_fold_init(&fold);
+  ASSERT_EQ(refine_fold_parse(records.c_str(), &fold), 0);
+  EXPECT_EQ(fold.nrecords, 2u) << "the record folds; the edit refuses";
+  refine_entry_t* ghost = refine_entry_find(&fold, "memory", "ghost");
+  ASSERT_NE(ghost, nullptr) << "the malformed evidence gate kept the entry";
+  EXPECT_EQ(ghost->version, 1u);
+  refine_fold_destroy(&fold);
 }

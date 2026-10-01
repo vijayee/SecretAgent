@@ -7,7 +7,8 @@
 #ifdef SA_HAS_WDB
 
 #include "frame_internal.h"   /* the backend fetch + the refine slice's
-                                 _frame_sync_scan round-trip helpers */
+                                 _frame_sync_scan/_frame_sync_batch
+                                 round-trip helpers */
 #include "../Util/allocator.h"
 #include "../Util/log.h"
 
@@ -16,16 +17,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* refine.c — the refine slice's DATA half (the orchestrator spec: the fold,
    the edit validation, the evidence gate, the apply semantics with version
    guards, the record's edit-element composition, and the fold's canonical
-   views — the FNV-1a-64 fingerprint and the bounded digest render) plus the
+   views — the FNV-1a-64 fingerprint and the bounded digest render), the
    review pass (spec §3 step 4): the no-tools backend call over the composed
    prompt and the JSON proposal decode under the output-cap guard — decode
-   ONLY (the store-riding runners refine_run / refine_rollback land with
-   their own tasks; the store actor remains the only serializer this module
-   ever answers to, and the review performs no store WRITE at all). */
+   ONLY, no store WRITE — and the two store-riding runners (spec §3 + §5):
+   refine_run / refine_rollback, the whole cycles on the caller's thread,
+   every write action ONE atomic batch through the store actor (the only
+   serializer this module ever answers to). */
 
 const char* const REFINE_KINDS[REFINE_KINDS_COUNT] = {
     "prompt", "memory", "skill", "subagent",
@@ -900,15 +903,27 @@ static int _refine_edit_decode(json_value_t* el, refine_edit_t* e) {
 
   v = json_get(el, "evidence");
   if (v != NULL && json_type(v) == JSON_OBJECT) {
-    /* The plain shape: {"first_seq","last_seq","summary"}; the rollback
-       shape {"kind":"rollback","refineOf":N} names the target record seq —
-       both satisfy the gate (the inverse edit's evidence IS the target). */
+    /* The plain shape: {"first_seq","last_seq","summary"}. The ROLLBACK
+       shape (spec §4 — a rollback record's inverse edits carry
+       {"kind":"rollback","refineOf":N}) folds to
+       first_seq = last_seq = refineOf: the inverse edit's evidence IS the
+       target record, so the evidence gate passes with the target named.
+       The rollback shape overwrites the plain fields when both ride. */
     json_value_t* first = json_get(v, "first_seq");
     json_value_t* last = json_get(v, "last_seq");
     if (first != NULL && last != NULL && json_type(first) == JSON_INT &&
         json_type(last) == JSON_INT) {
       e->evidence_first = (uint64_t) json_as_int(first);
       e->evidence_last = (uint64_t) json_as_int(last);
+    }
+    json_value_t* kind_v = json_get(v, "kind");
+    if (kind_v != NULL && json_type(kind_v) == JSON_STRING &&
+        strcmp(json_as_string(kind_v), "rollback") == 0) {
+      json_value_t* of = json_get(v, "refineOf");
+      if (of != NULL && json_type(of) == JSON_INT && json_as_int(of) > 0) {
+        e->evidence_first = (uint64_t) json_as_int(of);
+        e->evidence_last = (uint64_t) json_as_int(of);
+      }
     }
     json_value_t* summary = json_get(v, "summary");
     if (summary != NULL && json_type(summary) == JSON_STRING) {
@@ -1611,6 +1626,968 @@ char* refine_review_call(frame_t* f, const refine_fold_t* fold,
   *edits = out_edits;
   *nedits = out_n;
   return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* The runners (spec §3 + §5): refine_run / refine_rollback — the      */
+/* whole cycles on the caller's thread, ONE atomic batch per write     */
+/* action through the store actor                                      */
+/* ------------------------------------------------------------------ */
+
+/* The frozen no-op banner (the result contract's rc-1 refinement summary;
+   a same-shape rollback with nothing left to write takes it too). */
+#define REFINE_NOOP_BANNER \
+  "refine: no refinement committed (no evidence-backed edits)"
+
+/* The record edit element's rollback evidence shape (spec §4): where the
+   relation between a rollback record and its target lands IN THE RECORD
+   TEXT the store holds ("kind":"rollback" + "refineOf" = the target seq).
+   The fold's record decode accepts BOTH shapes (refine.h's evidence
+   contract) — a rollback record folds as its inverse edits re-apply. */
+static json_value_t* _refine_rollback_evidence_dom(uint64_t target_seq) {
+  json_value_t* evidence = json_new_object();
+  json_object_set(evidence, "kind", json_new_string("rollback"));
+  json_object_set(evidence, "refineOf", json_new_int((int64_t) target_seq));
+  return evidence;
+}
+
+/* UTC ISO-8601 wall clock (the record's "at" field — frame.c's
+   _frame_iso_now's shape, the same bounded buffer). */
+static void _refine_utc_now(char* out, size_t out_size) {
+  time_t now = 0;
+  time(&now);
+  struct tm tmv;
+#ifdef _WIN32
+  gmtime_s(&tmv, &now);
+#else
+  gmtime_r(&now, &tmv);
+#endif
+  strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+}
+
+/* The record id mint (spec §4's sample: "refine_20261001_183422" — a UTC
+   wall-clock stamp; the seq is the record's unique key, so two records
+   minted inside one second share the id). */
+static void _refine_record_id(char* out, size_t out_size) {
+  char iso[25];
+  _refine_utc_now(iso, 25);
+  snprintf(out, out_size, "refine_%.4s%.2s%.2s_%.2s%.2s%.2s", iso, iso + 5,
+           iso + 8, iso + 11, iso + 14, iso + 17);
+}
+
+/* The harness log's counter restore (the fold's newest record seq — the
+   scan reply is ascending, so the LAST parseable record line's seq; the
+   same monotonic restore as frame.c's _frame_restore_seq, gaps recorded
+   identically). 0 when the fold holds no record. */
+static uint64_t _refine_restore_log_seq(const refine_fold_t* fold) {
+  if (fold == NULL) return 0;
+  for (size_t i = fold->nrecords; i-- > 0;) {
+    const char* line = fold->record_lines[i];
+    if (line == NULL || strncmp(line, "- ", 2) == 0) {
+      continue;   /* a malformed record's skip line carries no seq */
+    }
+    char* endp = NULL;
+    unsigned long long seq = strtoull(line, &endp, 10);
+    if (endp != line && *endp == ';') return (uint64_t) seq;
+  }
+  return 0;
+}
+
+/* The record DOM (spec §4's frozen shape): {"seq","id","scope","trigger",
+   "rollbackOf","evidence","edits","at"}. A rollback's "rollbackOf" rides
+   the target seq and the record-level rollback evidence shape. */
+static json_value_t* _refine_record_dom(uint64_t seq, const char* record_id,
+                                        const char* scope_name,
+                                        const char* trigger, uint8_t is_rollback,
+                                        uint64_t target_seq,
+                                        json_value_t* evidence,
+                                        json_value_t* edits_arr, const char* at) {
+  json_value_t* rec = json_new_object();
+  json_object_set(rec, "seq", json_new_int((int64_t) seq));
+  json_object_set(rec, "id", json_new_string(record_id));
+  json_object_set(rec, "scope", json_new_string(scope_name));
+  json_object_set(rec, "trigger", json_new_string(trigger));
+  json_object_set(rec, "rollbackOf",
+                  is_rollback ? json_new_int((int64_t) target_seq)
+                              : json_new_null());
+  json_object_set(rec, "evidence", evidence);
+  json_object_set(rec, "edits", edits_arr);
+  json_object_set(rec, "at", json_new_string(at));
+  return rec;
+}
+
+/* The fold's record line for the record a call is ABOUT to write (the
+   SAME composition the fold's parse makes): the meta pair covers the
+   POST-commit fold — the log is truth, so a later refold reproduces the
+   stored meta byte-for-byte. */
+static void _refine_push_record_line(refine_fold_t* fold, uint64_t seq,
+                                     const char* trigger) {
+  if (fold == NULL) return;
+  char* compacted = _refine_compact(trigger, SA_REFINE_DIGEST_CONTENT_CHARS);
+  if (compacted == NULL) return;
+  char line[512];
+  snprintf(line, sizeof(line), "%llu;%.360s;",
+           (unsigned long long) seq, compacted);
+  _record_line_put(fold, line);
+  free(compacted);
+}
+
+/* "<root>/log/<%020llu seq>" — the events discipline (frame.c's
+   _frame_event_key pad): the fixed-width zero pad keeps the keys'
+   lexicographic order the seq order, so the fold's range scan is the
+   ascending log and the rollback's exact-record bounds [<seq>, <seq+1>)
+   hit exactly one stored key (log seqs are leaves). */
+static int _refine_log_key(const char* root, uint64_t seq, char* out,
+                           size_t out_size) {
+  int n = snprintf(out, out_size, "%s/log/%020llu", root,
+                   (unsigned long long) seq);
+  if (n < 0 || (size_t) n >= out_size) {
+    log_error("refine: the log key overflows its buffer (root '%s', seq %llu)",
+              root != NULL ? root : "?", (unsigned long long) seq);
+    return -1;
+  }
+  return 0;
+}
+
+/* "<root>/<sub>" .. "<root>/<sub>0" — the two ABSOLUTE ROOT-LEVEL scan
+   bounds for one range below a scope root (the log ranges' shape; the
+   meta reads compose their keys directly). */
+static int _refine_sub_bounds(const char* root, const char* sub, char* lo,
+                              size_t lo_size, char* hi, size_t hi_size) {
+  if (snprintf(lo, lo_size, "%s/%s", root, sub) >= (int) lo_size ||
+      snprintf(hi, hi_size, "%s/%s0", root, sub) >= (int) hi_size) {
+    return -1;
+  }
+  return 0;
+}
+
+/* One stored key's value text (the scan replies in raw record texts):
+   NULL when absent, the malloc'd text on presence. Returns 0 either way;
+   -1 loud on a scan/parse refusal. */
+static int _refine_stored_value(frame_t* f, const char* key, char** val_out) {
+  *val_out = NULL;
+  char lo[REFINE_BOUND_MAX + 2];
+  char hi[REFINE_BOUND_MAX + 2];
+  if (snprintf(lo, sizeof(lo), "%s", key) >= (int) sizeof(lo) ||
+      snprintf(hi, sizeof(hi), "%s0", key) >= (int) sizeof(hi)) {
+    log_error("refine: the value read key overflows its buffer ('%s')",
+              key != NULL ? key : "?");
+    return -1;
+  }
+  char* raw = NULL;
+  if (_frame_sync_scan(f, lo, hi, 1, &raw) != 0) return -1;
+  if (raw == NULL) return -1;   /* never: the scan hands back a text */
+  if (strcmp(raw, "[]") == 0) {
+    free(raw);
+    return 0;
+  }
+  json_value_t* arr = _refine_parse_text(raw);
+  free(raw);
+  if (arr == NULL || json_type(arr) != JSON_ARRAY || json_size(arr) != 1 ||
+      json_type(json_at(arr, 0)) != JSON_STRING) {
+    log_error("refine: the value read at '%s' is not a one-element array — "
+              "refused loud", key);
+    json_value_destroy(arr);
+    return -1;
+  }
+  *val_out = _refine_dup(json_as_string(json_at(arr, 0)));
+  json_value_destroy(arr);
+  return 0;
+}
+
+/* The scope meta key put's read side: "<root>/meta/<meta>"'s stored value. */
+static int _refine_stored_digest(frame_t* f, const char* scope_root,
+                                 char** stored_out) {
+  char key[REFINE_BOUND_MAX];
+  if (snprintf(key, sizeof(key), "%s/meta/digest", scope_root) >=
+      (int) sizeof(key)) {
+    log_error("refine: the digest meta key overflows its buffer ('%s')",
+              scope_root);
+    return -1;
+  }
+  return _refine_stored_value(f, key, stored_out);
+}
+
+/* The scope root's composition ("<frame_sid>/harness" local, the ROOT
+   "harness" shared — refine.h's scope contract). */
+static int _refine_scope_root(frame_t* f, uint8_t shared_scope, char* out,
+                              size_t out_size) {
+  if (shared_scope != 0) {
+    snprintf(out, out_size, "%s", REFINE_SCOPE_ROOT_SHARED);
+    return 0;
+  }
+  const char* sid = frame_sid(f);
+  if (sid == NULL ||
+      snprintf(out, out_size, "%s/harness", sid) >= (int) out_size) {
+    log_error("refine: the session scope root overflows its buffer");
+    return -1;
+  }
+  return 0;
+}
+
+/* The trajectory view's newest event seq (the record-compose evidence
+   bound — refine.h's evidence contract: a citation PAST the scanned view
+   is unprovable and the gate refuses it with the one string). 0 when the
+   view is empty. Returns 0, -1 loud on a parse failure (the run refuses).
+   The reply is ascending, so the newest record is the LAST element. */
+static int _refine_newest_event_seq(const char* traj, uint64_t* newest_out) {
+  *newest_out = 0;
+  json_value_t* arr = _refine_parse_text(traj != NULL ? traj : "[]");
+  if (arr == NULL || json_type(arr) != JSON_ARRAY) {
+    log_error("refine: the trajectory view is not an array");
+    json_value_destroy(arr);
+    return -1;
+  }
+  for (size_t i = json_size(arr); i-- > 0;) {
+    json_value_t* el = json_at(arr, i);
+    if (el == NULL || json_type(el) != JSON_STRING) continue;
+    json_value_t* rec = _refine_parse_text(json_as_string(el));
+    if (rec == NULL) continue;
+    json_value_t* seq = json_get(rec, "seq");
+    if (seq != NULL && json_type(seq) == JSON_INT) {
+      *newest_out = (uint64_t) json_as_int(seq);
+      json_value_destroy(rec);
+      break;
+    }
+    json_value_destroy(rec);
+  }
+  json_value_destroy(arr);
+  return 0;
+}
+
+/* The per-edit run path BOTH runners ride: compose the record element
+   (the pre-apply before snapshot is taken INSIDE the composition, before
+   the apply can mutate the reused row), apply, patch applied/error, and
+   render the frozen report line. `pre_err` (owned; freed here) is an
+   injected refusal the run composes before any apply. Returns 1 applied,
+   0 refused; *element_out is the appended element (the caller may patch
+   further fields); *line_out is the malloc'd report line. */
+static int _refine_edit_run(refine_fold_t* fold, refine_edit_t* e,
+                            uint64_t at_seq, const char* scope_name,
+                            char* pre_err, json_value_t* edits_arr,
+                            char** line_out, json_value_t** element_out) {
+  char* slug_id = NULL;
+  const char* id = _refine_edit_id(e, &slug_id);
+  const char* kind = e->kind != NULL ? e->kind : "?";
+  refine_entry_t* before = refine_entry_find(fold, e->kind, id);
+  /* The after-state version, computable BEFORE the apply (the apply's own
+     semantics: create -> 1, update -> the current version + 1, a
+     delete's tombstone keeps its version). */
+  unsigned after_version = 0;
+  int is_create = (e->action != NULL && strcmp(e->action, "create") == 0);
+  int is_delete = (e->action != NULL && strcmp(e->action, "delete") == 0);
+  if (is_create) {
+    after_version = 1;
+  } else if (before != NULL) {
+    after_version = is_delete ? before->version : before->version + 1;
+  }
+  json_value_t* element =
+      refine_record_edit_json(e, before, 1, NULL, after_version);
+  char* err = (pre_err != NULL) ? pre_err : refine_edit_apply(fold, e, at_seq);
+  pre_err = NULL;
+  int applied = (err == NULL);
+  if (err != NULL) {
+    json_object_set(element, "applied", json_new_bool(0));
+    json_object_set(element, "error", json_new_string(err));
+    *line_out = _refine_error("refuse %s %s: %s", kind, id, err);
+    log_error("refine: edit refused (%s %s): %s", kind, id, err);
+    free(err);
+  } else {
+    const char* reason = (e->reason != NULL && e->reason[0] != '\0')
+                             ? e->reason : "-";
+    char* compacted = _refine_compact(reason, 120);
+    *line_out = _refine_error("apply %s %s:%s v%u: %s", kind, scope_name, id,
+                              after_version, compacted);
+    free(compacted);
+  }
+  free(slug_id);
+  json_array_append(edits_arr, element);
+  *element_out = element;
+  return applied;
+}
+
+/* The record edit elements' applied flag (the inverse composition's
+   filter — refused edits live in the record only). */
+static uint8_t _refine_element_applied(const json_value_t* el) {
+  json_value_t* applied = json_get((json_value_t*) el, "applied");
+  return (applied != NULL && json_type(applied) == JSON_BOOL &&
+          json_as_bool(applied)) ? 1 : 0;
+}
+
+/* The inverse edit for one APPLIED edit element of the target record (the
+   create inverts to a delete of the created entry; an update/delete
+   inverts to the BEFORE snapshot's update/create, spec §5). Zeroed first,
+   so a shape refusal stays destroy-safe. Returns 0, -1 on shape failure. */
+static int _refine_inverse_edit(json_value_t* el, uint64_t target_seq,
+                                const char* target_id, refine_edit_t* inv) {
+  memset(inv, 0, sizeof(*inv));
+  const char* action = _refine_dom_string(el, "action");
+  const char* kind = _refine_dom_string(el, "kind");
+  const char* id = _refine_dom_string(el, "id");
+  json_value_t* version = json_get(el, "version");
+  unsigned after_version = 0;
+  if (version == NULL || json_type(version) != JSON_INT ||
+      json_as_int(version) < 0) {
+    return -1;
+  }
+  after_version = (unsigned) json_as_int(version);
+  if (action == NULL || kind == NULL || id == NULL) return -1;
+  if (strcmp(action, "create") == 0) {
+    inv->action = _refine_dup("delete");
+    inv->expect_version = after_version;   /* as the target left it */
+  } else if (strcmp(action, "delete") == 0) {
+    inv->action = _refine_dup("create");
+  } else if (strcmp(action, "update") == 0) {
+    inv->action = _refine_dup("update");
+    inv->expect_version = after_version;
+  } else {
+    return -1;
+  }
+  inv->kind = _refine_dup(kind);
+  inv->id = _refine_dup(id);
+  inv->evidence_first = target_seq;   /* the inverse edit's evidence IS the
+                                         target record (the rollback shape
+                                         folded to both fields) */
+  inv->evidence_last = target_seq;
+  char reason[160];
+  snprintf(reason, sizeof(reason), "Rollback %.128s", target_id);
+  inv->reason = _refine_dup(reason);
+  if (strcmp(inv->action, "create") == 0 || strcmp(inv->action, "update") == 0) {
+    json_value_t* before = json_get(el, "before");
+    if (before == NULL || json_type(before) != JSON_OBJECT) return -1;
+    inv->title = _refine_dup(_refine_dom_string(before, "title"));
+    inv->content = _refine_dup(_refine_dom_string(before, "content"));
+    inv->path = _refine_dup(_refine_dom_string(before, "path"));
+    json_value_t* reference = json_get(before, "reference");
+    if (reference != NULL && json_type(reference) == JSON_OBJECT) {
+      inv->reference = json_serialize(reference);
+    }
+    json_value_t* arguments = json_get(before, "arguments");
+    if (arguments != NULL && json_type(arguments) == JSON_OBJECT) {
+      inv->arguments = json_serialize(arguments);
+    }
+  }
+  return 0;
+}
+
+/* One applied edit's materialization write: a full-entry put, or a real
+   DELETE op (is_delete, value NULL) on a withdrawal. */
+static int _refine_entry_op(frm_store_op_t* op, const char* scope_root,
+                            const refine_fold_t* fold, const char* kind,
+                            const char* id, uint8_t withdraw, size_t* total) {
+  char key[REFINE_BOUND_MAX];
+  int n = snprintf(key, sizeof(key), "%s/entry/%s/%s", scope_root, kind, id);
+  if (n < 0 || (size_t) n >= sizeof(key)) {
+    log_error("refine: the entry key overflows its buffer ('%s/entry/%s/%s')",
+              scope_root, kind, id);
+    return -1;
+  }
+  op->key = _refine_dup(key);   /* never NULL: get_memory aborts on OOM */
+  if (withdraw) {
+    op->is_delete = 1;   /* value NULL, value_len 0 — a deletion never
+                            smuggles bytes (the store validator refuses) */
+    *total += strlen(key);
+    return 0;
+  }
+  refine_entry_t* row = refine_entry_find(fold, kind, id);
+  if (row == NULL) {
+    log_error("refine: the applied edit's materialization row (%s, %s) is "
+              "missing — a composer invariant broke", kind, id);
+    return -1;
+  }
+  json_value_t* dom = _refine_entry_json(row);
+  char* text = (dom != NULL) ? json_serialize(dom) : NULL;
+  json_value_destroy(dom);
+  if (text == NULL) {
+    log_error("refine: the entry value at '%s' did not serialize", key);
+    return -1;
+  }
+  size_t len = strlen(text);
+  if (len > (size_t) SA_REFINE_ENTRY_PUT_BYTES) {
+    log_error("refine: the entry put at '%s' is %zu bytes, exceeding the "
+              "%d-byte per-entry cap — refusing, never truncating", key, len,
+              SA_REFINE_ENTRY_PUT_BYTES);
+    free(text);
+    return -1;
+  }
+  op->value = (uint8_t*) text;
+  op->value_len = len;
+  *total += strlen(key) + len;
+  return 0;
+}
+
+/* One applied edit's materialization write (the compose-side record — the
+   runner collects these on the fly, owning the id strings). */
+typedef struct _refine_write_t {
+  char* kind;
+  char* id;
+  uint8_t withdraw;
+} _refine_write_t;
+
+static void _refine_writes_clear(_refine_write_t* writes, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    free(writes[i].kind);
+    free(writes[i].id);
+  }
+}
+
+/* The COMMIT batch (spec §5): ONE atomic root batch = the log record put +
+   one entry op per applied edit + meta/fingerprint + meta/digest. The per-
+   entry/record caps and SA_REFINE_BATCH_BYTES are checked BEFORE the post
+   (loud — the store's mirrored caps back it up; nothing half-commits). The
+   ops' ownership transfers into the round trip on every path. Returns 0
+   committed, -1 refused. */
+static int _refine_commit(frame_t* f, const char* scope_root,
+                          const refine_fold_t* fold, uint64_t record_seq,
+                          json_value_t* record_dom, const char* fingerprint,
+                          const char* digest, const _refine_write_t* writes,
+                          size_t n_writes, const char* op_name) {
+  char key_log[REFINE_BOUND_MAX];
+  char key_fp[REFINE_BOUND_MAX];
+  char key_digest[REFINE_BOUND_MAX];
+  if (_refine_log_key(scope_root, record_seq, key_log, sizeof(key_log)) != 0 ||
+      snprintf(key_fp, sizeof(key_fp), "%s/meta/fingerprint", scope_root) >=
+          (int) sizeof(key_fp) ||
+      snprintf(key_digest, sizeof(key_digest), "%s/meta/digest", scope_root) >=
+          (int) sizeof(key_digest)) {
+    log_error("refine: the '%s' batch keys overflow their buffers at '%s'",
+              op_name, scope_root);
+    return -1;
+  }
+  char* record_text = json_serialize(record_dom);
+  if (record_text == NULL) {
+    log_error("refine: the record text did not serialize");
+    return -1;
+  }
+  size_t record_len = strlen(record_text);
+  if (record_len > (size_t) SA_REFINE_RECORD_BYTES) {
+    log_error("refine: the record text is %zu bytes, exceeding the "
+              "%d-byte record cap — refusing, never truncating", record_len,
+              SA_REFINE_RECORD_BYTES);
+    free(record_text);
+    return -1;
+  }
+
+  size_t nops = 1 + n_writes + 2;   /* record + entries + the meta pair */
+  frm_store_op_t* ops = get_clear_memory(nops * sizeof(frm_store_op_t));
+  if (ops == NULL) {
+    log_error("refine: out of memory composing the batch '%s'", op_name);
+    free(record_text);
+    return -1;
+  }
+  size_t total = 0;
+  int failed = 0;
+  ops[0].key = _refine_dup(key_log);
+  ops[0].value = (uint8_t*) record_text;   /* OWNED by the round trip */
+  ops[0].value_len = record_len;
+  if (ops[0].key != NULL) total += strlen(key_log);
+  for (size_t i = 0; i < n_writes && !failed; i++) {
+    if (_refine_entry_op(&ops[1 + i], scope_root, fold, writes[i].kind,
+                         writes[i].id, writes[i].withdraw, &total) != 0) {
+      failed = 1;
+    }
+  }
+  if (!failed) {
+    ops[1 + n_writes].key = _refine_dup(key_fp);
+    ops[1 + n_writes].value = (uint8_t*) _refine_dup(fingerprint);
+    ops[1 + n_writes].value_len = strlen(fingerprint);
+    ops[1 + n_writes + 1].key = _refine_dup(key_digest);
+    ops[1 + n_writes + 1].value = (uint8_t*) _refine_dup(digest);
+    ops[1 + n_writes + 1].value_len = strlen(digest);
+    if (ops[1 + n_writes].key == NULL || ops[1 + n_writes].value == NULL ||
+        ops[1 + n_writes + 1].key == NULL ||
+        ops[1 + n_writes + 1].value == NULL) {
+      log_error("refine: out of memory composing the meta pair");
+      failed = 1;
+    } else {
+      total += strlen(key_fp) + strlen(fingerprint);
+      total += strlen(key_digest) + strlen(digest);
+    }
+  }
+  if (!failed && total > (size_t) SA_REFINE_BATCH_BYTES) {
+    log_error("refine: the batch at '%s' is %zu bytes, exceeding the "
+              "%d-byte batch cap — refusing, never truncating", scope_root,
+              total, SA_REFINE_BATCH_BYTES);
+    failed = 1;
+  }
+  if (failed) {
+    /* The compose-side caps refused: nothing was posted. */
+    for (size_t i = 0; i < nops; i++) {
+      free(ops[i].key);
+      free(ops[i].value);
+    }
+    free(ops);
+    return -1;
+  }
+  int rc = _frame_sync_batch(f, ops, nops, op_name);
+  return (rc == 0) ? 0 : -1;
+}
+
+/* The folded edits array's teardown (the review decode's ownership: every
+   element destroyed, then the array). */
+static void _refine_edits_free(refine_edit_t* edits, size_t n) {
+  if (edits == NULL) return;
+  for (size_t i = 0; i < n; i++) refine_edit_destroy(&edits[i]);
+  free(edits);
+}
+
+int refine_run(frame_t* f, const char* instructions, uint8_t shared_scope,
+               char** summary_out) {
+  if (summary_out != NULL) *summary_out = NULL;
+  if (f == NULL || summary_out == NULL) {
+    log_error("refine_run: a live frame and a summary out-slot are required");
+    return -1;
+  }
+
+  char scope_root[REFINE_BOUND_MAX];
+  char lo[REFINE_BOUND_MAX];
+  char hi[REFINE_BOUND_MAX];
+  char record_id[32];
+  char iso[25];
+  char trigger[REFINE_BOUND_MAX];
+  refine_fold_t fold;
+  refine_fold_t shared_fold;
+  uint8_t have_shared = 0;
+  char* log_raw = NULL;
+  char* shared_raw = NULL;
+  refine_edit_t* edits = NULL;
+  size_t nedits = 0;
+  char* summary = NULL;
+  char* rationale = NULL;
+  char* traj = NULL;
+  json_value_t* edits_arr = NULL;
+  json_value_t* record_dom = NULL;
+  json_value_t* evidence = NULL;
+  char** lines = NULL;
+  char* fingerprint = NULL;
+  char* digest = NULL;
+  char* stored_digest = NULL;
+  const char* scope_name = (shared_scope != 0) ? "shared" : "local";
+  _refine_buf_t sum = {NULL, 0, 0};
+  _refine_write_t writes[SA_REFINE_MAX_EDITS];
+  size_t n_applied = 0;
+  size_t n_lines = 0;
+  int rc = -1;
+
+  memset(&fold, 0, sizeof(fold));
+  memset(&shared_fold, 0, sizeof(shared_fold));
+  memset(writes, 0, sizeof(writes));
+
+  /* THE SCOPE (spec §1) + THE FOLD (spec §3 step 2): the scope's log, the
+     newest 512 window. */
+  if (_refine_scope_root(f, shared_scope, scope_root, sizeof(scope_root)) != 0) {
+    goto out;
+  }
+  if (_refine_sub_bounds(scope_root, "log", lo, sizeof(lo), hi, sizeof(hi)) != 0) {
+    log_error("refine_run: the log bounds overflow at '%s'", scope_root);
+    goto out;
+  }
+  if (_frame_sync_scan(f, lo, hi, (size_t) SA_REFINE_LOG_WINDOW, &log_raw) != 0 ||
+      log_raw == NULL) {
+    log_error("refine_run: the log scan refused at '%s'", scope_root);
+    goto out;
+  }
+  if (refine_fold_parse(log_raw, &fold) != 0) {
+    log_error("refine_run: the log does not fold at '%s'", scope_root);
+    goto out;
+  }
+  /* THE LOG COUNTER: restored ONCE per call (the newest scanned record's
+     seq — the same monotonic restore as frame.c's _frame_restore_seq, gaps
+     recorded identically); the compose allocation is +1 per record the
+     call writes. */
+  uint64_t record_seq = _refine_restore_log_seq(&fold) + 1;
+
+  /* THE REVIEW (spec §3 step 4): the no-tools decode-only call. */
+  if (refine_review_call(f, &fold, scope_root, instructions, &traj, &edits,
+                         &nedits, &summary, &rationale) != NULL) {
+    log_error("refine_run: the review refused at '%s'", scope_root);
+    goto out;
+  }
+
+  /* THE CROSS-SCOPE GUARD (spec §1's read-only-context rule,
+     refinement.ts:380-407's merge discipline): a local run folds the
+     SHARED scope's log once; an update/delete below that names an entry
+     living there refuses per edit (a local CREATE over a shared id is the
+     session-local override the merge shape carries — never a cross-scope
+     write). A shared run consults no session subtrees (the review's prompt
+     asked for shared-scope edits in the first place). */
+  if (nedits > 0 && shared_scope == 0) {
+    if (_refine_range_bounds(REFINE_SCOPE_ROOT_SHARED "/log", lo, sizeof(lo),
+                             hi, sizeof(hi)) != 0 ||
+        _frame_sync_scan(f, lo, hi, (size_t) SA_REFINE_LOG_WINDOW,
+                         &shared_raw) != 0 ||
+        shared_raw == NULL) {
+      log_error("refine_run: the shared-scope guard scan refused");
+      goto out;
+    }
+    if (refine_fold_parse(shared_raw, &shared_fold) != 0) {
+      log_error("refine_run: the shared-scope log does not fold — refused "
+                "loud");
+      goto out;
+    }
+    have_shared = 1;
+  }
+
+  /* THE EVIDENCE BOUND (spec §4's gate + refine.h's compose-time check):
+     the frame's current seq reads as the trajectory's scanned newest
+     record; a citation past it is unprovable and refuses with the gate's
+     one string. A ROLLBACK's inverse evidence (the target seq) never runs
+     this — refine_rollback carries no trajectory. */
+  uint64_t newest_event = 0;
+  if (_refine_newest_event_seq(traj, &newest_event) != 0) {
+    goto out;
+  }
+
+  /* THE APPLY (spec §3 step 5): the evidence gate + the version guards
+     refuse per edit; zero applied edits = the clean no-op (spec §4's
+     record-skip gate — nothing reaches the store). The apply rides at the
+     compose-time record seq (the materialization's seq = the record that
+     wrote it). */
+  edits_arr = json_new_array();
+  lines = get_memory((nedits > 0 ? nedits : 1) * sizeof(char*));
+  uint64_t ev_first = 0;
+  uint64_t ev_last = 0;
+  for (size_t i = 0; i < nedits; i++) {
+    refine_edit_t* e = &edits[i];
+    json_value_t* element = NULL;
+    char* line = NULL;
+    char* slug_id = NULL;
+    const char* id = _refine_edit_id(e, &slug_id);
+    char* pre_err = NULL;
+    if (id == NULL) {
+      /* A decoded edit always resolves an id (validate refuses one that
+         composes to nothing); this never-firing branch stays loud. */
+      pre_err = _refine_error("%s requires id", e->action);
+    } else if (e->evidence_first != 0 && e->evidence_first > newest_event) {
+      /* A citation past the scanned view is unprovable evidence (the
+         gate's one string; the record never cites an unseen event). */
+      pre_err = _refine_error("edit without evidence");
+    } else if (have_shared && strcmp(e->action, "create") != 0 &&
+               refine_entry_find(&shared_fold, e->kind, id) != NULL &&
+               refine_entry_find(&fold, e->kind, id) == NULL) {
+      pre_err = _refine_error("%s targets a %s-scope entry from a %s "
+                              "refinement", e->action, "shared", "local");
+    }
+    int applied = _refine_edit_run(&fold, e, record_seq, scope_name, pre_err,
+                                   edits_arr, &line, &element);
+    /* element only needed as the out target: the element rides inside
+       edits_arr from the helper's append. */
+    if (lines != NULL) {
+      lines[n_lines++] = line;   /* line NULL = an unresolved id's slot */
+    }
+    if (applied) {
+      /* The dups ride BEFORE the slug's free (the create's resolved id IS
+         the slug). */
+      writes[n_applied].kind = _refine_dup(e->kind);
+      writes[n_applied].id = _refine_dup(id);
+      writes[n_applied].withdraw =
+          (e->action != NULL && strcmp(e->action, "delete") == 0) ? 1 : 0;
+      if (ev_first == 0 || e->evidence_first < ev_first) {
+        ev_first = e->evidence_first;
+      }
+      if (e->evidence_last > ev_last) ev_last = e->evidence_last;
+      n_applied++;
+    }
+    free(slug_id);
+  }
+
+  /* THE STORE WAS UNTOUCHED (the no-op rule, spec §3 step 5; every edit
+     refused or none decoded): the frozen banner rides out, no meta, no
+     record (spec §4's record-skip gate). */
+  if (n_applied == 0) {
+    rc = 1;
+    goto out;
+  }
+
+  /* THE COMMIT (spec §3 step 6): ONE atomic batch — the record put + the
+     entry ops + meta/fingerprint + meta/digest. The record's fold line
+     rides first: the meta pair covers the POST-commit fold. */
+  snprintf(trigger, sizeof(trigger), "%.360s", summary != NULL ? summary : "");
+  _refine_push_record_line(&fold, record_seq, trigger);
+  fingerprint = refine_fold_fingerprint(&fold);
+  digest = refine_fold_digest(&fold);
+  if (fingerprint == NULL || digest == NULL ||
+      _refine_stored_digest(f, scope_root, &stored_digest) != 0) {
+    log_error("refine_run: the commit's reads refused at '%s'", scope_root);
+    goto out;
+  }
+  evidence = json_new_object();
+  json_object_set(evidence, "session",
+                  (shared_scope != 0) ? json_new_null()
+                                      : json_new_string(frame_sid(f)));
+  json_object_set(evidence, "first_seq", json_new_int((int64_t) ev_first));
+  json_object_set(evidence, "last_seq", json_new_int((int64_t) ev_last));
+  json_object_set(evidence, "summary",
+                  json_new_string(rationale != NULL ? rationale : ""));
+  _refine_record_id(record_id, 32);
+  _refine_utc_now(iso, 25);
+  record_dom = _refine_record_dom(record_seq, record_id, scope_name, trigger,
+                                  0, 0, evidence, edits_arr, iso);
+  evidence = NULL;   /* rode into the record DOM */
+  edits_arr = NULL;  /* the record DOM owns it from here */
+  /* THE SUMMARY (the frozen shape — the record id is the minted one, the
+     per-edit lines ride proposal order, and the digest line compares the
+     new digest against the STORED meta/digest). */
+  if (_refine_commit(f, scope_root, &fold, record_seq, record_dom,
+                     fingerprint, digest, writes, n_applied,
+                     "refine commit") != 0) {
+    goto out;   /* nothing reached the store (the batch is atomic) */
+  }
+  rc = 0;
+  _refine_buf_add(&sum, "refine: %s committed (%zu/%zu edits applied)\n",
+                  record_id, n_applied, nedits);
+  for (size_t i = 0; i < n_lines; i++) {
+    _refine_buf_add(&sum, "  %s\n", lines[i] != NULL ? lines[i] : "");
+  }
+  _refine_buf_add(&sum, "digest changed: %s",
+                  (stored_digest == NULL || strcmp(stored_digest, digest) != 0)
+                      ? "yes" : "no");
+  *summary_out = (sum.text != NULL) ? sum.text : _refine_dup("");
+
+out:
+  free(log_raw);
+  free(shared_raw);
+  if (lines != NULL) {
+    for (size_t i = 0; i < n_lines; i++) free(lines[i]);
+    free(lines);
+  }
+  _refine_writes_clear(writes, n_applied);
+  _refine_edits_free(edits, nedits);
+  free(summary);
+  free(rationale);
+  free(traj);
+  free(fingerprint);
+  free(digest);
+  free(stored_digest);
+  json_value_destroy(edits_arr);   /* NULL once the record DOM owns it */
+  json_value_destroy(record_dom);
+  json_value_destroy(evidence);
+  if (have_shared) refine_fold_destroy(&shared_fold);
+  refine_fold_destroy(&fold);
+  if (rc == 1) *summary_out = _refine_dup(REFINE_NOOP_BANNER);
+  return rc;
+}
+
+int refine_rollback(frame_t* f, uint64_t seq, uint8_t shared_scope,
+                    char** summary_out) {
+  if (summary_out != NULL) *summary_out = NULL;
+  if (f == NULL || summary_out == NULL) {
+    log_error("refine_rollback: a live frame and a summary out-slot are "
+              "required");
+    return -1;
+  }
+
+  char scope_root[REFINE_BOUND_MAX];
+  char lo[REFINE_BOUND_MAX];
+  char hi[REFINE_BOUND_MAX];
+  char tlo[REFINE_BOUND_MAX + 2];
+  char record_id[32];
+  char iso[25];
+  char trigger[REFINE_BOUND_MAX];
+  refine_fold_t fold;
+  char* log_raw = NULL;
+  char* target_text = NULL;
+  json_value_t* target = NULL;
+  json_value_t* target_edits = NULL;
+  const char* target_id = NULL;
+  json_value_t* edits_arr = NULL;
+  json_value_t* record_dom = NULL;
+  char** lines = NULL;
+  _refine_write_t* writes = NULL;
+  const char* scope_name = (shared_scope != 0) ? "shared" : "local";
+  _refine_buf_t sum = {NULL, 0, 0};
+  size_t inv_slots = 0;
+  size_t n_applied = 0;
+  size_t n_lines = 0;
+  char* result_summary = NULL;
+  int rc = -1;
+
+  memset(&fold, 0, sizeof(fold));
+
+  /* THE SCOPE + THE EXACT-RECORD READ (spec §5): [<root>/log/<seq>,
+     <root>/log/<seq+1>) — exactly one record when it exists (log seqs are
+     leaves), none otherwise. */
+  if (_refine_scope_root(f, shared_scope, scope_root, sizeof(scope_root)) != 0) {
+    goto out;
+  }
+  if (_refine_log_key(scope_root, seq, tlo, sizeof(tlo)) != 0) {
+    goto out;
+  }
+  if (_refine_stored_value(f, tlo, &target_text) != 0) {
+    log_error("refine_rollback: the exact-record read refused at '%s'",
+              scope_root);
+    goto out;
+  }
+  if (target_text == NULL) {
+    /* The missing target: the store stays untouched and the caller is
+       told loudly (PA throws; ours refuses through the banner — the
+       summary carries it, spec §5's result contract). */
+    result_summary = _refine_error("rollback: no refinement record at seq %llu",
+                                   (unsigned long long) seq);
+    rc = 1;
+    goto out;
+  }
+
+  /* THE FOLD (the CURRENT version guards' state, spec §5): the full log
+     window; the exact record is the before snapshots' source. */
+  if (_refine_sub_bounds(scope_root, "log", lo, sizeof(lo), hi, sizeof(hi)) != 0) {
+    log_error("refine_rollback: the log bounds overflow at '%s'", scope_root);
+    goto out;
+  }
+  if (_frame_sync_scan(f, lo, hi, (size_t) SA_REFINE_LOG_WINDOW, &log_raw) != 0 ||
+      log_raw == NULL) {
+    log_error("refine_rollback: the log scan refused at '%s'", scope_root);
+    goto out;
+  }
+  if (refine_fold_parse(log_raw, &fold) != 0) {
+    log_error("refine_rollback: the log does not fold at '%s'", scope_root);
+    goto out;
+  }
+  uint64_t record_seq = _refine_restore_log_seq(&fold) + 1;
+
+  /* THE TARGET RECORD's DOM + contract. */
+  target = _refine_parse_text(target_text);
+  free(target_text);
+  target_text = NULL;
+  if (target == NULL || json_type(target) != JSON_OBJECT) {
+    log_error("refine_rollback: the record at seq %llu is not a JSON object "
+              "— refused loud", (unsigned long long) seq);
+    goto out;
+  }
+  target_edits = json_get(target, "edits");
+  json_value_t* target_id_v = json_get(target, "id");
+  if (target_id_v == NULL || json_type(target_id_v) != JSON_STRING ||
+      target_edits == NULL || json_type(target_edits) != JSON_ARRAY) {
+    log_error("refine_rollback: the record at seq %llu violates the record "
+              "contract — refused loud", (unsigned long long) seq);
+    goto out;
+  }
+  target_id = json_as_string(target_id_v);
+
+  /* THE INVERSE COMPOSITION (spec §5): the APPLIED edit elements walked
+     BACKWARD, the before snapshots restored (or an original create
+     withdrawn) and applied with the CURRENT fold's version guards
+     re-checked — a later edit to the same entry gets its per-edit stale
+     rejection while the OTHER inverses still apply. */
+  inv_slots = json_size(target_edits);
+  if (inv_slots > (size_t) SA_REFINE_MAX_EDITS) {
+    log_error("refine_rollback: the record at seq %llu carries %zu edits — "
+              "refusing loud", (unsigned long long) seq, inv_slots);
+    goto out;
+  }
+  edits_arr = json_new_array();
+  lines = get_memory((inv_slots > 0 ? inv_slots : 1) * sizeof(char*));
+  writes = get_clear_memory((inv_slots > 0 ? inv_slots : 1) *
+                            sizeof(_refine_write_t));
+  for (size_t i = inv_slots; i-- > 0;) {
+    json_value_t* el = json_at(target_edits, i);
+    if (el == NULL || json_type(el) != JSON_OBJECT ||
+        !_refine_element_applied(el)) {
+      continue;
+    }
+    refine_edit_t inv;
+    if (_refine_inverse_edit(el, seq, target_id, &inv) != 0) {
+      log_error("refine_rollback: record %llu's edit %zu violates the edit "
+                "contract — skipped loud", (unsigned long long) seq, i);
+      continue;   /* render-not-crash (refinement.ts:479-483's rule) */
+    }
+    char* line = NULL;
+    json_value_t* element = NULL;
+    _refine_edit_run(&fold, &inv, record_seq, scope_name, NULL, edits_arr,
+                     &line, &element);
+    /* The rollback record's inverse edits carry the ROLLBACK evidence
+       shape ({"kind":"rollback","refineOf":N} — the record text is what
+       the store holds; the record decode folds it back to first_seq =
+       last_seq = refineOf). The reason rides top-level (the rollback
+       shape has no summary slot). */
+    if (element != NULL) {
+      json_object_set(element, "evidence", _refine_rollback_evidence_dom(seq));
+      json_object_set(element, "reason",
+                      inv.reason != NULL ? json_new_string(inv.reason)
+                                         : json_new_null());
+    }
+    lines[n_lines++] = line;   /* NULL line = an unresolved id's slot */
+    json_value_t* applied_v = json_get(element, "applied");
+    if (applied_v != NULL && json_as_bool(applied_v)) {
+      writes[n_applied].kind = _refine_dup(inv.kind);
+      writes[n_applied].id = _refine_dup(inv.id);
+      writes[n_applied].withdraw = (strcmp(inv.action, "delete") == 0) ? 1 : 0;
+      n_applied++;
+    }
+    refine_edit_destroy(&inv);
+  }
+
+  /* The all-refused rollback writes NOTHING (spec §4's record-skip gate:
+     the fold would be unchanged — the stored-fingerprint rule). */
+  if (n_applied == 0) {
+    rc = 1;
+    result_summary = _refine_dup(REFINE_NOOP_BANNER);
+    goto out;
+  }
+
+  /* THE COMMIT: the rollback record ("rollbackOf":<target seq>, the
+     rollback evidence shape on the record and its edits) + the entry ops
+     + the meta pair, ONE atomic batch. The record's fold line rides
+     first: the meta pair covers the POST-commit fold. */
+  snprintf(trigger, sizeof(trigger), "Rollback refinement %.200s", target_id);
+  _refine_push_record_line(&fold, record_seq, trigger);
+  char* fingerprint = refine_fold_fingerprint(&fold);
+  char* digest = refine_fold_digest(&fold);
+  char* stored_digest = NULL;
+  if (fingerprint == NULL || digest == NULL ||
+      _refine_stored_digest(f, scope_root, &stored_digest) != 0) {
+    log_error("refine_rollback: the commit's reads refused at '%s'",
+              scope_root);
+    free(fingerprint);
+    free(digest);
+    free(stored_digest);
+    goto out;
+  }
+  _refine_record_id(record_id, 32);
+  _refine_utc_now(iso, 25);
+  record_dom = _refine_record_dom(record_seq, record_id, scope_name, trigger,
+                                  1, seq, _refine_rollback_evidence_dom(seq),
+                                  edits_arr, iso);
+  edits_arr = NULL;   /* the record DOM owns it from here */
+  if (_refine_commit(f, scope_root, &fold, record_seq, record_dom,
+                     fingerprint, digest, writes, n_applied,
+                     "refine rollback") != 0) {
+    free(fingerprint);
+    free(digest);
+    free(stored_digest);
+    goto out;
+  }
+  rc = 0;
+
+  /* THE SUMMARY (the frozen shape). */
+  _refine_buf_add(&sum, "refine: %s committed (%zu/%zu edits applied)\n",
+                  record_id, n_applied, n_lines);
+  for (size_t i = 0; i < n_lines; i++) {
+    _refine_buf_add(&sum, "  %s\n", lines[i] != NULL ? lines[i] : "");
+  }
+  _refine_buf_add(&sum, "digest changed: %s",
+                  (stored_digest == NULL || strcmp(stored_digest, digest) != 0)
+                      ? "yes" : "no");
+  *summary_out = (sum.text != NULL) ? sum.text : _refine_dup("");
+  free(fingerprint);
+  free(digest);
+  free(stored_digest);
+
+out:
+  free(log_raw);
+  if (target_text != NULL) free(target_text);
+  if (lines != NULL) {
+    for (size_t i = 0; i < n_lines; i++) free(lines[i]);
+    free(lines);
+  }
+  _refine_writes_clear(writes, n_applied);
+  free(writes);
+  json_value_destroy(edits_arr);   /* NULL once the record DOM owns it */
+  json_value_destroy(record_dom);
+  json_value_destroy(target);
+  refine_fold_destroy(&fold);
+  if (result_summary != NULL) *summary_out = result_summary;
+  return rc;
 }
 
 #endif /* SA_HAS_WDB */

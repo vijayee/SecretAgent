@@ -148,7 +148,12 @@ typedef struct refine_edit_t {
   char* arguments;  /* skill create/update: serialized arguments; NULL = keep */
   unsigned expect_version;  /* update/delete: the version the review SAW */
   uint64_t evidence_first, evidence_last;  /* the trajectory event seqs this
-                            lesson rests on (BOTH 0 = no evidence => refused) */
+                            lesson rests on (BOTH 0 = no evidence => refused).
+                            A rollback record's inverse edits carry the
+                            rollback evidence shape
+                            {"kind":"rollback","refineOf":<seq>} (spec §4);
+                            the record decode folds it to BOTH = refineOf —
+                            the inverse edit's evidence IS the target. */
   char* reason;     /* the "why" — the record also carries it */
 } refine_edit_t;
 
@@ -159,8 +164,13 @@ void refine_edit_destroy(refine_edit_t* e);
 char* refine_edit_validate(const refine_edit_t* e);
 
 /* The evidence gate (spec §4, OURS): NULL = both seqs set and sane
-   (first <= last, both nonzero, first <= the frame's current seq is checked
-   at record-compose time); "edit without evidence" malloc'd otherwise. */
+   (first <= last, both nonzero); "edit without evidence" malloc'd
+   otherwise. The compose-time UPPER bound (first <= the frame's current
+   seq) is the RUNNERS' check — refine_run reads the frame's current seq
+   as the trajectory's scanned newest record (the only seq view a store
+   round trip exposes), so a citation past the scanned view refuses with
+   the gate's one string; an inverse (rollback) edit's evidence IS its
+   target record seq and never runs the bound. */
 char* refine_edit_evidence_check(const refine_edit_t* e);
 
 /* Apply one VALIDATED edit to the fold IN MEMORY (no store). Returns NULL
@@ -213,6 +223,72 @@ char* refine_review_call(frame_t* f, const refine_fold_t* fold,
                          char** trajectory_json,
                          refine_edit_t** edits, size_t* nedits,
                          char** summary, char** rationale);
+
+/* --- the runners (spec §3 + §5): the whole refine cycles, on the caller's
+   thread. The store actor stays the ONLY serializer: every write action is
+   ONE atomic FRM_STORE_BATCH through it (1 log record + one entry op per
+   applied edit — a full-entry put, or a real DELETE op on a withdrawal —
+   plus meta/fingerprint + meta/digest), and the harness log is APPEND-ONLY
+   (a rollback is a NEW record; an original record's text is never mutated).
+
+   The scope roots (spec §1): the LOCAL scope composes under the session
+   subtree ("<frame_sid>/harness/...", written by shared_scope = 0), the
+   SHARED scope is the ROOT "harness/" subtree (shared_scope != 0, like the
+   lineage graph ops' absolute root-level keys — no subtree handle). A
+   shared run's writes never touch the session subtree and vice versa; a
+   LOCAL run that names (update/delete) an entry living in the shared scope
+   refuses loud per edit ("%s targets a %s-scope entry from a %s
+   refinement") — the shared scope is READ-ONLY CONTEXT to a local run (its
+   entries render into the review prompt's marked shared_harness_context
+   section), and a local CREATE over a shared id is a session-local
+   override (PA's merge namespacing), never a cross-scope write.
+
+   The harness-log keys ride the events discipline ("log/<%020llu seq>",
+   frame.c's _frame_event_key pad): the fixed-width zero pad keeps the
+   keys' lexicographic order the seq order, so the fold's range scan
+   [<root>/log, <root>/log0) IS the ascending log and the rollback's
+   exact-record bounds [<root>/log/<seq>, <root>/log/<seq+1>) hit exactly
+   one stored key (spec §5 — log seqs are leaves).
+
+   The log's counter is restored ONCE per call from the fold (the newest
+   scanned record's seq; the same monotonic restore as frame.c's
+   _frame_restore_seq, gaps recorded identically) and allocated +1 per
+   record the call composes. The record's "evidence" object is
+   {"session",first_seq,last_seq,summary} for a normal refinement and
+   {"kind":"rollback","refineOf":<target seq>} for a rollback record (the
+   record text is what the store holds; the fold's parse accepts BOTH
+   shapes). The batch is cap-checked against the per-op entry/record caps
+   and SA_REFINE_BATCH_BYTES BEFORE the post — a refusal commits NOTHING.
+
+   THE LIBRARY NEVER PRINTS (the summary is the caller's): rc
+     0 = a refinement (or rollback) committed — *summary_out is the
+         frozen report (the per-edit applied/refused lines + the
+         "digest changed: <yes|no>" line against the STORED meta/digest)
+     1 = the store was untouched (a no-op or a refusal) — *summary_out:
+         refine: the frozen no-op banner ("no refinement committed (no
+         evidence-backed edits)"; a rollback with nothing to apply takes
+         it too — the fold would be unchanged, spec §4's record-skip gate)
+         rollback: the missing-target banner ("rollback: no refinement
+         record at seq <N>")
+    -1 = failed loud (the log carries it; *summary_out NULL) */
+
+/* ONE refine cycle (spec §3): fold the scope's log, review the trajectory
+   with the frame's OWN backend (the no-tools review call), validate +
+   evidence-gate + apply the proposal per edit, and commit the survivors in
+   ONE atomic batch. */
+int refine_run(frame_t* f, const char* instructions, uint8_t shared_scope,
+               char** summary_out);
+
+/* The rollback (spec §5): the exact-record scan over the target's log key
+   range, the inverses recomposed from the record's APPLIED edit elements
+   (a create inverts to a delete, an update/deletion inverts to the before
+   snapshot's create/update) applied with the CURRENT fold's version guards
+   re-checked (a later edit to the same entry gets its per-edit stale
+   rejection while the OTHER inverses still apply), then its own ONE batch:
+   the rollback record ("rollbackOf":<target seq>, the rollback evidence
+   shape on record and edits) + the entry ops + the meta pair. */
+int refine_rollback(frame_t* f, uint64_t seq, uint8_t shared_scope,
+                    char** summary_out);
 
 #endif /* SA_HAS_WDB */
 #endif /* SA_REFINE_H */
