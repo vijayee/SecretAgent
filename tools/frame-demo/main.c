@@ -32,6 +32,7 @@
 #include "../../src/Util/json.h"
 #include "../../src/Util/log.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -177,10 +178,14 @@ static int _demo_print_outcome(frame_t* f) {
 
 /* The refine summary print: the summary rides out VERBATIM (fputs, exact
    bytes — the library never prints; the demo is its printing surface) on a
-   commit or a loud no-op (rr 0 or 1). On rr -1 the summary is NULL by the
-   refine.h contract and the log hook already carried the failure — the demo
-   mirrors its existing engine-failure convention (a stderr line, exit 1)
-   and prints nothing. Returns 0 for rr >= 0, 1 for the failure. */
+   commit or a loud no-op (rr 0 or 1), with ONE demo-side rule: when the
+   frozen text itself carries no trailing newline (an empty summary takes
+   the same path) the demo adds a single one after the fputs, so the
+   summary never fuses with the next shell line. On rr -1 the summary is
+   NULL by the refine.h contract and the log hook already carried the
+   failure — the demo mirrors its existing engine-failure convention (a
+   stderr line, exit 1) and prints nothing. Returns 0 for rr >= 0, 1 for
+   the failure. */
 static int _demo_print_refine_summary(int rr, char** summary) {
   if (rr < 0) {
     fprintf(stderr,
@@ -188,7 +193,9 @@ static int _demo_print_refine_summary(int rr, char** summary) {
     return 1;
   }
   if (*summary != NULL) {
+    size_t len = strlen(*summary);
     fputs(*summary, stdout);
+    if (len == 0 || (*summary)[len - 1] != '\n') putchar('\n');
     free(*summary);
     *summary = NULL;
     fflush(stdout);
@@ -251,10 +258,15 @@ int main(int argc, char** argv) {
       char* end = NULL;
       errno = 0;
       unsigned long long seq = strtoull(text, &end, 10);
-      if (text[0] == '\0' || text[0] == '-' || end == text || *end != '\0' ||
-          errno == ERANGE) {
-        fprintf(stderr, "frame-demo: --refine-rollback needs a nonnegative "
-                "harness-log seq (got '%s')\n%s", text, SA_DEMO_USAGE);
+      /* The single LEADING-DIGIT check subsumes empty, a leading minus, and
+         whitespace-prefixed negatives (" -5": strtoull skips the space,
+         negates, and lands on seq - 1 with no error) — seq 0 is folded in
+         too (the log keys allocate from seq >= 1, refine.h's counter
+         restore). */
+      if (!isdigit((unsigned char)text[0]) || end == text || *end != '\0' ||
+          errno == ERANGE || seq == 0) {
+        fprintf(stderr, "frame-demo: --refine-rollback needs a positive "
+                "harness-log seq >= 1 (got '%s')\n%s", text, SA_DEMO_USAGE);
         return 2;
       }
       has_rollback = 1;
@@ -271,6 +283,13 @@ int main(int argc, char** argv) {
   if (want_refine && has_rollback) {
     fprintf(stderr, "frame-demo: --refine and --refine-rollback are mutually "
             "exclusive\n%s", SA_DEMO_USAGE);
+    return 2;
+  }
+  /* --refine-global only widens the scope of a refine action; with no refine
+     action requested it would ride silently ignored. */
+  if (refine_global && !want_refine && refine_sid == NULL && !has_rollback) {
+    fprintf(stderr, "frame-demo: --refine-global requires one of --refine, "
+            "--refine-sid, or --refine-rollback\n%s", SA_DEMO_USAGE);
     return 2;
   }
   if (model == NULL) {
