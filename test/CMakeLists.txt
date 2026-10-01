@@ -183,10 +183,13 @@ if (BUILD_TESTING)
         # cells run through the frame's own pyrt on real pool workers — the
         # same CPython-owned classes. TestFrame.TestInlineParentYieldsAwaiting
         # Children (Task 5's inline yield pin) runs a spawn cell the same way.
+        # TestRefine's opt-in live gate (Task 7: refine against a real model)
+        # seeds its trajectory with real loop turns — the same classes.
         if(_test_name MATCHES "^TestPyrt" OR _test_name MATCHES "^TestLoop" OR
            _test_name MATCHES "^TestLiveLoop" OR _test_name MATCHES "^TestPyAgent" OR
            _test_name MATCHES "^TestFrameTree" OR
-           _test_name MATCHES "^TestFrame.TestInlineParentYieldsAwaitingChildren$")
+           _test_name MATCHES "^TestFrame.TestInlineParentYieldsAwaitingChildren$" OR
+           _test_name MATCHES "^TestRefine.TestRefineLiveRefineAgainstRealModel$")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()
       endforeach()

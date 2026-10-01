@@ -10,16 +10,28 @@
 #include <cstring>
 #include <cstdlib>
 
+/* The parity rows 1-19 are network-free (scripted backends); the one live
+   gate at the file's end (TestRefineLiveRefineAgainstRealModel) is opt-in. */
+
 extern "C" {
 #include "../src/Util/allocator.h"
 #include "../src/Frame/refine.h"
 #include "../src/Frame/frame_internal.h"   /* Task 3's _frame_sync_* helpers */
 #include "../src/Frame/model_internal.h"   /* Task 4's _model_request_body */
+#include "../src/Frame/loop.h"             /* the live gate's frame_run_loop */
 #include "../src/Scheduler/scheduler.h"    /* the pooled-store refusal's pool */
 }
 
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <unistd.h>   /* mkdtemp (the live gate's scratch dir) */
+
+#if defined(SA_HAS_PYTHON)
+/* Declared bare (never through py_agent.h's <Python.h>): the live gate's
+   loop seed turns drive real cells through it. */
+extern "C" void py_agent_init(void);
+#endif
 
 /* Task 1's tests build folds in memory, so the seed helpers live here: the
    parse function's own round trips ride the store-actor tests (Task 3+).
@@ -3025,4 +3037,203 @@ TEST(TestRefine, TestFoldRefusesMalformedRollbackEvidence) {
   ASSERT_NE(ghost, nullptr) << "the malformed evidence gate kept the entry";
   EXPECT_EQ(ghost->version, 1u);
   refine_fold_destroy(&fold);
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 7: the opt-in LIVE refine gate (parity row 20)                 */
+/* ------------------------------------------------------------------ */
+
+/* mkdtemp over the TMPDIR base (the scratch-disk discipline: a fresh dir
+   the test creates and destroys, never the repo's demo database). */
+static std::string refi_temp_dir(void) {
+  const char* base = getenv("TMPDIR");
+  std::string tmpl = std::string((base != NULL && base[0] != '\0') ? base : "/tmp") +
+                     "/sa-refine-live-XXXXXX";
+  std::vector<char> buf(tmpl.begin(), tmpl.end());
+  buf.push_back('\0');
+  char* got = mkdtemp(buf.data());
+  if (got == NULL) return std::string();
+  return std::string(got);
+}
+
+/* Opt-in LIVE refine: SA_TEST_REFINE_LIVE=1 + SA_TEST_OLLAMA_URL +
+   SA_TEST_OLLAMA_MODEL. A REAL frame runs seed turns against the real
+   endpoint, then refine_run reviews the real trajectory. The OUTCOME-
+   independent assertions ONLY (models differ): rc is 0 or 1 (never -1
+   without a log_error line), the folded fingerprint + digest exist and the
+   stored meta/fingerprint matches the recomputed fold of the store's
+   records — outcome-dependent lesson CONTENT is never asserted. */
+TEST(TestRefine, TestRefineLiveRefineAgainstRealModel) {
+  const char* live = getenv("SA_TEST_REFINE_LIVE");
+  if (live == NULL || strcmp(live, "1") != 0) {
+    GTEST_SKIP() << "SA_TEST_REFINE_LIVE is not set to 1 — the live refine "
+                    "gate is opt-in (set SA_TEST_REFINE_LIVE=1 with "
+                    "SA_TEST_OLLAMA_URL and SA_TEST_OLLAMA_MODEL)";
+  }
+  const char* url = getenv("SA_TEST_OLLAMA_URL");
+  if (url == NULL || url[0] == '\0') {
+    GTEST_SKIP() << "SA_TEST_OLLAMA_URL is not set — an opt-in live gate "
+                    "never touches the network without an explicit endpoint";
+  }
+  const char* model_env = getenv("SA_TEST_OLLAMA_MODEL");
+  if (model_env == NULL || model_env[0] == '\0') {
+    GTEST_SKIP() << "SA_TEST_OLLAMA_MODEL is not set — name a served model "
+                    "tag for the review pass";
+  }
+
+  /* The same frame-config shape the live loop gate rides (one
+     OpenAI-compatible endpoint, no key) with a WIDER per-call timeout:
+     the live TEST's review pass is ONE BIG no-tools completion over the
+     whole trajectory view — a local model answers it slower than the
+     loop's short turns (TestLiveLoop's 180 s bound timed out on exactly
+     that turn here), so this gate carries 600 s: still a loud, bounded
+     failure instead of a hang. */
+  frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));   /* additive fields (pool) default sensibly */
+  cfg.model_base_url = url;
+  cfg.model_api_key = NULL;   /* Ollama-compatible: no key */
+  cfg.model_name = model_env;
+  cfg.max_depth = 4;
+  cfg.model_timeout_ms = 600000;
+
+  std::string dir = refi_temp_dir();
+  ASSERT_FALSE(dir.empty());
+  std::string loc = dir + "/db";
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+
+  /* Seed turns: a REAL frame runs the plan's literal goal against the real
+     endpoint (the live loop gate's shape — real cells through the bridge
+     when the build carries the python runtime), then real msg turns ride on
+     top so the trajectory is non-empty even when the model narrates instead
+     of acting: a narrating or empty loop is TOLERATED (the loop gate
+     TestLiveLoop owns the loop's assertions; this gate's subject is the
+     refine cycle over whatever the trajectory earned). */
+  frame_t* f = frame_create(db, NULL, "remember the word 'wave' then report it",
+                            &cfg);
+  ASSERT_NE(f, nullptr);
+  frame_set_loop_turn_cap(f, 8);
+#if defined(SA_HAS_PYTHON)
+  py_agent_init();
+  int loop_rc = frame_run_loop(f);
+  if (loop_rc != 0) loop_rc = frame_run_loop(f);   /* one full-run retry */
+  if (loop_rc != 0) {
+    char* raw = frame_debug_events(f);
+    fprintf(stdout, "[  AUDIT  ] the live seed loop never completed; "
+                    "the refine review still runs on the frame's events. "
+                    "control events: %s\n", raw ? raw : "(none)");
+    fflush(stdout);
+    free(raw);
+  }
+#endif
+
+  ASSERT_EQ(frame_append_msg(f, "user", "the live seed turn ran a real model"),
+            0);
+  ASSERT_EQ(frame_append_msg(f, "assistant", "noted the session's shape"), 0);
+
+  /* The refine cycle against the REAL model: whatever it proposes carries
+     or loses the evidence gate — rc 0 commits, rc 1 is the clean no-op
+     (the loud rc==1 shape IS a pass). */
+  char* summary = NULL;
+  int rc = refine_run(f, "The trajectory ran a real model's turns; persist "
+                         "ONE memory lesson about what this session's run "
+                         "did, citing the event seqs it rests on; commit "
+                         "nothing that the trajectory does not evidence.", 0,
+                      &summary);
+  EXPECT_TRUE(rc == 0 || rc == 1)
+      << "a live refine returns 0 or 1, never a -1 without its log_error "
+         "line; summary: " << (summary != NULL ? summary : "(null)");
+
+  std::string sid = frame_sid(f);
+  std::string root = sid + "/harness";
+  auto records = refi_scan_values(f, root + "/log", root + "/log0", 0);
+  auto stored_fp = refi_stored_meta(f, root, "fingerprint");
+  auto stored_digest = refi_stored_meta(f, root, "digest");
+
+  if (rc == 1) {
+    /* The no-op shape: the summary learns it, the store is untouched. */
+    ASSERT_NE(summary, nullptr);
+    fprintf(stdout, "[  AUDIT  ] live refine no-op: %s\n", summary);
+    fflush(stdout);
+    free(summary);
+    summary = NULL;
+    EXPECT_EQ(records.size(), 0u) << "a no-op commits no record";
+    for (int k = 0; k < REFINE_KINDS_COUNT; k++) {
+      std::string base = std::string(root) + "/entry/" + REFINE_KINDS[k];
+      EXPECT_EQ(refi_scan_values(f, base, base + "0", 0).size(), 0u)
+          << "a no-op commits no " << REFINE_KINDS[k] << " entry";
+    }
+    EXPECT_EQ(stored_fp.size(), 0u) << "a no-op commits no meta";
+    EXPECT_EQ(stored_digest.size(), 0u);
+  } else if (rc == 0) {
+    /* The commit shape — the OUTCOME-INDEPENDENT derivation assertion: the
+       stored meta/fingerprint is byte-equal to the recomputed fold of the
+       store's own records, and the folded fingerprint + digest exist.
+       Nothing here asserts what the model decided to learn. */
+    ASSERT_NE(summary, nullptr);
+    fprintf(stdout, "[  AUDIT  ] live refine committed: %s\n", summary);
+    fflush(stdout);
+    free(summary);
+    summary = NULL;
+    ASSERT_GE(records.size(), 1u)
+        << "one refine_run on a fresh session subtree commits one record";
+
+    std::string joint = "[";
+    for (size_t i = 0; i < records.size(); i++) {
+      if (i > 0) joint += ",";
+      joint += refi_json_quote(records[i]);
+    }
+    joint += "]";
+    refine_fold_t fold;
+    mk_fold_init(&fold);
+    ASSERT_EQ(refine_fold_parse(joint.c_str(), &fold), 0)
+        << "the store's OWN records fold: " << joint;
+    EXPECT_EQ(fold.nrecords, records.size());
+    char* fp = refine_fold_fingerprint(&fold);
+    EXPECT_NE(fp, nullptr) << "the folded fingerprint exists";
+    char* digest = refine_fold_digest(&fold);
+    EXPECT_NE(digest, nullptr) << "the folded digest exists";
+    if (fp != nullptr && digest != nullptr) {
+      EXPECT_EQ(stored_fp.size(), 16u) << "the stored fingerprint is 16 hex";
+      EXPECT_EQ(stored_fp, std::string(fp))
+          << "the stored meta/fingerprint matches the recomputed fold";
+      EXPECT_EQ(stored_digest, std::string(digest))
+          << "the stored meta/digest matches the recomputed fold";
+    }
+    free(fp);
+    free(digest);
+    refine_fold_destroy(&fold);
+
+    /* The committed record's structure (never its lesson content): the
+       newest record parses, carries a mint id + a non-empty applied-edits
+       array whose elements stay evidence-cited (the spec §4 gate, the one
+       rule a live model is REQUIRED to have followed). */
+    json_value_t* rec = refi_parse_record(records.back());
+    ASSERT_NE(rec, nullptr) << records.back();
+    EXPECT_EQ(refi_str(rec, "id").find("refine_"), 0u) << records.back();
+    EXPECT_EQ(json_as_int(json_get(rec, "seq")),
+              (int64_t) records.size());
+    json_value_t* edits = json_get(rec, "edits");
+    ASSERT_NE(edits, nullptr);
+    ASSERT_GE(json_size(edits), 1u);
+    for (size_t i = 0; i < json_size(edits); i++) {
+      json_value_t* el = json_at(edits, i);
+      ASSERT_NE(el, nullptr);
+      EXPECT_EQ(json_as_bool(json_get(el, "applied")), 1)
+          << "every committed edit applied (refusals never commit)";
+      json_value_t* ev = json_get(el, "evidence");
+      ASSERT_NE(ev, nullptr) << records.back();
+      EXPECT_GE(json_as_int(json_get(ev, "first_seq")), (int64_t) 1)
+          << "the lesson names the event seqs it rests on";
+      EXPECT_GE(json_as_int(json_get(ev, "last_seq")),
+                json_as_int(json_get(ev, "first_seq")))
+          << "the evidence span is sane";
+    }
+    json_value_destroy(rec);
+  }
+  if (summary != NULL) free(summary);
+
+  frame_destroy(f);
+  wave_db_close(db);
+  std::filesystem::remove_all(dir);
 }
