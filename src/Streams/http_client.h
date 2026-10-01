@@ -26,4 +26,12 @@ int http_client_submit(http_client_t* c, const char* url, const char* api_key,
 /* Cancels in-flight requests this client owns and destroys it. Callbacks
    that have not fired will NEVER fire (the caller owns ctx cleanup). */
 void http_client_destroy(http_client_t* c);
+/* Fire-and-forget teardown for the client's OWN completion context (the
+   loop thread — model.c's submit relay; http_client_destroy from there
+   deadlocks, it joins the loop's destroy op). Dead-marks + enqueues the
+   destroy op and RETURNS: the op cancels/tears down in-flight requests,
+   then frees the record — nothing waits, nobody frees afterward. The
+   client must have no other submits (one-shot client, nothing user-side
+   outlives its own completion). */
+void http_client_defer_destroy(http_client_t* c);
 #endif // SA_HTTP_CLIENT_H

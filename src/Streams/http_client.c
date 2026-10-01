@@ -139,11 +139,14 @@ struct http_client_req_t {
 
 /* destroy's wait record: the caller waits until the loop thread's destroy
    op ran — after that, no callback of this client can fire (the destroy op
-   is the last op enqueued for the client, and the loop thread is serial). */
+   is the last op enqueued for the client, and the loop thread is serial).
+   owned = the deferred teardown's HEAP record (http_client_defer_destroy):
+   no waiter exists, so the destroy op itself finishes the record there. */
 typedef struct client_destroy_joiner_t {
   platform_mutex_t* mutex;
   platform_condvar_t* cv;
   int done;
+  int owned;
 } client_destroy_joiner_t;
 
 /* ---------------- moved helpers (src/Net/http.c) ---------------- */
@@ -788,6 +791,18 @@ static void _op_client_destroy(void* p) {
   }
   _op_drain(c);
 
+  if (joiner->owned) {
+    /* The deferred teardown (http_client_defer_destroy): no waiter exists —
+       the record's last pieces die right here, loop-serial. The only submit
+       on a defer-destroyed client completed long before (its own completion
+       enqueued this op; the documented single-consumer rule), so nothing
+       user-side can hold or wait on the lock. */
+    platform_mutex_destroy(c->lock);
+    free(c);
+    free(joiner);
+    return;
+  }
+
   platform_mutex_lock(joiner->mutex);
   joiner->done = 1;
   platform_condvar_signal(joiner->cv);
@@ -944,6 +959,7 @@ void http_client_destroy(http_client_t* c) {
   joiner.mutex = platform_mutex_create();
   joiner.cv = platform_condvar_create();
   joiner.done = 0;
+  joiner.owned = 0;   /* http_client_destroy's stack record: a waiter frees the record */
   if (joiner.mutex == NULL || joiner.cv == NULL) {
     log_error("http_client_destroy: joiner primitives failed");
     abort();
@@ -1012,4 +1028,61 @@ void http_client_destroy(http_client_t* c) {
   }
   platform_mutex_destroy(joiner.mutex);
   platform_condvar_destroy(joiner.cv);
+}
+
+void http_client_defer_destroy(http_client_t* c) {
+  if (c == NULL) return;
+
+  /* One consumer, by contract: the MODEL RELAY's completion (model.c), which
+     runs ON the loop thread — http_client_destroy from there would join the
+     loop's destroy op while BEING that thread's current work (a 10 s wait,
+     then the fail-loud abort). This variant dead-marks and enqueues and
+     returns; the destroy op itself finishes the record (the joiner's owned
+     flag), so nothing waits and nothing frees afterward. The client it is
+     called on must have no other submits — a one-shot client outlived by
+     nothing but its own completion, which is exactly what the relay owns. */
+  client_destroy_joiner_t* joiner =
+      (client_destroy_joiner_t*)get_clear_memory(sizeof(client_destroy_joiner_t));
+  joiner->owned = 1;
+
+  platform_mutex_lock(c->lock);
+  if (c->dead) {
+    platform_mutex_unlock(c->lock);
+    free(joiner);
+    return;
+  }
+  c->dead = 1;
+  c->destroy_joiner = joiner;
+  int rc = streams_loop_call(c->lt, _op_client_destroy, c);
+  platform_mutex_unlock(c->lock);
+
+  if (rc != 0) {
+    /* The loop thread is gone: nothing on it can race or fire, and no op
+       will ever run — teardown locally, the same fallback destroy takes. */
+    log_error("http_client_defer_destroy: loop thread gone; tearing down "
+              "locally");
+    http_client_req_t* req = c->inflight;
+    while (req != NULL) {
+      http_client_req_t* next = req->next;
+      if (req->fd >= 0) {
+        close(req->fd);   /* the loop died without stopping this transport */
+        req->fd = -1;
+      }
+      _req_free_request_side(req);
+      free(req);
+      req = next;
+    }
+    c->inflight = NULL;
+    req = c->deferred;
+    while (req != NULL) {
+      http_client_req_t* next = req->next;
+      free(req->dec_buf);
+      free(req);
+      req = next;
+    }
+    c->deferred = NULL;
+    platform_mutex_destroy(c->lock);
+    free(joiner);
+    free(c);
+  }
 }
