@@ -1509,7 +1509,12 @@ a leaked batch payload or a stranded store reply shows here first.
   && echo "VIOLATION: a lock in the frame layer"; } || echo "no locks in the frame layer"
 ```
 Expected: "no locks in the frame layer" — the store actor is the ONLY serializer. This
-is the owner's amendment turned into evidence.
+is the owner's amendment turned into evidence. SCOPE AMENDMENT (Task 6's fold-in): the
+grep that must come back clean is over the frame-ENGINE files — frame.c /
+frame_internal.h / loop.c / frame_messages.h / frame.h; `src/Frame/model.c` legitimately
+holds the `_model_loop_guard` install-once mutex and the completion-pair record mutexes
+(process-lifetime primitives OFF the turn-dispatch path), so its hits are the recorded
+exception — the store actor remains the only serializer of frame state.
 
 - [ ] **Step 4: The live gate rides the event-driven engine + the store actor**
 
