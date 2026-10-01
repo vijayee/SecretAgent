@@ -27,7 +27,11 @@
 #include "frame_messages.h"
 #include "model.h"                    /* model_reply_t (the engine state's
                                          in-flight turn reply) */
+#include "../Util/atomic_compat.h"    /* ATOMIC(T) — the lifetime handoff
+                                         fields below */
 #include "../Util/json.h"
+
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -111,10 +115,45 @@ typedef struct frame_engine_state_t {
                                   the engine between the model arrival and its
                                   path's dispatch turn (the CELL_RUN reply
                                   runs the cell out of it) */
+
+  /* --- the async submit's LIFETIME HANDOFF (lock-free; atomics are
+     house-legal — the frame layer stays lock-free post store-actor) ------
+
+     The engine hands the bare frame_t* to the backend's sink (loop.c's
+     _loop_model_sink via model.c's relay), and that sink may outlive BOTH
+     the turn and the frame: frame_destroy mid-turn would free the record
+     under a completion that has not fired yet. The submit step ACQUIRES one
+     slot before submit(); the sink's completion RELEASES it; a destroy with
+     a slot held marks die_requested and DEFERS its teardown to the LAST
+     release (frame.c's claim protocol — the record stays alive until then,
+     so every late touch of the record's own atomics is safe). The SYNC path
+     never acquires: only a real in-flight submit counts. */
+  ATOMIC(uint32_t) pending_submits;    /* acquire/release per async submit;
+                                          frame_internal.h's teardown CLAIM
+                                          lands here too (SA_ENGINE_SUBMIT_CLAIM) */
+  ATOMIC(uint8_t) die_requested;       /* 1 = a frame_destroy ran (or defers)
+                                          mid-turn; the engine must not repost
+                                          into the dead mailbox */
+  ATOMIC(uint8_t) submit_inflight;     /* 1 while the engine thread is INSIDE
+                                          submit(): a sink firing synchronously
+                                          there stands down its teardown — the
+                                          engine stays the record's owner until
+                                          it settles (frame.c) */
 } frame_engine_state_t;
+
+/* The teardown CLAIM marker inside pending_submits: exactly one agent (the
+   destroy that found no slot held, or the sink's last release on a
+   die-requested frame — the CAS in frame.c arbitrates) ever holds it, and
+   that agent runs _frame_destroy_run. */
+#define SA_ENGINE_SUBMIT_CLAIM UINT32_MAX
 
 /* The engine state's accessor (NULL on a dead/unknown frame). */
 frame_engine_state_t* _frame_engine_state(frame_t* f);
+
+/* The die-requested flag's atomic read (loop.c's model sink + completion
+   handler gate against a dying frame): 0 = clear, 1 = a frame_destroy ran
+   (or defers) mid-turn. 0 for a NULL frame. */
+uint8_t _frame_engine_die_requested(const frame_t* f);
 
 /* Engine handlers (loop.c implements, frame.c's _frame_behavior routes): */
 
@@ -153,6 +192,35 @@ void _frame_engine_cell_done(frame_t* f);
    bookkeeping + resume-only-a-live-engine. CONSUMES the payload on every
    path. */
 void _frame_engine_child_report(frame_t* f, frm_child_report_payload_t* payload);
+
+/* --- the async submit's lifetime handoff (frame.c implements; loop.c's
+   submit step + model sink call them) ------------------------------------- */
+
+/* Acquire ONE pending-submit slot + mark the engine's submit as in flight.
+   The engine calls this BEFORE handing the derived messages to a backend's
+   submit() — the sink's completion may outlive both the turn and
+   frame_destroy itself. */
+void _frame_engine_submit_begin(frame_t* f);
+
+/* Release ONE pending-submit slot (the sink's completion, or the engine's
+   own submit-reject path where the sink will never fire). Returns 1 when
+   THIS release was last on a die-requested frame and it ran the deferred
+   teardown inside itself: the frame record is GONE and the caller must not
+   touch the frame (or anything borrowed from it) again. 0 otherwise.
+   (A release while the engine thread is inside submit() — a synchronous
+   sink fire — only unbinds the slot; the ENGINE settles the record, see
+   _frame_engine_submit_settle.) */
+uint8_t _frame_engine_submit_release(frame_t* f);
+
+/* The engine's post-submit settle (loop.c calls right after submit returns
+   and the derived messages are destroyed): clears the in-flight marker, and
+   on a die-requested frame whose slots are all back (the synchronous-fire
+   sink stood down) the ENGINE is the record's last owner — this claims +
+   runs the deferred teardown. Returns 1 when the record is GONE (the caller
+   must not touch f again); 0 = slots still out or the normal non-die flow —
+   the call falls through to the ordinary turn step (the die gate refuses
+   every later repost into the dead mailbox). */
+uint8_t _frame_engine_submit_settle(frame_t* f);
 
 /* The sync driver's pump deadlines (the cell deadline SA_LOOP_CELL_WAIT_MS
    60000 already lives in loop.c): a config-slow model's own timeout + slack

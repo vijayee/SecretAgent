@@ -533,7 +533,13 @@ static int _loop_post_turn(frame_t* f) {
    completes on (the streams loop thread; a test backend synchronously within
    submit — µs-scale either way: field writes + one post, NO decode here),
    it moves body/error ownership into the FRM_MODEL_RESULT payload the
-   frame's own dispatch decodes. */
+   frame's own dispatch decodes.
+
+   The sink also OWNS one pending-submit slot (frame_internal.h's lifetime
+   handoff: the engine's submit step acquired it for exactly this
+   completion) — every exit from the sink releases it, and the release of a
+   die-requested frame runs the deferred teardown (frame.c: the record dies
+   exactly once, on whichever thread got there last). */
 static void _loop_model_sink(void* ctx, int status, char* body,
                              size_t body_len, char* error) {
   frame_t* f = (frame_t*)ctx;
@@ -544,12 +550,27 @@ static void _loop_model_sink(void* ctx, int status, char* body,
     free(error);
     return;
   }
+  if (_frame_engine_die_requested(f) != 0) {
+    /* The frame died under the in-flight submit — frame_destroy mid-turn
+       marked die_requested and DEFERRED its teardown to this release: the
+       record is alive (only its mailbox and the engine are dead), so this
+       gate is safe to read, and past it NOTHING on the frame is touched.
+       The completion is unusable now; the body/error die here. */
+    log_error("loop: the model completion arrived after the frame '%s' died "
+              "— dropped loud; the slot's release runs the deferred teardown",
+              frame_sid(f));
+    free(body);
+    free(error);
+    (void)_frame_engine_submit_release(f);   /* may free f inside */
+    return;
+  }
   frm_model_payload_t* p = get_clear_memory(sizeof(frm_model_payload_t));
   if (p == NULL) {
     log_error("loop: the model completion payload failed to allocate at '%s' — "
               "the completion is dropped loud", frame_sid(f));
     free(body);
     free(error);
+    (void)_frame_engine_submit_release(f);
     return;
   }
   p->status = status;
@@ -558,16 +579,21 @@ static void _loop_model_sink(void* ctx, int status, char* body,
   p->error = error;
   actor_t* mailbox = _frame_actor(f);
   if (mailbox == NULL) {
-    /* The frame died under the in-flight submit: the completion is unusable
-       now. The decode side would answer it with the unmatched-arrival drop —
-       skip the dead mailbox and drop loud here. */
+    /* Defensive only (the handoff keeps the record alive over the slot; the
+       actor is embedded): if the mailbox is ever missing, the completion is
+       unusable — drop loud and RELEASE (the slot's duty moved here). */
     log_error("loop: the model completion arrived after the frame '%s' died "
               "— dropped loud", frame_sid(f));
     frm_model_payload_destroy(p);
+    (void)_frame_engine_submit_release(f);
     return;
   }
+  /* The last-mile race is _frame_post's own DESTROY-flag gate: a destroy
+     that lands right after the die check above has flagged the actor, and
+     the post drops the payload loud instead of entering the dying queue. */
   _frame_post(mailbox, (uint32_t)FRM_MODEL_RESULT, p,
               frm_model_payload_destroy, "model result");
+  (void)_frame_engine_submit_release(f);   /* the slot's owner lets go last */
 }
 
 /* The derive's store round trip (the turn step's yield): compose the events
@@ -779,9 +805,26 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
     /* The ASYNC shape (Task 4's http submit): rc 0 → the sink fires EXACTLY
        ONCE (FRM_MODEL_RESULT) and the engine yields in FRAME_PHASE_MODEL;
        rc != 0 = rejected before any I/O — the sink will NEVER fire. */
+    /* The lifetime handoff's begin: ONE pending-submit slot held from
+       BEFORE the submit until the sink's release (frame.c's claim protocol)
+       — frame_destroy mid-turn then DEFERS its teardown to that sink's last
+       release instead of freeing the record under the completion it still
+       carries. The sync path (below) never acquires: only a real in-flight
+       submit counts. `_frame_engine_submit_settle` right after the submit
+       clears the in-flight marker and — a destroy having raced the call —
+       runs the deferred teardown on this, the record's last-owner thread:
+       a settle returning 1 means the record is GONE and nothing of `f`/`e`
+       may follow that return. */
+    _frame_engine_submit_begin(f);
     int src = mb->submit(mb, messages, NULL, _loop_model_sink, f);
     json_value_destroy(messages);
+    if (_frame_engine_submit_settle(f) != 0) return;
     if (src != 0) {
+      /* Rejected before any I/O: the sink will never fire, so THIS caller
+         releases its slot. A concurrent destroy's deferral ends here too:
+         a release that returns 1 means the record is GONE — the engine
+         state died inside the release and nothing of `f` may follow. */
+      if (_frame_engine_submit_release(f) != 0) return;
       log_error("loop: the model submit was rejected (the sink will never "
                 "fire) at '%s'", frame_sid(f));
       _loop_control(f, "submit-failed", NULL);
@@ -1040,6 +1083,17 @@ void _frame_engine_model_arrived(frame_t* f, frm_model_payload_t* payload) {
     log_error("loop: an unmatched model completion at '%s' — dropped loud",
               (f != NULL) ? frame_sid(f) : "?");
     if (payload != NULL) frm_model_payload_destroy(payload);
+    return;
+  }
+  if (_frame_engine_die_requested(f) != 0) {
+    /* A completion dispatched into a dying frame (a destroy raced the
+       mailbox): loud drop, and — the die rule — NO FRM_TURN repost and NO
+       engine step into a record whose teardown owns everything. The
+       payload's ownership dies here. */
+    log_error("loop: a model completion dispatched into the dying frame "
+              "'%s' — dropped loud (no turn continuation is reposted into "
+              "the dead mailbox)", frame_sid(f));
+    frm_model_payload_destroy(payload);
     return;
   }
   e->phase = FRAME_PHASE_NONE;

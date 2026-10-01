@@ -2437,6 +2437,12 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
      from the config attaches the actor to that pool — the engine
      (frame_start) schedules onto it instead. */
   actor_init(&f->actor, f, _frame_behavior, f->pool);
+  /* The engine-state atomics (frame_internal.h's lifetime handoff) are
+     stored to explicitly — the record's zeroing is not a defined-value
+     atomic initialization. */
+  ATOMIC_STORE(&f->engine.pending_submits, 0);
+  ATOMIC_STORE(&f->engine.die_requested, 0);
+  ATOMIC_STORE(&f->engine.submit_inflight, 0);
   return f;
 
 fail:
@@ -2592,6 +2598,11 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
   }
 
   actor_init(&f->actor, f, _frame_behavior, f->pool);
+  /* Explicit atomic init, as in frame_create (frame_internal.h's lifetime
+     handoff starts clear on the resume path too). */
+  ATOMIC_STORE(&f->engine.pending_submits, 0);
+  ATOMIC_STORE(&f->engine.die_requested, 0);
+  ATOMIC_STORE(&f->engine.submit_inflight, 0);
   return f;
 
 fail:
@@ -2650,8 +2661,12 @@ uint8_t frame_is_done(const frame_t* f) {
   return done ? 1 : 0;
 }
 
-void frame_destroy(frame_t* f) {
-  if (f == NULL) return;
+/* The teardown body — runs EXACTLY ONCE per frame, from the frame's first
+   thread able to: frame_destroy directly when no async submit slot is held,
+   or the model sink's LAST release (the engine's lifetime handoff,
+   _frame_engine_submit_release) when a destroy marked die_requested and
+   deferred. Everything below frees; the record dies at the tail. */
+static void _frame_destroy_run(frame_t* f) {
 #ifdef SA_HAS_PYTHON
   /* The runtime must stop BEFORE the mailbox it posts into is drained (its
      worker thread and TLS point at the frame actor; the join is bounded). A
@@ -2718,6 +2733,141 @@ void frame_destroy(frame_t* f) {
     f->owned_backend = NULL;
   }
   free(f);
+}
+
+/* The engine's lifetime handoff (frame_internal.h's contract): the ASYNC
+   submit path holds the bare frame across the backend's completion — a
+   frame_destroy mid-turn used to free the record under a pending sink and
+   the sink then dereferenced the freed memory before its own death check
+   could ever see it. The fix is lock-free (the plan's shape (b) — no locks,
+   atomics are house-legal): the submit step holds one slot for the
+   duration; destroy marks die_requested and, on a held slot, DEFERS
+   EVERYTHING — the record and all its owned memory stay alive, and the
+   LAST release (the sink itself) runs _frame_destroy_run. The decision is
+   a CAS-CLAIM on pending_submits so the destroy thread and the sink's
+   final release can never both read "now free" and tear down twice.
+
+   Ownership order at destroy time (die FIRST, everything after watches it):
+     1. die_requested := 1 — the sink's death gate stops touching the frame
+        (beyond the still-alive record's own atomics) as soon as any
+        destroy is in play;
+     2. CAS(pending_submits 0 -> CLAIM): winning it means NO slot is held —
+        run the teardown HERE. Failing means slots are held — mark ACTOR_FLAG
+        DESTROY so every late post refuses loud through _frame_post's own
+        gate, log, and let the last release claim + run the teardown. */
+void frame_destroy(frame_t* f) {
+  if (f == NULL) return;
+  if (atomic_exchange(&f->engine.die_requested, 1) != 0) {
+    /* Already dying: a deferred destroy (or its last release) owns the
+       teardown — this call must not touch the record (the first dyer's
+       claim already decided how it ends; a teardown may even be running
+       right now, so nothing on `f` is read past this point). Loud, bare. */
+    log_error("frame: frame_destroy re-entered on a die-requested frame — "
+              "ignored (the deferred teardown's owner runs it)");
+    return;
+  }
+  uint32_t expect = 0;
+  if (atomic_compare_exchange_strong(&f->engine.pending_submits, &expect,
+                                     SA_ENGINE_SUBMIT_CLAIM)) {
+    if (atomic_load(&f->engine.submit_inflight) != 0) {
+      /* The CLAIM wins while the engine thread is INSIDE its submit call
+         (a synchronous sink fire released already): that engine is still
+         running its post-submit flow on this record, so give the CLAIM
+         back — the engine settles the deferred teardown itself. */
+      expect = SA_ENGINE_SUBMIT_CLAIM;
+      (void)atomic_compare_exchange_strong(&f->engine.pending_submits, &expect, 0);
+      atomic_fetch_or(&f->actor.flags, ACTOR_FLAG_DESTROY);
+      log_error("frame: '%s' was destroyed mid-turn inside its own model "
+                "submit — the engine settles the deferred teardown (no lock)",
+                f->sid_path);
+      return;
+    }
+    /* No slot held, no submit in flight: the destroy IS the last releaser —
+       tear down now. */
+    _frame_destroy_run(f);
+    return;
+  }
+  if (expect == SA_ENGINE_SUBMIT_CLAIM) {
+    /* Another agent already claimed the record's end — never double-run. */
+    return;
+  }
+  /* Slots held: the record stays alive; the last release runs the teardown.
+     Refuse everything further through the actor's own destroy flag, so even
+     a sink mid-flight inside its die check (die was still 0 then) finds its
+     post dropped loud by _frame_post — never a post into a dying queue. */
+  atomic_fetch_or(&f->actor.flags, ACTOR_FLAG_DESTROY);
+  log_error("frame: '%s' was destroyed mid-turn with a pending async model "
+            "submit — the teardown defers to the sink's last release "
+            "(die-requested; no lock, the record stays alive until then)",
+            f->sid_path);
+}
+
+/* The die-requested flag's atomic read (frame_internal.h's contract: the
+   loop-side's die gate — the model sink and the completion handler — cannot
+   reach the engine state's atomics through the incomplete frame_t). */
+uint8_t _frame_engine_die_requested(const frame_t* f) {
+  return (f != NULL) ? atomic_load(&f->engine.die_requested) : 0;
+}
+
+/* The engine's submit step: ONE slot held from BEFORE the submit until the
+   sink's release; the sink's completion (or the engine's own submit-reject
+   path — that sink will never fire) gives it back. The LAST release — or
+   the engine's post-submit settle — on a die-requested frame claims the
+   record (CAS against destroy's own claim) and runs the deferred teardown,
+   exactly once per frame, on whichever thread got there last. */
+void _frame_engine_submit_begin(frame_t* f) {
+  if (f == NULL) return;
+  atomic_fetch_add(&f->engine.pending_submits, 1);
+  atomic_store(&f->engine.submit_inflight, 1);
+}
+
+uint8_t _frame_engine_submit_release(frame_t* f) {
+  if (f == NULL) return 0;
+  uint32_t before = atomic_fetch_sub(&f->engine.pending_submits, 1);
+  /* The die read comes after the sub (the record is alive either way — both
+     this release's slot and destroy's deferral pin it). */
+  if (before != 1 || atomic_load(&f->engine.die_requested) == 0) return 0;
+  if (atomic_load(&f->engine.submit_inflight) != 0) return 0;
+  /* Last slot off a dying frame — but NEVER from inside the engine's own
+     submit call (a synchronous sink fire): the engine thread still runs its
+     post-submit flow on this record and settles instead. Otherwise claim
+     the teardown. Losing the CAS means another agent (a destroy that found
+     zero slots; another release under a concurrent re-acquire) owns it —
+     this caller stands down, silently, without touching the record. */
+  uint32_t expect = 0;
+  if (!atomic_compare_exchange_strong(&f->engine.pending_submits, &expect,
+                                      SA_ENGINE_SUBMIT_CLAIM)) {
+    return 0;
+  }
+  _frame_destroy_run(f);
+  return 1;
+}
+
+uint8_t _frame_engine_submit_settle(frame_t* f) {
+  if (f == NULL) return 0;
+  if (atomic_load(&f->engine.die_requested) == 0) {
+    atomic_store(&f->engine.submit_inflight, 0);
+    return 0;
+  }
+  /* Die-requested. Keep the inflight marker up THROUGH the decision — a
+     destroy that just won the CLAIM stands down the moment it sees it, so
+     this engine thread cannot race a teardown over the freed record. */
+  for (;;) {
+    if (atomic_load(&f->engine.pending_submits) != 0) {
+      /* A slot is still out — its sink owes the release; the die gate (and
+         the actor's own refuse) cover the wait. */
+      atomic_store(&f->engine.submit_inflight, 0);
+      return 0;
+    }
+    uint32_t expect = 0;
+    if (!atomic_compare_exchange_strong(&f->engine.pending_submits, &expect,
+                                        SA_ENGINE_SUBMIT_CLAIM)) {
+      continue;   /* a just-unclaiming destroy — retry */
+    }
+    atomic_store(&f->engine.submit_inflight, 0);
+    _frame_destroy_run(f);
+    return 1;
+  }
 }
 
 /* --- store operations ---------------------------------------------------- */

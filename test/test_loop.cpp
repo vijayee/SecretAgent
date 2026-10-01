@@ -31,10 +31,13 @@ extern "C" void py_agent_init(void);
    cells really run (both WDB and PYTHON). */
 #if defined(SA_HAS_WDB)
 
-/* NOTE on the guard idiom: C preprocessor macros cannot be joined with `&&` —
-   the plan's listing note is honored by writing the real form below:
-     #if defined(SA_HAS_WDB) && defined(SA_HAS_PYTHON)   */
-#if defined(SA_HAS_PYTHON)
+/* The engine's private contract (frame_internal.h): the mid-turn-destroy pin
+   below drives the frame's round-trip surface BY HAND (_frame_pump) to reach
+   the submit boundary (phase=MODEL, one slot held) deterministically and
+   single-threaded. */
+extern "C" {
+#include "../src/Frame/frame_internal.h"
+}
 
 static frame_config_t test_config(void) {
   frame_config_t cfg;
@@ -45,6 +48,11 @@ static frame_config_t test_config(void) {
   cfg.max_depth = 4;
   return cfg;
 }
+
+/* NOTE on the guard idiom: C preprocessor macros cannot be joined with `&&` —
+   the plan's listing note is honored by writing the real form below:
+     #if defined(SA_HAS_WDB) && defined(SA_HAS_PYTHON)   */
+#if defined(SA_HAS_PYTHON)
 
 /* Scripted model: pops pre-queued raw OpenAI-shaped replies; when the queue
    empties it answers with `fallback` (the turn-cap test's always-tool-calling
@@ -527,6 +535,91 @@ TEST(TestLoop, TestAsyncScriptedBackendDrivesTheSameEngine) {
 }
 
 #endif /* python gate */
+
+/* --- the mid-turn-destroy pin (the frame lifetime's red/green) ------------
+
+   THE HAZARD: the engine hands the bare frame_t* to the model sink, and the
+   backend may complete it at ANY point — including AFTER frame_destroy
+   freed the record mid-turn. The sink then dereferenced freed memory
+   (frame_sid(f), _frame_actor(f)) BEFORE its own death check could ever see
+   the death: no lock exists or should exist, so the die cannot be detected
+   by reading the dying record itself.
+
+   THE FIX's shape (frame.c/frame_internal.h): the submit step holds ONE
+   pending-submit slot before submit(); the sink's release gives it back;
+   frame_destroy mid-turn marks die_requested (and the actor's DESTROY
+   refuse) and DEFERS its teardown while a slot is held — the LAST release
+   runs the teardown instead of freeing underneath anyone.
+
+   DETERMINISTIC SEQUENCING (documented honestly): a TRUE concurrent
+   mid-turn destroy cannot be staged deterministically, so the test replays
+   the load-bearing ordering single-threaded — the completion fires on the
+   test thread after frame_destroy returned, exactly the "free before the
+   sink's first frame touch" order that made the old code read freed
+   memory. That is the same decision path the racing interleaving takes
+   (die_requested checked after the record stayed alive through the slot's
+   deferral), so the ASan red/green outcome carries. */
+typedef struct held_model_t {
+  model_backend_t base;
+  model_response_sink_fn held_fn;   /* the engine's sink, recorded by submit */
+  void* held_ctx;                   /* its ctx (the frame), recorded too */
+  int armed;                        /* 1 once submit recorded the pair */
+  const char* body;                 /* the completion the sink never saw */
+} held_model_t;
+
+static int held_submit(void* self, json_value_t* messages, json_value_t* tools,
+                       model_response_sink_fn on_done, void* on_done_ctx) {
+  (void)tools;
+  (void)messages;
+  held_model_t* hm = (held_model_t*)self;
+  hm->held_fn = on_done;
+  hm->held_ctx = on_done_ctx;
+  hm->armed = 1;
+  /* Accepted (rc 0) but the completion NEVER fires here — the sink hangs
+     until the test invokes it: a production backend's loop-thread
+     completion, replayed. */
+  return (on_done != NULL) ? 0 : -1;
+}
+
+TEST(TestLoop, TestDestroyMidTurnDefersToThePendingSink) {
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "destroy under me", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  held_model_t hm = {};   /* zero-init: the vtable's members are set below */
+  hm.base.complete = NULL;           /* async-only: the engine takes the submit path */
+  hm.base.submit = held_submit;
+  hm.body = R"json({"choices":[{"message":{"role":"assistant","content":"never seen"}}]})json";
+  frame_set_model_backend(f, &hm.base);
+
+  EXPECT_EQ(frame_start(f), 0);
+  int guard = 0;
+  while (!hm.armed && guard++ < 100) {
+    _frame_pump(f);   /* the turn, the derive's store round trip, the submit */
+  }
+  ASSERT_TRUE(hm.armed) << "the engine reached the submit boundary";
+  ASSERT_NE(hm.held_fn, nullptr);
+  ASSERT_EQ(hm.held_ctx, (void*)f);   /* the sink carries the bare frame */
+
+  /* Destroy MID-TURN with the sink pending: the deferred teardown (die-
+     requested; the record stays alive for the release). The old code freed
+     f HERE and the sink invocation below dereferenced the freed record. */
+  frame_destroy(f);
+
+  /* The test then plays the backend's completion thread: fire the recorded
+     sink EXACTLY ONCE — it must read die_requested, drop the completion,
+     and let its release (the last one) run the teardown. No crash, no
+     use-after-free, exactly one free. (A re-entry destroy is only safe
+     while the deferral holds, i.e. strictly BEFORE this fire — after it the
+     record is gone and even reading it is the caller's own bug.) */
+  char* body = strdup(hm.body);
+  ASSERT_NE(body, nullptr);
+  hm.held_fn(hm.held_ctx, 200, body, strlen(body), NULL);
+
+  wave_db_close(db);
+}
 
 /* --- restart/replay (also carries the plan's S003 acceptance): a real
    disk location, close, reopen, frame_resume. Python-independent — the
