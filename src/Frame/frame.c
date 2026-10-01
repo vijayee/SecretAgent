@@ -50,6 +50,21 @@ void frm_cell_payload_destroy(void* p) {
   free(cp);
 }
 
+void frm_model_payload_destroy(void* p) {
+  frm_model_payload_t* mp = (frm_model_payload_t*)p;
+  if (mp == NULL) return;
+  free(mp->body);
+  free(mp->error);
+  free(mp);
+}
+
+void frm_child_report_payload_destroy(void* p) {
+  frm_child_report_payload_t* rp = (frm_child_report_payload_t*)p;
+  if (rp == NULL) return;
+  free(rp->child_sid);
+  free(rp);
+}
+
 #ifdef SA_HAS_WDB
 
 #include "model.h"
@@ -124,6 +139,9 @@ struct frame_t {
   char* model_name;
   unsigned max_depth;
   unsigned model_timeout_ms;  /* 0 = built-in default (model_timeout_ms_resolve) */
+  scheduler_pool_t* pool;     /* BORROWED from the config (inherited down the
+                                 lineage): the frame actor's scheduler pool;
+                                 NULL = the inline shape (the owner pumps). */
   uint64_t seq;               /* last allocated event seq (0 = none yet) */
   uint32_t depth;
   /* --- the turn-loop pieces (Task 10; see frame_internal.h) ---------------
@@ -150,6 +168,11 @@ struct frame_t {
   uint64_t cell_pyrt_corr;    /* the pyrt executor corr it was handed as */
   uint8_t cell_status;        /* completion status of the pending/last cell */
   uint8_t stop_requested;     /* FRM_STOP: the loop drains, then stops */
+  /* The engine knob this slice's Task 1 carries (Task 3 adds the rest): set
+     by frame_start while ONE engine is live on the frame. Single-writer
+     discipline like the cell slot: every access is on the frame's dispatch
+     thread (an inline frame's owner thread) or before the actor runs. */
+  uint8_t engine_live;
 };
 
 /* --- bridge reply hook (frame_bridge.h contract) ---------------------------
@@ -791,6 +814,17 @@ static void _frame_behavior(void* state, message_t* msg) {
       break;
     }
 #endif
+    case FRM_TURN:
+      /* Task-1's temporary holder (Task 3's engine replaces it): a
+         scheduled turn-step continuation. With no engine behaviors yet the
+         continuation is a LATE DROP — loud, then the engine knob clears so
+         a driver may restart (Task 3's engine consumes FRM_TURN for real).
+         No payload to destroy. */
+      f->engine_live = 0;
+      log_error("frame: FRM_TURN late-dropped at '%s' — no turn engine is "
+                "wired yet (Task 3's loop replaces this holder)",
+                f->sid_path);
+      break;
     case FRM_STOP:
       /* Control, not interruption: a cell in flight runs to its boundary;
          the loop (which pumps this inbox) drains and then stops. */
@@ -1202,6 +1236,7 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
   if (cfg != NULL) {
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
     f->model_timeout_ms = cfg->model_timeout_ms;
+    f->pool = cfg->pool;        /* BORROWED, exactly like `backend` */
     if (cfg->model_base_url != NULL) {
       f->model_base_url = strdup(cfg->model_base_url);
       if (f->model_base_url == NULL) goto fail;
@@ -1215,9 +1250,11 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
       if (f->model_name == NULL) goto fail;
     }
   } else if (parent != NULL) {
-    /* Spawned children inherit the parent's depth budget and model config. */
+    /* Spawned children inherit the parent's depth budget, model config, and
+       pool (a tree always sits on ONE pool). */
     f->max_depth = parent->max_depth;
     f->model_timeout_ms = parent->model_timeout_ms;
+    f->pool = parent->pool;
     if (parent->model_base_url != NULL) {
       f->model_base_url = strdup(parent->model_base_url);
       if (f->model_base_url == NULL) goto fail;
@@ -1249,8 +1286,10 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
      (No events in this task — Task 10's restart/replay test depends on this.) */
   f->seq = _frame_restore_seq(f);
 
-  /* Inline actor (pool NULL): tests/loop pump the mailbox by hand. */
-  actor_init(&f->actor, f, _frame_behavior, NULL);
+  /* Inline actor (pool NULL): tests/loop pump the mailbox by hand. A pool
+     from the config attaches the actor to that pool — the engine
+     (frame_start) schedules onto it instead. */
+  actor_init(&f->actor, f, _frame_behavior, f->pool);
   return f;
 
 fail:
@@ -1373,6 +1412,7 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
   if (cfg != NULL) {
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
     f->model_timeout_ms = cfg->model_timeout_ms;
+    f->pool = cfg->pool;        /* BORROWED, exactly like the model strings */
     if (cfg->model_base_url != NULL) {
       f->model_base_url = strdup(cfg->model_base_url);
       if (f->model_base_url == NULL) goto fail;
@@ -1389,7 +1429,7 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
     f->max_depth = 4;
   }
 
-  actor_init(&f->actor, f, _frame_behavior, NULL);
+  actor_init(&f->actor, f, _frame_behavior, f->pool);
   return f;
 
 fail:
@@ -1417,6 +1457,39 @@ void frame_set_loop_turn_cap(frame_t* f, unsigned cap) {
   f->loop_turn_cap = cap;   /* 0 = the SA_LOOP_MAX_TURNS default */
 }
 
+int frame_start(frame_t* f) {
+  if (!_frame_is_live(f)) {
+    log_error("frame_start: dead frame");
+    return -1;
+  }
+  if (f->engine_live) {
+    log_error("frame_start: an engine is already live at '%s' — ONE engine "
+              "per frame", f->sid_path);
+    return -1;
+  }
+  f->engine_live = 1;   /* cleared again by the engine's terminal step (Task
+                           3's handlers replace this task's late-drop case) */
+  message_t m;
+  m.type = (uint32_t)FRM_TURN;
+  m.payload = NULL;
+  m.payload_destroy = NULL;
+  if (!actor_send(&f->actor, &m)) {
+    f->engine_live = 0;
+    log_error("frame_start: the turn continuation was refused at '%s'",
+              f->sid_path);
+    return -1;
+  }
+  return 0;
+}
+
+scheduler_pool_t* frame_pool(const frame_t* f) {
+  return (f != NULL) ? f->pool : NULL;
+}
+
+actor_t* _frame_actor(frame_t* f) {
+  return (f != NULL) ? &f->actor : NULL;
+}
+
 const char* frame_sid(const frame_t* f) {
   return f ? f->sid_path : NULL;
 }
@@ -1439,11 +1512,18 @@ void frame_destroy(frame_t* f) {
   if (f->pyrt != NULL) pyrt_destroy(f->pyrt);
   f->pyrt = NULL;
 #endif
-  /* Inline teardown: no pool owns this actor (frame_create uses pool=NULL),
-     so the enclosing struct's lifetime is ours to end here. */
-  atomic_fetch_or(&f->actor.flags, ACTOR_FLAG_DESTROY);
-  actor_detach_pool(&f->actor);
-  message_queue_destroy(&f->actor.queue);   /* drains; the queue retires payloads */
+  /* Inline teardown: no pool owns this actor (a NULL-pool frame), so the
+     enclosing struct's lifetime is ours to end here. POOLED frames route
+     through actor_destroy instead: its RUNNING/queue-state waits break out
+     once scheduler_pool_stop set `stopped` — the caller's documented order
+     is stop the pool FIRST, then frame_destroy, then pool destroy. */
+  if (f->pool != NULL) {
+    actor_destroy(&f->actor);
+  } else {
+    atomic_fetch_or(&f->actor.flags, ACTOR_FLAG_DESTROY);
+    actor_detach_pool(&f->actor);
+    message_queue_destroy(&f->actor.queue);   /* drains; the queue retires payloads */
+  }
   if (f->st != NULL) database_subtree_close(f->st);
   free(f->sid_path);
   free(f->parent_path);

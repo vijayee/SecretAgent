@@ -5,6 +5,7 @@
 #ifndef SA_FRAME_MESSAGES_H
 #define SA_FRAME_MESSAGES_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Frame-layer message types (carried in the generic message_t envelope).
@@ -22,7 +23,15 @@ typedef enum frame_message_type_e {
   FRM_CELL_EXECUTE,       /* loop -> frame: run this cell (from the model's tool call) */
   FRM_STOP,               /* control: end the frame when the queue drains */
   FRM_SPAWN,              /* cell -> frame: admission-only child spawn */
-  FRM_REPORT              /* cell -> frame: the cell's frame.report verb */
+  FRM_REPORT,             /* cell -> frame: the cell's frame.report verb */
+  FRM_TURN,               /* engine -> itself: the scheduled turn-step
+                             continuation (payload NULL) — the loop's turn
+                             loop, dissolved */
+  FRM_MODEL_RESULT,       /* transport -> frame: the model completion arrived
+                             (frm_model_payload_t; see model.c's relay) */
+  FRM_CHILD_REPORT        /* child -> parent: this child's engine is terminal
+                             (frm_child_report_payload_t; the parent
+                             re-schedules) */
 } frame_message_type_e;
 
 /* Event types (stored at sessions/<sid>/events/<seq>, JSON, %020d seq). ONLY
@@ -55,6 +64,25 @@ void frm_spawn_payload_destroy(void* p);
 void frm_report_payload_destroy(void* p);
 void frm_reply_payload_destroy(void* p);
 void frm_cell_payload_destroy(void* p);
+
+/* Model completion (transport -> frame): the http body and error move in RAW
+   (steal-slot, exactly model.c's completion record shape); the
+   FRM_MODEL_RESULT behavior decodes via model_internal.h on the frame's own
+   thread — the streams completion stays µs-scale. Ownership of body/error
+   transfers with the message. */
+typedef struct frm_model_payload_t {
+  int status;       /* http status, or -1 on transport failure */
+  char* body;       /* heap; steal-slot */
+  size_t body_len;
+  char* error;      /* heap transport reason on status -1 */
+} frm_model_payload_t;
+/* Child terminal: bookkeeping only — the parent-side report binding ALREADY
+   happened in the child's report batch (under the parent's write lock);
+   this message RESUMES the parent's live engine. failed = the child ended
+   on a control event (the parent's thread logs the resume loudly for it). */
+typedef struct frm_child_report_payload_t { char* child_sid; uint8_t failed; } frm_child_report_payload_t;
+void frm_model_payload_destroy(void* p);
+void frm_child_report_payload_destroy(void* p);
 
 /* JSON event record shape (authoritative):
    {"seq":<int>,"type":"<event-name>","frame":"<sid-path>","corr":<int|null>,

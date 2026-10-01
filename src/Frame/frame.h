@@ -24,6 +24,12 @@ typedef struct frame_config_t {
                                     SA_MODEL_TIMEOUT_MS). Local models on
                                     big tool-calling turns can run minutes —
                                     the default 30 s is for cloud endpoints. */
+  /* The scheduler pool this frame's embedded actor attaches to. BORROWED —
+     never owned/freed by the frame. NULL = the inline shape (tests/loop pump
+     the mailbox by hand); a spawned child INHERITS the parent's pool, so a
+     tree always sits on one pool. The engine (frame_start) schedules onto
+     it; no pool means the driver pumps. */
+  scheduler_pool_t* pool;
 } frame_config_t;
 
 wave_database_root_t* wave_db_open(const char* location /* NULL = in-memory */);
@@ -68,6 +74,18 @@ void frame_set_model_backend(frame_t* f, model_backend_t* backend);
    is runtime state (not a compile-time constant) so a test can bound the
    always-tool-calling model to a handful of turns. */
 void frame_set_loop_turn_cap(frame_t* f, unsigned cap);
+
+/* Begin (or restart after an ended run) the event-driven turn engine: ONE
+   turn-step continuation is queued on the frame's actor; from there the
+   actor yields to its scheduler pool between turn phases and re-runs on
+   every arrival (model completion, cell result, child report). Returns 0,
+   or nonzero with a loud log_error when the frame is dead or an engine is
+   already live on it (one engine per frame). */
+int frame_start(frame_t* f);
+
+/* Test/debug + embedding accessor: the pool the frame's actor is attached
+   to (NULL = inline). */
+scheduler_pool_t* frame_pool(const frame_t* f);
 
 /* Store operations (called by frame behaviors; ONE root batch per effect). */
 int frame_remember_local(frame_t* f, const char* key, const char* json_value);   /* state/local/<key> */

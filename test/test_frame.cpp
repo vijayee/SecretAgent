@@ -10,6 +10,8 @@ extern "C" {
 #include "../src/Frame/frame.h"
 #include "../src/Frame/frame_messages.h"
 #include "../src/Frame/frame_bridge.h"
+#include "../src/Frame/frame_internal.h"
+#include "../src/Scheduler/scheduler.h"
 #include "../src/Util/json.h"
 #include "../src/Util/allocator.h"
 }
@@ -18,11 +20,60 @@ extern "C" {
 
 static frame_config_t test_config(void) {
   frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));   /* additive fields (pool, timeout) default sensibly */
   cfg.model_base_url = NULL;
   cfg.model_api_key = NULL;
   cfg.model_name = "unused";
   cfg.max_depth = 4;
   return cfg;
+}
+
+TEST(TestFrame, TestPoolAttachAndInheritance) {
+  frame_config_t cfg = test_config();   /* zero-init'd helper from Step 1 */
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  cfg.pool = pool;
+  wave_database_root_t* db = wave_db_open(NULL);
+  frame_t* parent = frame_create(db, NULL, "tree root", &cfg);
+  ASSERT_NE(parent, nullptr);
+  EXPECT_EQ(frame_pool(parent), pool) << "frame_create attaches the config's pool";
+
+  frame_t* child = frame_spawn(parent, "leaf", NULL);
+  ASSERT_NE(child, nullptr);
+  EXPECT_EQ(frame_pool(child), pool) << "spawned children inherit the parent's pool";
+
+  /* An inline default is unchanged: a pool-less config means pool NULL. */
+  frame_config_t plain = test_config();
+  frame_t* inline_frame = frame_create(db, NULL, NULL, &plain);
+  ASSERT_NE(inline_frame, nullptr);
+  EXPECT_EQ(frame_pool(inline_frame), nullptr);
+
+  frame_destroy(child);
+  frame_destroy(inline_frame);
+  frame_destroy(parent);
+  scheduler_pool_stop(pool);
+  scheduler_pool_destroy(pool);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestFrameStartQueuesOneTurnContinuation) {
+  frame_config_t plain = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  frame_t* f = frame_create(db, NULL, NULL, &plain);
+  ASSERT_NE(f, nullptr);
+
+  EXPECT_EQ(frame_start(f), 0);
+  EXPECT_NE(frame_start(f), 0) << "one live engine per frame — restart refused loudly";
+
+  /* On an inline frame the continuation sits in the mailbox (the owner
+     pumps): exactly what Task 3's FRM_TURN case will consume. Drain it by
+     hand — the Task-1 handler is a loud late-drop, so after the drain the
+     engine is still startable (task 3's engine changes that). */
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
+  EXPECT_EQ(frame_start(f), 0) << "the single continuation was consumed; engine restartable";
+
+  frame_destroy(f);
+  wave_db_close(db);
 }
 
 TEST(TestFrame, TestCreateRootAndChildGeneratesPaths) {

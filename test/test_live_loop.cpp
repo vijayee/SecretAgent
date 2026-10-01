@@ -116,6 +116,7 @@ TEST(TestLiveLoop, TestLiveOllamaRememberAndReportWave) {
   py_agent_init();
 
   frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));   /* additive fields (pool) default sensibly */
   cfg.model_base_url = url;
   cfg.model_api_key = NULL;   /* Ollama-compatible: no key */
   cfg.model_name = model;

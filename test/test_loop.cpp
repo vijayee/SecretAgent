@@ -38,6 +38,7 @@ extern "C" void py_agent_init(void);
 
 static frame_config_t test_config(void) {
   frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));   /* additive fields (pool, timeout) default sensibly */
   cfg.model_base_url = NULL;
   cfg.model_api_key = NULL;
   cfg.model_name = "unused";

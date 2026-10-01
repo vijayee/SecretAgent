@@ -93,6 +93,13 @@ uint8_t _frame_cell_pending(const frame_t* f);
    longer awaited by the loop). */
 int _frame_cell_wait(frame_t* f, unsigned timeout_ms, uint8_t* status_out);
 
+/* The frame's embedded actor (the mailbox frame_start's FRM_TURN continuation
+   queues into): the owner of an INLINE frame (pool NULL) pumps it by hand
+   with actor_run — that is the whole inline contract; a pooled frame's
+   mailbox belongs to its scheduler pool's workers. NULL on a dead/unknown
+   frame. */
+actor_t* _frame_actor(frame_t* f);
+
 #endif /* SA_HAS_WDB */
 
 #ifdef __cplusplus

@@ -201,8 +201,11 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  frame_config_t cfg = {base_url, NULL /* api key — none for Ollama */, model,
-                        4 /* max_depth */};
+  frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));   /* additive fields (pool) default sensibly */
+  cfg.model_base_url = base_url;  /* api key — none for Ollama */
+  cfg.model_name = model;
+  cfg.max_depth = 4;
   frame_t* f = frame_create(db, NULL, goal, &cfg);
   if (f == NULL) {
     fprintf(stderr, "frame-demo: cannot create the top frame\n");
