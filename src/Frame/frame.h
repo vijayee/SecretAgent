@@ -105,8 +105,9 @@ void frame_set_loop_turn_cap(frame_t* f, unsigned cap);
    turn-step continuation is queued on the frame's actor; from there the
    actor yields to its scheduler pool between turn phases and re-runs on
    every arrival (model completion, cell result, child report). Returns 0,
-   or nonzero with a loud log_error when the frame is dead or an engine is
-   already live on it (one engine per frame). */
+   or nonzero with a loud log_error when the frame is dead, already done
+   (an ended frame re-runs nothing), or an engine is already live on it
+   (one engine per frame). */
 int frame_start(frame_t* f);
 
 /* Test/debug + embedding accessor: the pool the frame's actor is attached
@@ -122,9 +123,21 @@ int frame_append_msg(frame_t* f, const char* role, const char* content);   /* ms
 
 /* Admission-only spawn (PA semantics): validates depth, creates the child
    subtree, ONE root batch: child's birth batch (meta + status) + parent's
-   frame.spawn event + lineage triple ops. Returns the child immediately;
-   fails (NULL + log_error) when depth is exceeded — never substitutes.
-   context_json (nullable) is stored as the child's state/ctx/handoff key. */
+   frame.spawn event + lineage triple ops. Returns the child (only after the
+   admission COMMITS — the store reply confirms it); fails (NULL + log_error)
+   when depth is exceeded — never substitutes. context_json (nullable) is
+   stored as the child's state/ctx/handoff key.
+   SPAWN = ADMIT + START (the orchestration slice): the child INHERITS the
+   parent's engine knobs (loop_turn_cap) and the parent's BORROWED backend
+   override (frame_set_model_backend on the parent; production leaves it NULL
+   for everyone — the child's default backend builds from its own config),
+   and when a turn engine is LIVE on the parent the admission commit's reply
+   STARTS the child's own engine (spawn = admit + start; the child rides the
+   parent's pool) and counts it in the parent's live children — the parent
+   yields at FRAME_PHASE_CHILDREN and resumes on the child reports. An
+   engine-less caller gets the admission-only shape unchanged and drives the
+   child itself (frame_start / frame_run_loop's start-or-pump); the caller
+   ADOPTS the returned record either way (its teardown is the caller's). */
 frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json);
 /* Child-side: frame.report event in the child + one event bound into the
    parent's log; marks the child done. */

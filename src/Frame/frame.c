@@ -160,17 +160,25 @@ typedef struct frame_sync_slot_t {
   char* text;              /* a recall reply's resolved text (transfer) */
 } frame_sync_slot_t;
 
-/* The spawn admission: the parent awaits the store's commit; the router
-   fills the child (and the bridge corr's cell answer when cell-side). */
-typedef struct frame_spawn_slot_t {
-  uint8_t in_use, done;
+/* The spawn admissions IN FLIGHT (a corr-keyed list, not one slot): the
+   orchestration slice made cell-verb spawns OVERLAPPABLE — a pooled parent's
+   cell can start the next actor.spawn while a previous one's store reply is
+   still routing (the py-agent's bounded bridge wait can also give up on a
+   busy mailbox: the post is still DELIVERED — actor_send's was_empty return
+   is not a delivery/refusal answer), so one slot would strand the older
+   admission's child. Every admission carries its own entry; every store
+   reply corr-matches ITS entry. The list is the parent's dispatch-thread
+   single-writer. */
+typedef struct frm_spawn_pending_t {
   uint64_t corr;
   uint64_t bridge_corr;    /* 0 = the direct sync caller awaits; nonzero = a
                               cell-verb spawn (the router answers + cleans) */
+  uint8_t done;
   int rc;                  /* the store's refusal code (0 = committed) */
   uint64_t own_seq;        /* the parent's PRE-ALLOCATED admission seq */
-  frame_t* child;          /* the allocated (not yet committed) child */
-} frame_spawn_slot_t;
+  frame_t* child;          /* the allocated child (NULL once released) */
+  struct frm_spawn_pending_t* next;
+} frm_spawn_pending_t;
 
 /* The report bind: the CHILD awaits its own store corr (the reply routes
    back to the child's actor); the router releases the direct caller and
@@ -299,8 +307,21 @@ struct frame_t {
   frm_bridge_pending_t* bridge_pending;   /* corr answers waiting one store
                                              hop (registered pre-post) */
   frame_sync_slot_t sync;           /* the direct sync API's awaited reply */
-  frame_spawn_slot_t spawn_slot;    /* the spawn admission's awaited commit */
+  frm_spawn_pending_t* spawn_pending;   /* the spawn admissions in flight
+                                           (the bridge one's corr answers +
+                                           cleanup live in the router) */
   frame_bind_slot_t bind_slot;      /* the report bind's awaited commit */
+  /* --- the spawned-children RECORD bookkeeping (Task 5; spec §1 §4) -------- */
+  frame_t* owned_children;   /* the UNADOPTED (cell-verb) spawned child records
+                                whose record lives on past the admission reply
+                                once START runs: the parent frees them all at
+                                ITS teardown (a started child's record has no
+                                other owner). Owned by this parent's dispatch
+                                thread (single-writer, the house discipline). */
+  frame_t* owned_next;       /* THIS record's link in its OWNING parent's
+                                teardown list (the parent's dispatch thread
+                                writes it in the START branch; only the
+                                parent's teardown reads it) */
 };
 
 /* --- bridge reply hook (frame_bridge.h contract) ---------------------------
@@ -1513,8 +1534,8 @@ static int _frame_recall_post(frame_t* f, const char* key, uint64_t corr,
 static frame_t* _frame_spawn_post(frame_t* parent, const char* goal,
                                   const char* context_json,
                                   uint64_t bridge_corr, uint64_t corr);
-static int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
-                                   uint8_t engine_driven, const char* text);
+/* _frame_report_bind_post — declared in frame_internal.h (the turn engine's
+   terminal step is one of its callers; loop.c runs the engine). */
 static void _frame_report_bind_compose(frame_t* parent,
                                        frm_report_bind_payload_t* b);
 
@@ -1538,37 +1559,94 @@ static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
   }
   if (r == NULL) return;
 
-  /* 1. The spawn admission. */
-  if (f->spawn_slot.in_use && r->corr == f->spawn_slot.corr) {
-    f->spawn_slot.done = 1;
-    f->spawn_slot.rc = r->rc;
-    if (r->rc != 0) {
-      log_error("frame: the spawn admission for '%s' was refused by the store "
-                "(%d) — nothing committed",
-                (f->spawn_slot.child != NULL) ? frame_sid(f->spawn_slot.child)
-                                              : "?", r->rc);
-      _frame_seq_rollback(f, f->spawn_slot.own_seq);
-    }
-    if (f->spawn_slot.bridge_corr != 0) {
-      /* Cell-side: the router answers + cleans (the child is released here —
-         the admission is DURABLE, not a live process; Task 5 starts it
-         instead). */
-      char* sid = (r->rc == 0 && f->spawn_slot.child != NULL)
-                      ? strdup(frame_sid(f->spawn_slot.child)) : NULL;
-      _frame_bridge_reply(f->spawn_slot.bridge_corr, (r->rc == 0) ? 0 : 1, sid);
-      free(sid);
+  /* 1. The spawn admissions (the corr-keyed entries). */
+  {
+    frm_spawn_pending_t* pe = f->spawn_pending;
+    while (pe != NULL && pe->corr != r->corr) pe = pe->next;
+    if (pe != NULL) {
+      pe->done = 1;
+      pe->rc = r->rc;
       if (r->rc != 0) {
-        log_error("frame: the cell-verb spawn's child for corr %llu is "
-                  "released loud (the admission was refused)",
-                  (unsigned long long)f->spawn_slot.bridge_corr);
+        log_error("frame: the spawn admission for '%s' was refused by the "
+                  "store (%d) — nothing committed",
+                  (pe->child != NULL) ? frame_sid(pe->child) : "?", r->rc);
+        _frame_seq_rollback(f, pe->own_seq);
       }
-      frame_destroy(f->spawn_slot.child);
-      f->spawn_slot.child = NULL;
-      f->spawn_slot.in_use = 0;
+      /* START (spawn = admit + start; the plan's reply-handler branch): on a
+         CONFIRMED commit and a LIVE turn engine on this frame, the admitted
+         child becomes the admission's live product — it inherits this
+         frame's engine knobs (loop_turn_cap) and the BORROWED backend
+         override (frame.h documents the borrowed inheritance: production
+         leaves it NULL for everyone; tests set it once on the parent), its
+         engine starts (ONE FRM_TURN queued here or scheduled on the
+         inherited pool), and it is counted among this frame's live
+         children. ONLY now — never before the batch was handed to the
+         store. Admissions OVERLAP (a cell's next actor.spawn can compose
+         while a previous reply still routes), so each entry stands alone. */
+      uint8_t started = 0;
+      if (r->rc == 0 && pe->child != NULL) {
+        frame_t* child = pe->child;
+        if (f->engine.engine_live != 0 && child->st != NULL) {
+          child->loop_turn_cap = f->loop_turn_cap;
+          child->backend = f->backend;
+          if (_frame_engine_start(child) == 0) {
+            started = 1;
+            f->engine.live_children++;
+            if (pe->bridge_corr != 0) {
+              /* A cell-verb child is UNADOPTED (no caller takes it): this
+                 parent owns the record and frees it at its teardown — the
+                 counter keeps the parent's engine schedulable (the
+                 pending-children shape), never a CAS teardown claim. */
+              child->owned_next = f->owned_children;
+              f->owned_children = child;
+            }
+          }
+          /* else: frame_start logged loud (dead/already-live engine). */
+        } else if (f->engine.engine_live == 0) {
+          log_info("frame: the admission of '%s' committed under '%s' with "
+                   "no live engine on the parent — the child stays "
+                   "admission-only (the engine-less caller starts or drives "
+                   "it)", frame_sid(child), f->sid_path);
+        }
+      }
+      if (pe->bridge_corr != 0) {
+        /* The cell-verb corr answer: the child's sid text (already known at
+           compose — the wait covered only the store hop; when the cell
+           already moved on, py_agent's own registry logs the drop loud). */
+        char* sid = (r->rc == 0 && pe->child != NULL)
+                        ? strdup(frame_sid(pe->child)) : NULL;
+        _frame_bridge_reply(pe->bridge_corr, (r->rc == 0) ? 0 : 1, sid);
+        free(sid);
+        if (!started) {
+          /* NEVER started (the admission was refused, or no live engine
+             could own a cell-verb child): the record is released — the
+             admission-only shape. */
+          if (r->rc == 0) {
+            log_error("frame: the cell-verb spawn's child '%s' stays "
+                      "unstarted at '%s' (no live engine on the parent) — "
+                      "released loud", frame_sid(pe->child), f->sid_path);
+          } else {
+            log_error("frame: the cell-verb spawn's child for corr %llu is "
+                      "released loud (the admission was refused)",
+                      (unsigned long long)pe->bridge_corr);
+          }
+          frame_destroy(pe->child);
+        }
+        pe->child = NULL;    /* a STARTED child's record is the tracked
+                                teardown's now */
+        /* The router unlinks + frees the entry (the cell-verb caller is
+           done with it). */
+        frm_spawn_pending_t** p = &f->spawn_pending;
+        while (*p != NULL && *p != pe) p = &(*p)->next;
+        if (*p == pe) *p = pe->next;
+        free(pe);
+      }
+      /* bridge_corr == 0: the direct sync caller reads its entry (done/rc/
+         child) and takes it off the list itself — the entry's memory is
+         this frame's dispatch thread's, so the read is race-free. */
+      frm_store_reply_payload_destroy(r);
+      return;
     }
-    /* bridge_corr == 0: the direct sync caller reads + clears the slot. */
-    frm_store_reply_payload_destroy(r);
-    return;
   }
 
   /* 2. The report bind (routed back to the CHILD's actor). */
@@ -1584,10 +1662,20 @@ static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
     if (f->bind_slot.bridge_corr != 0) {
       _frame_bridge_reply(f->bind_slot.bridge_corr, (r->rc == 0) ? 0 : 1, NULL);
     }
-    /* f->bind_slot.engine_driven == 1 posts FRM_CHILD_REPORT to the parent
-       from this same reply (Task 6's terminate wires its binds with it). */
-    if (f->bind_slot.bridge_corr != 0) f->bind_slot.in_use = 0;
-    /* bridge_corr == 0: the direct sync caller reads + clears the slot. */
+    /* engine_driven == 1: the parent's resume posts FROM THE CONFIRMED COMMIT
+       — and from a refusal too (a parent must never hang because a WAL write
+       failed; the seq rollback above ran best-effort and the refusal is
+       logged). Task 6's terminate carries its own failed flag through the
+       bind slot; a quiet-completion bind resumes with failed = 0. */
+    if (f->bind_slot.engine_driven != 0) {
+      if (r->rc != 0) {
+        log_error("frame: the engine-driven report bind from '%s' was refused "
+                  "(%d) — the parent still resumes (never hang on a WAL "
+                  "failure)", f->sid_path, r->rc);
+      }
+      _frame_child_notify_post(f, 0);
+    }
+    f->bind_slot.in_use = 0;
     frm_store_reply_payload_destroy(r);
     return;
   }
@@ -1869,9 +1957,10 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          composes (the parent's PRE-ALLOCATED seq) and posts at the store
          actor; the ROUTER answers this corr with the child's sid text when
          the store reply lands (waiter's bounded py-agent wait covers the
-         extra hop). The child frame_t is released at the reply — the
-         admission is DURABLE, not a live process; Task 5's reply route
-         starts admitted children instead. */
+         extra hop). Task 5: the reply route STARTS a committed child (when
+         an engine is live on the parent) instead of releasing it — the child
+         is the admission's live product; its record joins the parent's
+         teardown list. */
       frm_spawn_payload_t* sp = (frm_spawn_payload_t*)msg->payload;
       msg->payload = NULL;
       if (sp == NULL) {
@@ -2586,15 +2675,33 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
 
   /* The pool guard of frame_create, at RESOLVED time: the cfg above is
      copied already, so f->pool is what this frame will run with. A frame
-     pool and a store pool must agree — a POOLED frame on an inline-store
-     root OR an inline (cfg-less) resume on a POOLED store is a mailbox
-     nobody pumps on one side. A mismatch refuses loud instead of hanging. */
-  if ((f->pool != NULL) != (db->store_pool != NULL)) {
-    log_error("frame_resume: the frame pool and the store pool must match "
-              "at '%s' — a POOLED frame requires a POOLED store (and the "
-              "resumed cfg must carry that pool); refusing loud",
+     pool and a store pool must agree — a POOLED frame requires a POOLED
+     store. An INLINE frame on a POOLED store is the nobody-pumps-one-side
+     hang — EXCEPT the orchestration slice's documented READ-ONLY HANDLE
+     shape: a DONE subtree resumed pool-less keeps its reads on the DIRECT
+     debug scan (frame_debug_events/frame_is_done, never store messages),
+     its sync writes refuse loud (spec §5's inline-only rule), and frame_start
+     refuses done frames so no engine can ever post at the pooled store's
+     mailbox. A NOT-done inline resume on a pooled store still refuses loud. */
+  if (f->pool != NULL && db->store_pool == NULL) {
+    log_error("frame_resume: a POOLED frame requires a POOLED store at '%s' "
+              "(the resumed cfg must carry the pool) — refusing loud",
               f->sid_path);
     goto fail;
+  }
+  if (f->pool == NULL && db->store_pool != NULL) {
+    char* status = _frame_subtree_text(f->st, "meta/status");
+    uint8_t done = (status != NULL &&
+                    strcmp(status, SA_FRAME_STATUS_DONE) == 0);
+    free(status);
+    if (!done) {
+      log_error("frame_resume: the frame pool and the store pool must match "
+                "at '%s' — an inline resume of a NOT-done frame on a POOLED "
+                "store is a mailbox nobody pumps on one side (only a DONE "
+                "subtree's read-only handle shape is legal); refusing loud",
+                f->sid_path);
+      goto fail;
+    }
   }
 
   actor_init(&f->actor, f, _frame_behavior, f->pool);
@@ -2703,6 +2810,8 @@ static void _frame_destroy_run(frame_t* f) {
   }
   free(f->sync.text);
   f->sync.text = NULL;
+  free(f->engine.finish_text);
+  f->engine.finish_text = NULL;
   if (f->engine.turn_reply != NULL) {
     /* A live engine's in-flight turn reply dies here (a destroy mid-turn —
        the engine state is not the queue's business). */
@@ -2714,12 +2823,39 @@ static void _frame_destroy_run(frame_t* f) {
     model_reply_destroy(f->engine.turn_reply);
     f->engine.turn_reply = NULL;
   }
-  if (f->spawn_slot.child != NULL) {
-    log_error("frame: an uncommitted spawn admission for '%s' is abandoned "
-              "at teardown of '%s'", frame_sid(f->spawn_slot.child),
-              f->sid_path);
-    frame_destroy(f->spawn_slot.child);
-    f->spawn_slot.child = NULL;
+  /* The spawn admissions whose store replies never routed (a teardown
+     racing an in-flight admission, or a dead store): each entry's still-
+     owned child is abandoned loud. */
+  {
+    frm_spawn_pending_t* pe = f->spawn_pending;
+    f->spawn_pending = NULL;
+    while (pe != NULL) {
+      frm_spawn_pending_t* next = pe->next;
+      if (pe->child != NULL) {
+        log_error("frame: a spawn admission for '%s' at '%s' never saw its "
+                  "store reply — the child is abandoned loud at teardown",
+                  frame_sid(pe->child), f->sid_path);
+        frame_destroy(pe->child);
+        pe->child = NULL;
+      }
+      free(pe);
+      pe = next;
+    }
+  }
+  /* The START branch's unadopted (cell-verb) children: their records are
+     this parent's — freed here, after this frame's own mailbox is drained
+     (a child's dispatch still in flight completes inside its own
+     actor_destroy's waits). A child with grandchildren tears down its own
+     tree the same way. */
+  {
+    frame_t* c = f->owned_children;
+    f->owned_children = NULL;
+    while (c != NULL) {
+      frame_t* next = c->owned_next;
+      c->owned_next = NULL;
+      frame_destroy(c);
+      c = next;
+    }
   }
   if (f->st != NULL) database_subtree_close(f->st);
   free(f->sid_path);
@@ -3173,12 +3309,17 @@ static frame_t* _frame_spawn_post(frame_t* parent, const char* goal,
   bp->op_name = "spawn-admission";                   /* BORROWED literal */
   bp->reply_to = &parent->actor;                     /* today's reply contract */
   bp->corr = corr;
-  parent->spawn_slot.in_use = 1;
-  parent->spawn_slot.done = 0;
-  parent->spawn_slot.corr = corr;
-  parent->spawn_slot.bridge_corr = bridge_corr;
-  parent->spawn_slot.own_seq = pseq;
-  parent->spawn_slot.child = child;
+  /* The admission's own entry (corr-keyed; admissions overlap). Filled
+     BEFORE the post so the reply's router finds it. */
+  {
+    frm_spawn_pending_t* pe = get_clear_memory(sizeof(*pe));
+    pe->corr = corr;
+    pe->bridge_corr = bridge_corr;
+    pe->own_seq = pseq;
+    pe->child = child;
+    pe->next = parent->spawn_pending;
+    parent->spawn_pending = pe;
+  }
   _frame_post(&parent->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
               frm_store_batch_payload_destroy, "spawn admission");
   return child;
@@ -3187,7 +3328,9 @@ static frame_t* _frame_spawn_post(frame_t* parent, const char* goal,
 /* The public admission: compose + post + pump-wait the store's commit — the
    child is returned only after the admission COMMITS (today's contract, now
    confirmed by the store reply). A refusal destroys the child exactly as
-   today. */
+   today. The wait matches THIS call's corr among the (overlappable) pending
+   admissions — the entries are the parent's dispatch thread's memory and the
+   pump runs its dispatches, so the read after each pump is race-free. */
 frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json) {
   if (parent == NULL || parent->st == NULL) {
     log_error("frame_spawn: no live parent frame");
@@ -3202,20 +3345,41 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
   uint64_t corr = ++parent->store_corr_seq;
   frame_t* child = _frame_spawn_post(parent, goal, context_json, 0, corr);
   if (child == NULL) return NULL;
-  (void)_frame_slot_wait(parent, &parent->spawn_slot.done,
-                         SA_FRAME_STORE_WAIT_MS);
-  uint8_t ok = (parent->spawn_slot.done && parent->spawn_slot.rc == 0);
-  int rc = parent->spawn_slot.rc;
-  parent->spawn_slot.in_use = 0;
-  parent->spawn_slot.child = NULL;   /* the caller ADOPTS the child either way */
+  uint64_t deadline =
+      platform_monotonic_ns() + (uint64_t)SA_FRAME_STORE_WAIT_MS * 1000000ULL;
+  frm_spawn_pending_t* pe = NULL;
+  for (;;) {
+    _frame_pump(parent);
+    for (frm_spawn_pending_t* w = parent->spawn_pending; w != NULL; w = w->next) {
+      if (w->corr == corr && w->done != 0) {
+        pe = w;
+        break;
+      }
+    }
+    if (pe != NULL) break;
+    if (platform_monotonic_ns() >= deadline) {
+      log_error("frame_spawn: corr %llu's admission reply never arrived in "
+                "time at '%s' — the child is abandoned loud",
+                (unsigned long long)corr, parent->sid_path);
+      break;
+    }
+    platform_sleep_ms(1);
+  }
+  uint8_t ok = (pe != NULL && pe->rc == 0);
+  int rc = (pe != NULL) ? pe->rc : 0;
+  /* The entry leaves the list (the caller ADOPTS the child either way; a
+     started child comes back engine-live). */
+  if (pe != NULL) {
+    frm_spawn_pending_t** p = &parent->spawn_pending;
+    while (*p != NULL && *p != pe) p = &(*p)->next;
+    if (*p == pe) *p = pe->next;
+    free(pe);
+  }
   if (!ok) {
-    if (parent->spawn_slot.done) {
+    if (pe != NULL) {
       log_error("frame_spawn: admission for '%s' under '%s' refused (%d) — "
                 "nothing committed; the child was never born",
                 frame_sid(child), parent->sid_path, rc);
-    } else {
-      log_error("frame_spawn: the admission reply never arrived in time at "
-                "'%s' — the child is abandoned loud", parent->sid_path);
     }
     frame_destroy(child);
     return NULL;
@@ -3233,8 +3397,8 @@ frame_t* frame_spawn(frame_t* parent, const char* goal, const char* context_json
    cause chain. engine_driven (Task 6's terminate path) posts FRM_CHILD_REPORT
    from the same reply route; a cell-verb report or a direct sync-API report
    only binds. */
-static int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
-                                   uint8_t engine_driven, const char* text) {
+int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
+                            uint8_t engine_driven, const char* text) {
   if (child == NULL || child->st == NULL) {
     log_error("frame_report: dead frame");
     return -1;
@@ -3406,6 +3570,136 @@ static void _frame_report_bind_compose(frame_t* f, frm_report_bind_payload_t* b)
   _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
               frm_store_batch_payload_destroy, "report bind batch");
   frm_report_bind_payload_destroy(b);
+}
+
+/* The parent-facing child-report post (frame_internal.h's contract): ONE
+   frm_child_report_payload_t{child_sid, failed} at the LIVE parent's actor.
+   The bind router (an engine-driven bind reply) and the terminal step's
+   never-hang fallback both reach the parent through it. */
+void _frame_child_notify_post(frame_t* child, uint8_t failed) {
+  if (child == NULL || child->st == NULL) {
+    log_error("frame: the child-notify for a dead child record — dropping "
+              "loud (a gone record's parent loses only a resume its own "
+              "engine end already handled)");
+    return;
+  }
+  frame_t* parent = child->parent;
+  if (parent == NULL || parent->st == NULL) {
+    log_error("frame: the child-notify for '%s' has no live parent log — "
+              "dropping loud (no engine could be live behind it)",
+              child->sid_path);
+    return;
+  }
+  frm_child_report_payload_t* crp =
+      (frm_child_report_payload_t*)get_clear_memory(sizeof(frm_child_report_payload_t));
+  crp->child_sid = strdup(child->sid_path);
+  if (crp->child_sid == NULL) {
+    log_error("frame: out of memory building the child-notify payload for '%s'",
+              child->sid_path);
+    frm_child_report_payload_destroy(crp);
+    return;
+  }
+  crp->failed = failed;
+  _frame_post(&parent->actor, (uint32_t)FRM_CHILD_REPORT, crp,
+              frm_child_report_payload_destroy, "child report");
+}
+
+/* The resume path's folded frame.join (frame_internal.h contract): ONE
+   frame.join event in the parent's log {child_sid}, FIRE-AND-POST — it runs
+   inside the parent's own dispatch (a nested caller never awaits), so the
+   store's FIFO commits it ahead of the resumed derive's scan. On-failure-
+   continue: every refusal logs loud + rolls the seq back best-effort and the
+   resume still happens. */
+void _frame_join_post(frame_t* parent, const char* child_sid) {
+  if (parent == NULL || parent->st == NULL) {
+    log_error("frame_join: the folded join for '%s' needs a live parent log",
+              child_sid != NULL ? child_sid : "?");
+    return;
+  }
+  if (child_sid == NULL || child_sid[0] == '\0') {
+    log_error("frame_join: the folded join needs the child's sid at '%s'",
+              parent->sid_path);
+    return;
+  }
+  uint64_t pseq = _frame_seq_alloc(parent);
+  json_value_t* payload = json_new_object();
+  if (payload == NULL) {
+    log_error("frame_join: out of memory building join payload");
+    _frame_seq_rollback(parent, pseq);
+    return;
+  }
+  json_object_set(payload, "child_sid", json_new_string(child_sid));
+  char* parent_text = _frame_event_json_full(parent->sid_path, pseq,
+                                             "frame.join", payload);
+  if (parent_text == NULL) {
+    _frame_seq_rollback(parent, pseq);
+    return;
+  }
+  char* k_pev = _frame_event_key(parent->sid_path, pseq);
+  if (k_pev == NULL) {
+    free(parent_text);
+    _frame_seq_rollback(parent, pseq);
+    return;
+  }
+  size_t total_bytes = strlen(k_pev) + strlen(parent_text);
+  if (total_bytes > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("frame_join: join batch for '%s' is %zu bytes, exceeding the "
+              "%d-byte WAL batch cap — refusing, never truncating",
+              child_sid, total_bytes, (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(k_pev);
+    free(parent_text);
+    _frame_seq_rollback(parent, pseq);
+    return;
+  }
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  bp->nops = 1;
+  bp->ops[0].key = k_pev;                    /* OWNED by the store round trip */
+  bp->ops[0].value = (uint8_t*)parent_text;  /* OWNED */
+  bp->ops[0].value_len = strlen(parent_text);
+  bp->op_name = "frame.join";                /* BORROWED literal */
+  bp->reply_to = NULL;                       /* fire-and-post (the resume path
+                                                never waits) */
+  bp->corr = 0;
+  _frame_post(&parent->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "join batch");
+}
+
+/* The meta/status=done put, FIRE-AND-POST (frame_internal.h contract — the
+   top engine's end-rule fix-up: a finish batch composed while live children
+   were pending carries NO status put (the CHILDREN yield keeps the frame
+   "running"), so an engine ending with live_children == 0 whose finish reply
+   raced the last child report completes the frame itself; nothing awaits
+   this batch, and the store's FIFO commits it ahead of anything the engine
+   posts after). */
+void _frame_status_post_fire(frame_t* f) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: status->done post on a dead frame");
+    return;
+  }
+  char* k_status = _frame_subkey(f->sid_path, "meta/status");
+  if (k_status == NULL) return;
+  uint8_t* val = (uint8_t*)get_memory(strlen(SA_FRAME_STATUS_DONE) + 1);
+  if (val == NULL) {
+    free(k_status);
+    log_error("frame: out of memory building the status put for '%s'",
+              f->sid_path);
+    return;
+  }
+  memcpy(val, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  bp->nops = 1;
+  bp->ops[0].key = k_status;    /* OWNED by the store round trip */
+  bp->ops[0].value = val;       /* OWNED */
+  bp->ops[0].value_len = strlen(SA_FRAME_STATUS_DONE);
+  bp->op_name = "status->done"; /* BORROWED literal */
+  bp->reply_to = NULL;
+  bp->corr = 0;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "status batch");
 }
 
 /* The public bind (pump-waits the corr-matched store reply at the child). */

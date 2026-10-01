@@ -21,8 +21,13 @@
 //   FRAME_STORE_CELL_RUN ─▶ FRM_CELL_EXECUTE ─▶ phase=CELL, yield
 //   PYRT_RESULT ─▶ slot completed ─▶ repost FRM_TURN ─▶ next turn
 //   FRAME_STORE_FINISH ─▶ the turn's message + completion commit ─▶
-//                            top: engine ends / child: quiet-completion
-//                            (Task 6's terminate)
+//                            top with live children: phase=CHILDREN, yield
+//                            top, none:      engine ends (status rode)
+//                            child, none:    quiet-completion terminate
+//                            (the content IS the outcome — reported to the
+//                             parent; its bind reply posts FRM_CHILD_REPORT)
+//   FRM_CHILD_REPORT ─▶ live_children-- + the folded frame.join ─▶
+//                            repost FRM_TURN (the parent RESUMES)
 //
 // ONE TURN = at most four mailbox dispatches; every arrow above is a
 // dispatch or a repost — never a wait. NO lock exists on the engine's path.
@@ -58,14 +63,19 @@
 //      re-derives from it. A FAILED cell does not end the turn: the next
 //      derive carries its status-1 text (traceback) back as a user message
 //      and the model self-corrects.
-//   4. content path — msg.append (or the empty-turn control event) and, for
-//      a TOP frame, the status->done put in ONE atomic FRAME_STORE_FINISH
-//      batch (message + completion cannot half-apply); its reply ends the
-//      engine. CHILD frames: Task 6's quiet-completion terminate — until
-//      then the child's status stays "running" (REPORT SEMANTICS: a report
-//      marks the REPORTING frame done at every depth; a child additionally
-//      binds the report event into the parent's log, a top frame has no
-//      parent log to bind into and reports into its OWN log).
+//   4. content path — msg.append (or the empty-turn control event) and, when
+//      the turn ENDS the frame, the status->done put in ONE atomic
+//      FRAME_STORE_FINISH batch (message + completion cannot half-apply).
+//      The END rule (spec §1/§4): a content turn while LIVE CHILDREN are
+//      pending yields — phase=FRAME_PHASE_CHILDREN, status stays "running",
+//      frame_run_loop returns 2 — and each child's report resumes it; an
+//      engine ending with live_children == 0 flips done. A CHILD with no
+//      children of its own ends quiet-complete: its content IS its outcome,
+//      reported to the parent through the engine-driven report bind (the
+//      reply posts FRM_CHILD_REPORT). (REPORT SEMANTICS: a report marks the
+//      REPORTING frame done at every depth; a child additionally binds the
+//      report event into the parent's log, a top frame has no parent log to
+//      bind into and reports into its OWN log.)
 //
 // MESSAGE-ARRAY CONSTRUCTION SIMPLIFICATION (documented): NO
 // tool_call/tool-role history is reconstructed. Each turn sends a FRESH
@@ -505,6 +515,10 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
     model_reply_destroy(e->turn_reply);
     e->turn_reply = NULL;
   }
+  free(e->finish_text);     /* the turn's outcome text dies with the engine
+                               (the FINISH reply that consumed it ran already,
+                               or the frame died mid-yield) */
+  e->finish_text = NULL;
   if (failed) e->engine_failed = 1;
 }
 
@@ -691,10 +705,11 @@ static void _loop_tool_path(frame_t* f, frame_engine_state_t* e,
 }
 
 /* The content path (no tool call: the turn ends): msg.append — or, on an
-   empty assistant turn, the empty-turn control event — and, for a TOP
-   frame, the meta/status=done put in ONE atomic FRAME_STORE_FINISH batch.
-   The reply ends the engine (top; child: Task 6's quiet-completion
-   terminate). */
+   empty assistant turn, the empty-turn control event — and, when the turn
+   ENDS the frame, the meta/status=done put in ONE atomic FRAME_STORE_FINISH
+   batch. The reply takes the END rule: live children pending → the CHILDREN
+   yield (status stays "running"); a child with none → the quiet-completion
+   terminate; a top frame → the engine ends (done rode the batch). */
 static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
                                model_reply_t* reply) {
   /* The content is read BEFORE the reply dies (the finish batch composes its
@@ -702,9 +717,19 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
      pointer), and the reply is destroyed after the batch composing used it. */
   const char* content =
       (reply->content != NULL && reply->content[0] != '\0') ? reply->content : NULL;
+  /* The status put rides the batch ONLY when this turn ends the frame: a
+     content turn while live children are pending yields at the finish reply
+     (status stays "running"; the completing end writes the put — this batch
+     when nothing raced, the engine's own fix-up otherwise). */
+  int write_status = (_frame_is_child(f) == 0 && e->live_children == 0) ? 1 : 0;
   uint64_t corr = _frame_store_corr_next(f);
-  int frc = _frame_engine_finish_post(f, content, _frame_is_child(f) ? 0 : 1,
+  int frc = _frame_engine_finish_post(f, content, write_status,
                                       corr, _frame_actor(f));
+  /* The outcome text rides the engine state to the finish reply's end rule
+     (the CHILDREN yield, the quiet-completion bind, and the top end all
+     consume or free it there). */
+  free(e->finish_text);
+  e->finish_text = (content != NULL) ? strdup(content) : NULL;
   model_reply_destroy(reply);
   if (frc != 0) {
     /* Pre-post refusal (already logged loud; the seq rolled back): the
@@ -716,7 +741,7 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
   e->phase = FRAME_PHASE_STORE;
   e->store_kind = FRAME_STORE_FINISH;
   e->store_corr = corr;
-  /* yield: the FINISH reply ends the engine */
+  /* yield: the FINISH reply takes the END rule */
 }
 
 /* The reply processing, shared by the sync and the async arrival paths —
@@ -935,12 +960,53 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
   (void)_loop_post_turn(f);   /* resume */
 }
 
+/* The terminal step (spec §4): end the live engine; a CHILD (not already
+   done, parent live) binds ONE frame.report with the outcome text — the
+   engine-driven bind makes the child's router post FRM_CHILD_REPORT on the
+   CONFIRMED commit — and an already-done child (the report verb bound
+   everything; its engine ends at the next is_done check) posts just the
+   resume. A TOP frame failure makes NO status change (the pinned
+   cap-is-a-failure shape). A terminate re-entered on an already-ended engine
+   is a loud no-op. Never silent. */
+static void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text) {
+  frame_engine_state_t* e = _frame_engine_state(f);
+  if (e == NULL || !e->engine_live) {
+    log_error("loop: a terminal step at '%s' reached an already-ended engine "
+              "— loud no-op", (f != NULL) ? frame_sid(f) : "?");
+    return;
+  }
+  _loop_engine_end(f, e, ok ? 0 : 1);
+  if (_frame_is_child(f) == 0) {
+    return;   /* a top frame has no parent log to notify */
+  }
+  if (frame_is_done(f) == 0) {
+    /* The bind: the child composes ITS report record (its pre-allocated
+       seq) + the outcome text; the PARENT composes the whole cross-subtree
+       batch (the child's record + the child's status=done + its bound
+       report event) and the store executes it as ONE atomic commit; the
+       reply routes back to THIS child, whose router posts FRM_CHILD_REPORT
+       to the parent. */
+    if (_frame_report_bind_post(f, 0, 1, (text != NULL) ? text : "") != 0) {
+      /* The compose refused loud (nothing was posted) — the resume still
+         fires: a parent must never hang because a WAL write failed. */
+      log_error("loop: the terminal report bind for '%s' refused pre-post — "
+                "the parent still resumes (never hang on a WAL failure)",
+                frame_sid(f));
+      _frame_child_notify_post(f, ok ? 0 : 1);
+    }
+    return;
+  }
+  /* Already done (the report verb's bind is confirmed committed): the resume
+     is the only missing piece — post it directly. */
+  _frame_child_notify_post(f, ok ? 0 : 1);
+}
+
 /* The FRAME_STORE_FINISH reply's continuation: rc != 0 → control
-   "commit-error" + engine end failed; rc == 0 → the END rule (§1): a TOP
-   frame's engine ends (the status put rode the batch). A CHILD's
-   quiet-completion terminate is Task 6's _frame_engine_terminate — until it
-   lands the child's engine ends and its status stays "running" (the old
-   loop's shape). */
+   "commit-error" + engine end failed; rc == 0 → the END rule (§1/§4):
+   live children pending → the CHILDREN yield (each child report resumes);
+   a child with none → its quiet-completion terminate (the content IS its
+   outcome, reported to the parent); a top frame → the engine ends with the
+   frame done. */
 static void _loop_engine_on_finish(frame_t* f, frame_engine_state_t* e, int rc) {
   if (rc != 0) {
     log_error("loop: the turn finish batch was refused (%d) at '%s'",
@@ -949,6 +1015,36 @@ static void _loop_engine_on_finish(frame_t* f, frame_engine_state_t* e, int rc) 
     _loop_engine_end(f, e, 1);
     return;
   }
+  /* The turn's outcome text (consumed by every branch below). */
+  char* text = e->finish_text;
+  e->finish_text = NULL;
+  if (e->live_children > 0) {
+    /* THE YIELD (Task 5): a content turn while live children are pending
+       does NOT end the frame — the engine goes quiet in FRAME_PHASE_CHILDREN
+       (status stays "running"; frame_run_loop returns 2) and each child's
+       report reposts the turn. */
+    e->phase = FRAME_PHASE_CHILDREN;
+    free(text);
+    return;
+  }
+  if (_frame_is_child(f) != 0) {
+    /* The child's quiet completion (spec §4): the content IS its outcome —
+       the engine reports it to the parent (the bind's reply posts
+       FRM_CHILD_REPORT) and the engine ends. */
+    _frame_engine_terminate(f, 1, (text != NULL) ? text : "");
+    free(text);
+    return;
+  }
+  /* TOP, no live children: the engine ends. The status put RODE this batch —
+     unless the yield shape raced (the batch composed while children were
+     pending and the last child's report landed before this reply): an engine
+     ending with live_children == 0 is done either way, so fire the status
+     put now when the batch did not write it (fire-and-post; the store's FIFO
+     commits it ahead of anything this engine could post after). */
+  if (frame_is_done(f) == 0) {
+    _frame_status_post_fire(f);
+  }
+  free(text);
   _loop_engine_end(f, e, 0);
 }
 
@@ -966,11 +1062,16 @@ int _frame_engine_start(frame_t* f) {
   }
   /* The per-run knobs (§1: turns_issued resets at frame_start — the cap
      stays a per-run bound, exactly like the old loop's; a full-run retry
-     gets a fresh budget and fresh failed-knob state). */
+     gets a fresh budget and fresh failed-knob state). live_children resets
+     with the engine (spec's recorded restart limit: the count is THIS run's
+     in-memory awaitables — children from a prior run are the restart/
+     reconcile slice's business). */
   e->turns_issued = 0;
   e->model_retries = 0;
   e->model_retry_step = 0;
   e->engine_failed = 0;
+  e->live_children = 0;
+  e->finish_text = NULL;
   e->phase = FRAME_PHASE_NONE;
   e->store_kind = (frame_store_kind_e)0;
   e->store_corr = 0;
@@ -1001,6 +1102,17 @@ void _frame_engine_turn(frame_t* f) {
     _loop_engine_end(f, e, 1);
     return;
   }
+  if (e->phase != FRAME_PHASE_NONE && e->phase != FRAME_PHASE_CHILDREN) {
+    /* A duplicate/late continuation raced a step already in flight (two
+       child reports each post their resume; the engine runs ONE turn at a
+       time): drop loud. Nothing is lost durably — the in-flight turn's own
+       continuation or the next resumed derive re-reads the store. (The
+       CHILDREN phase itself IS the resume dispatch point: a continuation
+       arriving there runs the step.) */
+    log_error("frame: FRM_TURN late-dropped at '%s' — a turn step (phase %u) "
+              "is already in flight", frame_sid(f), (unsigned)e->phase);
+    return;
+  }
 
   if (e->model_retry_step != 0) {
     /* A model-RETRY continuation: the old loop's retry did not spend a turn
@@ -1016,10 +1128,12 @@ void _frame_engine_turn(frame_t* f) {
       return;
     }
     /* A report (from any earlier turn's cell) already ended this frame —
-       clean completion whether it is now top or child (the advisory direct
-       read, spec §5's carve-out). */
+       clean completion (the advisory direct read, spec §5's carve-out). For
+       a CHILD the terminal step posts its parent's resume (the report verb's
+       bind is confirmed committed; the resume is the one missing piece); a
+       TOP frame simply ends. */
     if (frame_is_done(f)) {
-      _loop_engine_end(f, e, 0);
+      _frame_engine_terminate(f, 1, NULL);
       return;
     }
     /* Fail loud at the cap: never an infinite loop. */
@@ -1116,15 +1230,56 @@ void _frame_engine_cell_done(frame_t* f) {
 }
 
 void _frame_engine_child_report(frame_t* f, frm_child_report_payload_t* payload) {
-  /* Task 5 fills this behavior (the live-children bookkeeping + the
-     resume); Task 3 declares the route. Nothing posts FRM_CHILD_REPORT
-     before a terminate reports it — a delivery here is a routing bug. */
-  log_error("loop: FRM_CHILD_REPORT for '%s' at '%s' — the parent-resume "
-            "route is not wired yet (Task 5 fills it); dropping loud",
-            (payload != NULL && payload->child_sid != NULL)
-                ? payload->child_sid : "?",
-            (f != NULL) ? frame_sid(f) : "?");
+  /* Task 5's parent-resume behavior. The binding ALREADY happened (the
+     child's engine-driven bind batch was confirmed committed before the
+     FRM_CHILD_REPORT was posted) — this is bookkeeping + the resume. The
+     pending-children counter is the liveness shape (the Task-4
+     pending-submits precedent; the ponyc pointer's "pending-message
+     accounting" made honest): decrement, fold the join, repost the turn. */
+  const char* child_sid = (payload != NULL && payload->child_sid != NULL)
+                              ? payload->child_sid : "?";
+  uint8_t failed = (payload != NULL) ? payload->failed : 0;
+  if (f == NULL) {
+    log_error("loop: FRM_CHILD_REPORT for '%s' with no frame — dropped loud",
+              child_sid);
+    if (payload != NULL) frm_child_report_payload_destroy(payload);
+    return;
+  }
+  if (failed != 0) {
+    /* The parent's thread logs a failed child's resume loudly (spec's
+       contract); the failure text itself is in the bound report event. */
+    log_error("loop: child '%s' ended FAILED under '%s' — its failure report "
+              "is bound in this frame's log; the engine resumes",
+              child_sid, frame_sid(f));
+  } else {
+    log_info("loop: child '%s' reported under '%s' — the engine resumes",
+             child_sid, frame_sid(f));
+  }
+  /* The liveness counter: children admitted-and-started, not yet resumed. A
+     zero-count delivery is loud (nothing counted it) — the join fold and
+     the resume decision below still take their normal paths. */
+  frame_engine_state_t* e = _frame_engine_state(f);
+  if (e != NULL && e->live_children > 0) {
+    e->live_children--;
+  } else {
+    log_error("loop: a child report for '%s' arrived at '%s' with NO child "
+              "counted (in-memory bookkeeping of this process's spawns; a "
+              "restarted engine resumes without one)", child_sid, frame_sid(f));
+  }
+  /* Fold the join (§4): ONE frame.join in this frame's log, fire-and-post —
+     the store's FIFO commits it ahead of anything this dispatch posts after
+     (the resumed derive's scan sees it). On-failure-continue. */
+  _frame_join_post(f, (payload != NULL) ? payload->child_sid : NULL);
   if (payload != NULL) frm_child_report_payload_destroy(payload);
+  /* Resume ONLY a live engine (a direct-API caller's join bookkeeping still
+     landed above): the reposted turn re-derives — the bound report event is
+     in the store ahead of the scan, because the report message posts only
+     after the bind's commit reply. */
+  if (e == NULL || !e->engine_live) {
+    return;
+  }
+  (void)_loop_post_turn(f);   /* the parent RESUMES (the turn-step guard keeps
+                                 ONE turn in flight when two reports race) */
 }
 
 /* ---------------------------------------------------------------------------

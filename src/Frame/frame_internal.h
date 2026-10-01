@@ -72,7 +72,8 @@ typedef enum frame_phase_e {
   FRAME_PHASE_MODEL,        /* an async model submit is in flight */
   FRAME_PHASE_CELL,         /* the turn's one cell is in flight */
   FRAME_PHASE_STORE,        /* a store round trip is in flight (Task 2's vocabulary) */
-  FRAME_PHASE_CHILDREN      /* yielded: live children pending (Task 5 fills this) */
+  FRAME_PHASE_CHILDREN      /* yielded: live children pending; each child
+                               report's FRM_CHILD_REPORT reposts the turn */
 } frame_phase_e;
 
 /* What the pending FRAME_PHASE_STORE round trip is for (the engine state's
@@ -108,6 +109,11 @@ typedef struct frame_engine_state_t {
                                   (skips the checks + the turn count, exactly
                                   like the old loop's same-array retry) */
   uint8_t engine_failed;       /* the last terminal step failed (frame_run_loop's rc) */
+  size_t live_children;        /* children admitted-and-STARTED, not yet resumed
+                                  (Task 5; single-writer: the frame's dispatch
+                                  thread; in-memory bookkeeping of THIS
+                                  process's spawns — a restarted engine starts
+                                  at 0, spec's recorded restart limit) */
   uint64_t turn_cell_corr;     /* the loop's audit corr of the cell the
                                   pending cell.run round trip committed (the
                                   paired refusal result carries it) */
@@ -115,6 +121,11 @@ typedef struct frame_engine_state_t {
                                   the engine between the model arrival and its
                                   path's dispatch turn (the CELL_RUN reply
                                   runs the cell out of it) */
+  char* finish_text;           /* the content path's OUTCOME text, OWNED: it
+                                  rides the engine state to the finish
+                                  reply's end rule — the CHILDREN yield, the
+                                  child's quiet-completion report bind, or
+                                  the top end consume/free it there */
 
   /* --- the async submit's LIFETIME HANDOFF (lock-free; atomics are
      house-legal — the frame layer stays lock-free post store-actor) ------
@@ -188,9 +199,12 @@ void _frame_engine_model_arrived(frame_t* f, frm_model_payload_t* payload);
    step resume; see _frame_engine_store_reply's CELL_RUN path.) */
 void _frame_engine_cell_done(frame_t* f);
 
-/* The FRM_CHILD_REPORT behavior (Task 5 fills it; Task 3 declares the route):
-   bookkeeping + resume-only-a-live-engine. CONSUMES the payload on every
-   path. */
+/* The FRM_CHILD_REPORT behavior (the parent's resume, spec §4): decrement the
+   engine's live_children liveness counter (a zero-count delivery logs loud),
+   fold the child's frame.join into this dispatch as a fire-and-post store
+   batch, and — resume only a live engine — repost the FRM_TURN continuation
+   (the re-derive reads the bound report event the store committed BEFORE the
+   report message was posted). CONSUMES the payload on every path. */
 void _frame_engine_child_report(frame_t* f, frm_child_report_payload_t* payload);
 
 /* --- the async submit's lifetime handoff (frame.c implements; loop.c's
@@ -358,14 +372,48 @@ int _frame_event_post_fire(frame_t* f, const char* type_name,
 /* Best-effort seq roll-back of an abandoned pre-allocation (§5). */
 void _frame_seq_rollback(frame_t* f, uint64_t abandoned);
 
+/* The terminal step's cross-subtree report bind (Task 5's quiet-completion
+   path already uses it; Task 6's failure terminate keeps the shape): the
+   CHILD composes only its own frame.report record (its pre-allocated seq)
+   and posts FRM_REPORT_BIND{engine_driven = 1} to the parent's actor — the
+   parent composes the whole three-op batch, the store executes it as ONE
+   atomic commit, and its corr-matched reply routes back to the child's
+   actor, whose router posts ONE FRM_CHILD_REPORT to the parent. Returns 0
+   once POSTED; nonzero on the pre-post refusals (already logged; nothing
+   was posted — the caller still notifies the parent directly, never hang). */
+int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
+                            uint8_t engine_driven, const char* text);
+
+/* The resume path's folded frame.join (spec §4): ONE frame.join event in the
+   parent's log {child_sid}, FIRE-AND-POST (corr 0, reply_to NULL — it runs
+   inside the parent's own dispatch; the store's FIFO commits it ahead of
+   anything the engine posts after, so the resumed derive's scan sees the
+   join). On-failure-continue: every refusal logs loud + rolls the seq back
+   best-effort, the resume still happens. */
+void _frame_join_post(frame_t* parent, const char* child_sid);
+
+/* The meta/status=done put, FIRE-AND-POST (the top engine's end-rule fix-up:
+   a finish batch composed while live children were pending carries no status
+   put — the CHILDREN yield's frame stays "running" — so an engine ending
+   with live_children == 0 whose finish reply raced the last child report
+   writes the completion itself; nothing awaits it). */
+void _frame_status_post_fire(frame_t* f);
+
+/* The parent-facing child-report post (the bind router's resume and the
+   terminate's never-hang fallback): ONE frm_child_report_payload_t
+   {child_sid, failed} at the LIVE parent's actor. */
+void _frame_child_notify_post(frame_t* child, uint8_t failed);
+
 /* The content path's ONE atomic turn-end batch (loop.c's FRAME_STORE_FINISH
    round trip): the assistant msg.append event — or, on an empty assistant
    turn, the empty-turn control event (payload {kind, text:null}, the exact
    shape _loop_control composes) — at the frame's PRE-ALLOCATED seq, plus the
-   meta/status=done put for a TOP engine (a child's status stays "running"
-   and its content end reports via Task 6's terminate), in ONE root batch.
-   Returns 0 once POSTED; nonzero on the pre-post refusals (already logged;
-   the seq rolled back — nothing was posted). */
+   meta/status=done put for a TOP engine whose turn ENDS it (write_status;
+   a content turn while live children are pending composes WITHOUT the put —
+   the CHILDREN yield leaves the frame "running" — and a child's status stays
+   "running", its content end reporting via the terminate's bind), in ONE
+   root batch. Returns 0 once POSTED; nonzero on the pre-post refusals
+   (already logged; the seq rolled back — nothing was posted). */
 int _frame_engine_finish_post(frame_t* f, const char* append_text,
                               int write_status, uint64_t corr,
                               actor_t* reply_to);

@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <deque>
+#include <map>
 #include <string>
 #include <vector>
 extern "C" {
@@ -11,6 +13,9 @@ extern "C" {
 #include "../src/Frame/frame_messages.h"
 #include "../src/Frame/frame_bridge.h"
 #include "../src/Frame/frame_internal.h"
+#include "../src/Frame/loop.h"
+#include "../src/Frame/model.h"
+#include "../src/Platform/platform_time.h"
 #include "../src/Scheduler/scheduler.h"
 #include "../src/Util/json.h"
 #include "../src/Util/allocator.h"
@@ -818,5 +823,429 @@ TEST(TestFrame, TestReportBindIsOneCrossSubtreeBatch) {
   frame_destroy(parent);
   wave_db_close(db);
 }
+
+/* --- Task 5: the orchestration slice (spawn = admit + start; the parent
+   yields at FRAME_PHASE_CHILDREN and resumes on child reports) -------------
+
+   The pooled tree tests run REAL scheduler-pool workers with a scripted SYNC
+   backend completing inline inside the derive-reply dispatch: µs canned
+   replies — model.h's §6 carve-out is about REAL model calls on a pool
+   worker (a production backend implements submit), not µs canned ones.
+   Python gate: the spawn cells run through the frame's own pyrt. */
+
+#if defined(SA_HAS_PYTHON)
+
+extern "C" void py_agent_init(void);   /* idempotent; re-mounts the bridge sink */
+
+/* Decode ONE canned completion body into a model_reply_t (test_loop.cpp's
+   scripted_decode, verbatim shape: message.content string-or-absent;
+   tool_calls[0].function.arguments as a JSON string containing the argument
+   object). */
+static int scripted_decode(const std::string& body, model_reply_t** reply_out,
+                           char** error_out) {
+  char* err = NULL;
+  json_value_t* root = json_parse(body.c_str(), body.size(), &err);
+  if (err != NULL) free(err);
+  if (root == NULL) {
+    *error_out = strdup("scripted model: body is not valid JSON");
+    return -1;
+  }
+  json_value_t* choices = json_get(root, "choices");
+  json_value_t* choice = (choices != NULL && json_type(choices) == JSON_ARRAY)
+                             ? json_at(choices, 0) : NULL;
+  json_value_t* message =
+      (choice != NULL && json_type(choice) == JSON_OBJECT) ? json_get(choice, "message")
+                                                           : NULL;
+  if (message == NULL) {
+    json_value_destroy(root);
+    *error_out = strdup("scripted model: no message in choices[0]");
+    return -1;
+  }
+  model_reply_t* r = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
+
+  json_value_t* content = json_get(message, "content");
+  if (content == NULL || json_type(content) == JSON_NULL) {
+    r->content = strdup("");
+  } else {
+    r->content = strdup(json_as_string(content));
+  }
+
+  json_value_t* calls = json_get(message, "tool_calls");
+  if (calls != NULL && json_type(calls) == JSON_ARRAY && json_size(calls) > 0) {
+    json_value_t* fn = json_get(json_at(calls, 0), "function");
+    json_value_t* args = (fn != NULL) ? json_get(fn, "arguments") : NULL;
+    json_value_t* args_obj = args;
+    json_value_t* parsed_args = NULL;
+    if (args != NULL && json_type(args) == JSON_STRING) {
+      char* aerr = NULL;
+      const char* args_text = json_as_string(args);
+      parsed_args = json_parse(args_text, strlen(args_text), &aerr);
+      if (aerr != NULL) free(aerr);
+      if (parsed_args == NULL) {
+        json_value_destroy(root);
+        model_reply_destroy(r);
+        *error_out = strdup("scripted model: arguments string is not JSON");
+        return -1;
+      }
+      args_obj = parsed_args;
+    }
+    if (args_obj == NULL || json_type(args_obj) != JSON_OBJECT) {
+      json_value_destroy(root);
+      model_reply_destroy(r);
+      *error_out = strdup("scripted model: arguments are neither string nor object");
+      return -1;
+    }
+    json_value_t* code = json_get(args_obj, "code");
+    if (code == NULL || json_type(code) != JSON_STRING) {
+      if (parsed_args != NULL) json_value_destroy(parsed_args);
+      json_value_destroy(root);
+      model_reply_destroy(r);
+      *error_out = strdup("scripted model: no string `code` in arguments");
+      return -1;
+    }
+    r->tool_code = strdup(json_as_string(code));
+    if (parsed_args != NULL) json_value_destroy(parsed_args);
+  }
+  json_value_destroy(root);
+  *reply_out = r;
+  return 0;
+}
+
+/* JSON-string escaping (test-loop body shapes carry two layers: the
+   arguments value is itself a JSON-encoded string). */
+static std::string json_escape(const std::string& s) {
+  std::string out;
+  for (char c : s) {
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      default:   out += c;
+    }
+  }
+  return out;
+}
+
+/* An `execute` tool-call completion body whose `code` argument is `code`. */
+static std::string canned_cell_body(const std::string& code) {
+  std::string inner = std::string("{\"code\":\"") + json_escape(code) + "\"}";
+  return std::string(
+             R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+             R"json({"type":"function","function":{"name":"execute",)json"
+             R"json("arguments":")json") + json_escape(inner) +
+             std::string(R"json("}}]}}]})json");
+}
+
+/* A content-only completion body. */
+static std::string canned_content_body(const std::string& text) {
+  return std::string(
+      R"json({"choices":[{"message":{"role":"assistant","content":")json") + text +
+      std::string(R"json("}}]})json");
+}
+
+/* The inline test's harness shape (test_loop.cpp's scripted_model_t): a
+   queue of canned bodies popped in order. */
+typedef struct spawn_then_content_model_t {
+  model_backend_t base;
+  std::vector<std::string> replies;
+} spawn_then_content_model_t;
+
+static int spawn_then_content_complete(void* self, json_value_t* messages,
+                                       json_value_t* tools, char** raw_out,
+                                       model_reply_t** reply_out,
+                                       char** error_out) {
+  (void)tools;
+  (void)raw_out;
+  *reply_out = NULL;
+  *error_out = NULL;
+  spawn_then_content_model_t* sm = (spawn_then_content_model_t*)self;
+  if (sm->replies.empty()) {
+    *error_out = strdup("spawn-then-content model: queue empty");
+    return -1;
+  }
+  std::string body = sm->replies.front();
+  sm->replies.erase(sm->replies.begin());
+  return scripted_decode(body, reply_out, error_out) == 0 ? 0 : -1;
+}
+
+/* The pooled tests' harness: canned replies KEYED by the derived system
+   prompt's Goal line — the pool schedules the tree's frames in any order, so
+   a keyed queue (not one shared ordered queue) is what makes the canned
+   replies order-proof. An exhausted queue repeats its LAST canned reply —
+   "any later parent turn" in the plan's listing. */
+typedef struct goal_keyed_model_t {
+  model_backend_t base;
+  std::map<std::string, std::deque<std::string>> queues;
+  std::map<std::string, std::string> sticky;
+} goal_keyed_model_t;
+
+static int goal_keyed_complete(void* self, json_value_t* messages,
+                               json_value_t* tools, char** raw_out,
+                               model_reply_t** reply_out, char** error_out) {
+  (void)tools;
+  (void)raw_out;
+  *reply_out = NULL;
+  *error_out = NULL;
+  goal_keyed_model_t* gk = (goal_keyed_model_t*)self;
+
+  std::string key;
+  if (json_size(messages) > 0) {
+    json_value_t* sys = json_at(messages, 0);
+    json_value_t* content = (sys != NULL) ? json_get(sys, "content") : NULL;
+    const char* text = (content != NULL) ? json_as_string(content) : "";
+    const char* goal = strstr(text, "Goal: ");
+    if (goal != NULL) {
+      goal += strlen("Goal: ");
+      key.assign(goal, strcspn(goal, "\r\n"));
+    }
+  }
+  std::string body;
+  auto q = gk->queues.find(key);
+  if (q != gk->queues.end() && !q->second.empty()) {
+    body = q->second.front();
+    q->second.pop_front();
+    gk->sticky[key] = body;
+  } else {
+    auto s = gk->sticky.find(key);
+    if (s == gk->sticky.end()) {
+      *error_out = strdup("goal-keyed model: no canned reply for the goal line");
+      return -1;
+    }
+    body = s->second;
+  }
+  return scripted_decode(body, reply_out, error_out) == 0 ? 0 : -1;
+}
+
+/* Poller for the pooled tests: the pool runs everything — no joins, ever;
+   the test waits for the terminal status like a real embedder would. */
+static bool wait_frame_done(frame_t* f, int round10ms) {
+  for (int i = 0; i < round10ms && frame_is_done(f) == 0; i++)
+    platform_sleep_ms(10);
+  return frame_is_done(f) != 0;
+}
+
+TEST(TestFrameTree, TestPooledParentSpawnsChildAndResumesOnReport) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  cfg.pool = pool;
+
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;    /* the store actor rides the SAME pool (a pooled
+                              frame requires a pooled store — Task 2's guard) */
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_t* parent = frame_create(db, NULL, "parent goal", &cfg);
+  ASSERT_NE(parent, nullptr);
+
+  /* The parent's turn 1 = execute the spawn cell; the child's turn 1 =
+     content-only "leaf done quietly"; any later parent turn = content-only
+     "parent observed leaf" (the sticky repeat). */
+  goal_keyed_model_t gk = {};   /* zero-init: the vtable's members set below */
+  gk.base.complete = goal_keyed_complete;
+  gk.queues["parent goal"].push_back(canned_cell_body(
+      "import actor\nactor.spawn('leaf goal', None)\nprint('spawned')"));
+  gk.queues["parent goal"].push_back(canned_content_body("parent observed leaf"));
+  gk.queues["leaf goal"].push_back(canned_content_body("leaf done quietly"));
+  frame_set_model_backend(parent, &gk.base);
+
+  ASSERT_EQ(frame_start(parent), 0);   /* the event-driven entry */
+  EXPECT_TRUE(wait_frame_done(parent, 6000))
+      << "the parent resumed on the child's report and completed";
+
+  /* The child's subtree's effects, bound in the parent's log: the spawn
+     event + the child's frame.report (quiet completion) + the folded
+     frame.join. */
+  json_value_t* events = load_events(parent);
+  ASSERT_NE(events, nullptr);
+  size_t n_report = 0, n_spawn = 0, n_join = 0;
+  std::string child_sid;
+  std::string report_text;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    json_value_t* payload = json_get(rec, "payload");
+    if (event_is(rec, "frame.spawn")) n_spawn++;
+    if (event_is(rec, "frame.report")) {
+      n_report++;
+      if (child_sid.empty()) {
+        child_sid = json_as_string(json_get(payload, "child_sid"));
+        report_text = json_as_string(json_get(payload, "text"));
+      }
+    }
+    if (event_is(rec, "frame.join")) n_join++;
+  }
+  EXPECT_EQ(n_spawn, 1u);
+  EXPECT_EQ(n_report, 1u) << "exactly ONE report per child, regardless of the "
+                             "child's work volume (S004 accountability)";
+  EXPECT_EQ(n_join, 1u) << "join folded into the resume path";
+  EXPECT_FALSE(child_sid.empty());
+  EXPECT_EQ(report_text, "leaf done quietly")
+      << "the quiet completion REPORTS its assistant content into the parent";
+
+  /* The child's own log, WITHOUT a live handle (the spawn happened inside
+     the engine; the test never held the child): frame_resume(db, child_sid,
+     &plain) with a POOL-LESS config opens its DONE subtree as an inline
+     handle. A resumed done frame re-runs nothing (frame_start refuses for
+     done frames); the handle's reads ride the documented DIRECT debug scan
+     (frame_debug_events) — NO sync write API is available on it because the
+     store here is POOLED (spec §5's inline-only rule: a sync write would
+     refuse loud, which is exactly the shape this assertion documents).
+     Assert its ONE frame.report with the quiet content, then destroy the
+     handle. */
+  {
+    frame_config_t plain = test_config();   /* pool NULL: inline handle shape */
+    frame_t* resumed = frame_resume(db, child_sid.c_str(), &plain);
+    ASSERT_NE(resumed, nullptr);
+    json_value_t* child_events = load_events(resumed);
+    ASSERT_NE(child_events, nullptr);
+    size_t n_child_report = 0;
+    for (size_t i = 0; i < json_size(child_events); i++) {
+      json_value_t* rec = json_at(child_events, i);
+      if (event_is(rec, "frame.report")) {
+        n_child_report++;
+        EXPECT_STREQ(json_as_string(json_get(json_get(rec, "payload"), "text")),
+                     "leaf done quietly");
+      }
+    }
+    EXPECT_EQ(n_child_report, 1u);
+    json_value_destroy(child_events);
+    frame_destroy(resumed);
+  }
+  json_value_destroy(events);
+
+  frame_destroy(parent);   /* the resumed-child handle was destroyed above */
+  scheduler_pool_stop(pool);   /* documented order: stop, then close, then destroy */
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
+}
+
+TEST(TestFrameTree, TestPooledTreeKeepsOneReportPerChildWithContiguousSeq) {
+  /* The accountability storm: N children spawned from one parent cell, each
+     content-quitting; the parent's log holds N bound reports in a CONTIGUOUS
+     seq chain under concurrent scheduling — the property the old per-frame
+     write-lock test chased, proven without a lock (the store actor is the
+     only serializer; the seq counters pre-allocate in each frame's own
+     dispatch). */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  scheduler_pool_t* pool = scheduler_pool_create(4);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  cfg.pool = pool;
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_t* parent = frame_create(db, NULL, "storm root", &cfg);
+  ASSERT_NE(parent, nullptr);
+
+  /* The parent's first turn: ONE cell that spawns N = 8 children in a loop;
+     its next (content) turn quits while the children run ->
+     FRAME_PHASE_CHILDREN. */
+  goal_keyed_model_t gk = {};
+  gk.base.complete = goal_keyed_complete;
+  gk.queues["storm root"].push_back(canned_cell_body(
+      "import actor\nfor i in range(8):\n"
+      "    actor.spawn('leaf ' + str(i), None)\n"
+      "print('spawned 8')"));
+  gk.queues["storm root"].push_back(canned_content_body("storm observed"));
+  for (int i = 0; i < 8; i++) {
+    gk.queues["leaf " + std::to_string(i)].push_back(
+        canned_content_body("leaf " + std::to_string(i) + " done quietly"));
+  }
+  frame_set_model_backend(parent, &gk.base);
+
+  ASSERT_EQ(frame_start(parent), 0);
+  EXPECT_TRUE(wait_frame_done(parent, 6000));
+
+  /* Assert: the ONE spawn cell + 8 frame.spawn events + 8 bound frame.report
+     events + 8 frame.join events; every record's cause == the previous
+     record's seq; seq runs 1..N_total contiguous — the store actor's
+     serialization produced no gaps and no duplicates without any lock. */
+  json_value_t* events = load_events(parent);
+  ASSERT_NE(events, nullptr);
+  size_t n_run = 0, n_spawn = 0, n_report = 0, n_join = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    ASSERT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)(i + 1))
+        << "the seq chain runs 1..N contiguous";
+    json_value_t* cause = json_get(rec, "cause");
+    if (i == 0) {
+      EXPECT_EQ(json_type(cause), JSON_NULL);
+    } else {
+      EXPECT_EQ(json_as_int(cause), (int64_t)i)
+          << "every record's cause is the previous record's seq";
+    }
+    if (event_is(rec, "cell.run")) {
+      n_run++;
+    } else if (event_is(rec, "frame.spawn")) {
+      n_spawn++;
+    } else if (event_is(rec, "frame.report")) {
+      n_report++;
+    } else if (event_is(rec, "frame.join")) {
+      n_join++;
+    }
+  }
+  EXPECT_EQ(n_run, 1u);
+  EXPECT_EQ(n_spawn, 8u);
+  EXPECT_EQ(n_report, 8u) << "exactly ONE report per child under concurrent "
+                             "scheduling";
+  EXPECT_EQ(n_join, 8u);
+  json_value_destroy(events);
+
+  frame_destroy(parent);
+  scheduler_pool_stop(pool);
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
+}
+
+TEST(TestFrame, TestInlineParentYieldsAwaitingChildren) {
+  /* NO pool: the inline shape. The parent's scripted model answers its FIRST
+     turn with the spawn tool call (its cell admits + starts the child — the
+     child's engine queues, nobody pumps an inline actor but its driver), and
+     its SECOND turn with content-only text while the child is live:
+     frame_run_loop returns 2 — yielded, live, awaiting children (the child's
+     own loop is the test's business, as in the synchronous world today). */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  frame_t* parent = frame_create(db, NULL, "inline await", &cfg);
+  ASSERT_NE(parent, nullptr);
+  spawn_then_content_model_t scm = {};   /* zero-init: the vtable's members set below */
+  scm.base.complete = spawn_then_content_complete;
+  scm.replies.push_back(canned_cell_body(
+      "import actor\nactor.spawn('leaf goal', None)\nprint('spawned')"));
+  scm.replies.push_back(canned_content_body("parent waits on the leaf"));
+  frame_set_model_backend(parent, &scm.base);
+
+  EXPECT_EQ(frame_run_loop(parent), 2) << "yielded awaiting children";
+  EXPECT_EQ(frame_is_done(parent), 0) << "live children hold the frame running";
+
+  json_value_t* events = load_events(parent);
+  ASSERT_NE(events, nullptr);
+  size_t n_spawn = 0;
+  std::string child_sid;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "frame.spawn")) {
+      n_spawn++;
+      child_sid = json_as_string(json_get(json_get(rec, "payload"), "child_sid"));
+    }
+  }
+  EXPECT_EQ(n_spawn, 1u);
+  EXPECT_FALSE(child_sid.empty());
+  json_value_destroy(events);
+
+  frame_destroy(parent);
+  wave_db_close(db);
+}
+
+#endif /* python gate */
 
 #endif /* SA_HAS_WDB */

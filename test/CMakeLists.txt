@@ -173,8 +173,14 @@ if (BUILD_TESTING)
         # the same CPython-owned suppression classes (TestPyrt predates them).
         # TestLiveLoop runs the opt-in live gate (real cells through the
         # frame's own pyrt) when SA_TEST_OLLAMA_URL is set — same classes.
+        # TestFrameTree is the orchestration slice's pooled tree: its spawn
+        # cells run through the frame's own pyrt on real pool workers — the
+        # same CPython-owned classes. TestFrame.TestInlineParentYieldsAwaiting
+        # Children (Task 5's inline yield pin) runs a spawn cell the same way.
         if(_test_name MATCHES "^TestPyrt" OR _test_name MATCHES "^TestLoop" OR
-           _test_name MATCHES "^TestLiveLoop" OR _test_name MATCHES "^TestPyAgent")
+           _test_name MATCHES "^TestLiveLoop" OR _test_name MATCHES "^TestPyAgent" OR
+           _test_name MATCHES "^TestFrameTree" OR
+           _test_name MATCHES "^TestFrame.TestInlineParentYieldsAwaitingChildren$")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()
       endforeach()
