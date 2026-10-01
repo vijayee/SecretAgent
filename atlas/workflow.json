@@ -1,7 +1,7 @@
 {
   "schema": "rp036-atlas-v1",
-  "revision": 5,
-  "lastUpdated": "2026-10-01T09:19:00.000Z",
+  "revision": 6,
+  "lastUpdated": "2026-10-01T18:25:00.000Z",
   "project": {
     "id": "SECRETAGENT",
     "label": "SecretAgent \u2014 embeddable agent runtime and its desktop agent",
@@ -21,7 +21,8 @@
         "drive-model-driven-frame-tree",
         "remember-session-across-restarts",
         "subdivide-session-into-accountable-agents",
-        "run-agent-as-desktop"
+        "run-agent-as-desktop",
+        "refine-continual-harness"
       ],
       "requires": [],
       "completionRoute": "Four delivered slices with independent review per record: the runtime executes agent code without blocking, sessions survive restarts replayably, sessions subdivide into an accountable agent tree, and the desktop agent drives real work on top of the library. Cross-platform builds and the full gtest suite stay green at every completion."
@@ -154,6 +155,32 @@
         ],
         "onRejection": "Keep in-progress and correct only within this slice's boundary (bridge shapes, loop stop rules, batch composition)."
       }
+    },
+    "refine-continual-harness": {
+      "id": "refine-continual-harness",
+      "label": "Refine: supplemental state as a WaveDB subtree, evidence-backed lessons, append-only rollback",
+      "kind": "leaf",
+      "intent": "delivery",
+      "status": "in-progress",
+      "description": "The continual-harness /refine slice (Prime Agent's refinement port, spec docs/superpowers/specs/2026-10-01-refine-design.md, the parity-feature-matrix section 3/6 sketch): supplemental state is a WaveDB SUBTREE, never a side file. Schema: session-local by default at sessions/<sid>/harness/\u2026 (harness/log/<seq> the AUTHORITATIVE append-only records, harness/entry/<kind>/<id> the folded current-entry materialization, harness/meta/fingerprint + harness/meta/digest), with root-level harness/\u2026 as the shared opt-in scope (--refine-global): shared is READ-ONLY CONTEXT during a local refinement and cross-scope edits refuse loud (refinement.ts:380-407's merge discipline). Commit rule: every refinement write is ONE atomic store batch through the frame's store actor (FRM_STORE_SCAN reviews, FRM_STORE_BATCH commits, the entry withdrawal is a real WaveDB type-1 DELETE op on the materialized entry) \u2014 no new actor, no new thread, NO lock anywhere: the store actor remains the only serializer (the frame-tree slice's store-actor milestone is exactly the property this slice rides). History is APPEND-ONLY (the DB-as-log: the log alone is truth, entries/digests fold from it): a rollback is a NEW record carrying the rollbackOf link and the original's inverse edits \u2014 the original record stays byte-identical after; nothing in the log is ever mutated or deleted. The evidence gate (the spec \u00a74 recorded OURS-divergence): every edit requires evidence first..last event seqs \u2014 an edit without evidence refuses (\"edit without evidence\"), and a proposal with zero valid edits commits NOTHING (the loud no-op; rc==1 is a defined PASS shape). PA's reviewer is trusted to ground itself; ours FAILS LOUD because the owner's shape is small, EVIDENCE-BACKED writes the store can prove. Fingerprint gate ports: refine-time fingerprint gate (agent-session.ts:7238-7245's commit-only-when-fingerprint-changed, ported so a second refine with no fold change commits no record) and the FNV-1a-64 fingerprint over the canonical fold material (equal folds give equal fingerprints, version-only bookkeeping excluded, refinement.ts:777-843; the digest render is capped refinement.ts:20-22). The review call is never a tool: refine never appears in any model surface \u2014 the review completion carries tools as JSON null (model.c's single omission shape), and base_system_prompt is refused at every action. PARITY (spec \u00a78, citations inline in each test): rows 1-4 the record lifecycle with version guards \u2014 TestCreateUpdateDeleteLifecycleAppliesPerKind, TestCreateDerivesSlugIdAndDefaults (the slug port), TestStaleTargetRejectedOnVersionMismatch, TestSequentialEditsToSameEntryApply, TestCreateOnExistingUpdateAndDeleteOnMissingRefuse; row 5 the evidence gate + no-op rule \u2014 TestEditWithoutEvidenceRefusedAndZeroEditsAreNoop; row 6 the skill contract \u2014 TestSkillContractCarriesPythonReferenceAndArguments; row 7 base_system_prompt refused \u2014 TestBaseSystemPromptIdRefusedEveryAction; row 8 fingerprint stability \u2014 TestCanonicalViewsRefuseNullFold, TestFingerprintStableForEqualFold, TestFingerprintDiffersOnContentAndVersion, TestFingerprintSaltedVersionString; row 9 digest bounds \u2014 TestDigestRenderBounded; rows 10-12 rollback \u2014 TestRollbackComposesTheInverseFromTheRecord, TestRollbackMissingTargetRefused, TestRollbackAfterLaterEditRejectsStaleInverse; row 13 the fingerprint gate \u2014 TestRepeatedRefineWithNoChangeCommitsNothing; row 14 the over-budget batch refuses \u2014 TestRefineBatchOverBudgetRefusesNothingCommitted; row 15 the pooled-store refusal \u2014 TestRefinesOnPooledStoreRefuseLoud; row 16 the trajectory-scan caps \u2014 TestTrajectoryScanNewestCapHolds, TestReviewTrajectoryTailSliceDropsWholeOldestRecords; row 17 the scopes \u2014 TestSharedScopeSeparateAndReadOnlyFromLocal, TestLocalRefineRendersSeededSharedContext; row 18 the no-tools review call \u2014 TestRequestBodyOmitsToolsOnJsonNull, TestReviewCallPassesJsonNullTools; row 19 malformed log records skipped loud \u2014 TestFoldParsesRollbackEvidenceShape, TestFoldRefusesMalformedRollbackEvidence; the supporting store/decode/runit round trips riding the same gates \u2014 TestSyncScanReturnsNewestAscendingAsJointArray, TestProposalDecodeCapsAndFences, TestRefineRunCommitsOneAtomicBatch, TestRefineRunNoopCommitsNothing; row 20 THE LIVE GATE (opt-in, outcome-independent assertions only) \u2014 TestRefineLiveRefineAgainstRealModel. EVIDENCE: 33 committed tests in test/test_refine.cpp, full suite green (189/189 debug + ASan under setarch -R; refine tests registered under the WDB gate, absent from the OFF build), valgrind clean over TestRefine.*, the no-locks grep clean over src/Frame (model.c's recorded exceptions unchanged), and the live gate's real-model run (the outcome-independent invariant set \u2014 folded fingerprint + digest exist and the stored meta matches the recomputed fold, or the loud no-op):\nctest -R TestRefineLiveRefineAgainstRealModel (SA_TEST_REFINE_LIVE=1 SA_TEST_OLLAMA_URL=http://127.0.0.1:11434 SA_TEST_OLLAMA_MODEL=gemma4:latest, setarch -R):\n1/1 Test #119: TestRefine.TestRefineLiveRefineAgainstRealModel ...   Passed  349.62 sec\n100% tests passed, 0 tests failed out of 1\n[  AUDIT  ] live refine committed: refine: refine_20261001_182318 committed (1/1 edits applied)\n  apply memory local:real_model_run_confirmation v1: To store the operational confirmation that the simulation utilized a 'real model' for its turn, based on user and ass...\ndigest changed: yes",
+      "contains": [],
+      "requires": [
+        "drive-model-driven-frame-tree"
+      ],
+      "route": {
+        "completionEvidence": [
+          "Refinement history, entries and meta live as a WaveDB subtree session-local by default, with root-level harness/ as the shared opt-in scope",
+          "Every refinement write is ONE atomic store batch through the store actor; the log is append-only and a rollback is a new record with the rollbackOf link",
+          "Every committed lesson names the event seqs it rests on; a proposal with zero valid edits commits NOTHING (loud no-op)",
+          "The parity rows land as committed tests in test/test_refine.cpp (rows 1-19 network-free scripted backends, row 20 opt-in live gate)",
+          "Cross-platform: Linux green; Windows tracked on layer 1's record"
+        ],
+        "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
+        "next": [
+          "remember-session-across-restarts"
+        ],
+        "onRejection": "Keep in-progress and correct only within this slice's boundary (subtree schema, evidence gate, batch composition, rollback composition)."
+      }
     }
   },
   "edges": {
@@ -177,6 +204,10 @@
       {
         "from": "atlas-root",
         "to": "run-agent-as-desktop"
+      },
+      {
+        "from": "atlas-root",
+        "to": "refine-continual-harness"
       }
     ],
     "requires": [
@@ -207,18 +238,23 @@
       {
         "from": "run-agent-as-desktop",
         "to": "subdivide-session-into-accountable-agents"
+      },
+      {
+        "from": "refine-continual-harness",
+        "to": "drive-model-driven-frame-tree"
       }
     ]
   },
   "references": {
-    "next": 7,
+    "next": 8,
     "byId": {
       "atlas-root": "S001",
       "execute-agent-code-without-blocking": "S002",
       "remember-session-across-restarts": "S003",
       "subdivide-session-into-accountable-agents": "S004",
       "run-agent-as-desktop": "S005",
-      "drive-model-driven-frame-tree": "S006"
+      "drive-model-driven-frame-tree": "S006",
+      "refine-continual-harness": "S007"
     }
   },
   "lifecycle": {
