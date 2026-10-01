@@ -110,13 +110,16 @@ static int _life_kind_known(const char* kind) {
 }
 
 /* A payload field as JSON int: 0 and *out set, or -1 when the field is
-   absent or not an int (the caller logs + skips the record — the
-   render-not-crash rule; the skip's loud line names the shape, never the
-   record's VALUE). */
+   absent, not an int, or NEGATIVE (the caller logs + skips the record —
+   the render-not-crash rule; a negative number is the same corrupt-record
+   class as a missing one — cast to the unsigned cursor it would wrap to a
+   huge key, so it refuses exactly like an absent field; the skip's loud
+   line names the shape, never the record's VALUE). */
 static int _life_payload_int(json_value_t* payload, const char* key,
                              uint64_t* out) {
   json_value_t* v = json_get(payload, key);
   if (v == NULL || json_type(v) != JSON_INT) return -1;
+  if (json_as_int(v) < 0) return -1;
   *out = (uint64_t) json_as_int(v);
   return 0;
 }
@@ -187,8 +190,8 @@ static void _life_fold_record(size_t index, const char* type,
 
   if (strcmp(type, LIFE_EVENT_TURN_START) == 0) {
     if (_life_payload_int(payload, "turn", &turn) != 0) {
-      log_error("lifecycle_cursor_fold: turn.start record %zu carries no int "
-                "turn — skipped loud", index);
+      log_error("lifecycle_cursor_fold: turn.start record %zu carries no "
+                "non-negative int turn — skipped loud", index);
       return;
     }
     if (c->turn_open) {
@@ -209,8 +212,8 @@ static void _life_fold_record(size_t index, const char* type,
   if (strcmp(type, LIFE_EVENT_STEP_START) == 0) {
     if (_life_payload_int(payload, "turn", &turn) != 0 ||
         _life_payload_int(payload, "step", &step) != 0) {
-      log_error("lifecycle_cursor_fold: step.start record %zu carries no int "
-                "turn/step pair — skipped loud", index);
+      log_error("lifecycle_cursor_fold: step.start record %zu carries no "
+                "non-negative int turn/step pair — skipped loud", index);
       return;
     }
     /* Numbers come from the records' OWN payloads (spec §2's tolerance
@@ -226,8 +229,8 @@ static void _life_fold_record(size_t index, const char* type,
   if (strcmp(type, LIFE_EVENT_STEP_END) == 0) {
     if (_life_payload_int(payload, "turn", &turn) != 0 ||
         _life_payload_int(payload, "step", &step) != 0) {
-      log_error("lifecycle_cursor_fold: step.end record %zu carries no int "
-                "turn/step pair — skipped loud", index);
+      log_error("lifecycle_cursor_fold: step.end record %zu carries no "
+                "non-negative int turn/step pair — skipped loud", index);
       return;
     }
     /* A boundary record: the newest recorded numbers, the step closed, and
@@ -264,8 +267,8 @@ static void _life_fold_record(size_t index, const char* type,
       return;
     }
     if (_life_payload_int(payload, "turn", &turn) != 0) {
-      log_error("lifecycle_cursor_fold: turn.end record %zu carries no int "
-                "turn — skipped loud", index);
+      log_error("lifecycle_cursor_fold: turn.end record %zu carries no "
+                "non-negative int turn — skipped loud", index);
       return;
     }
     c->turn = turn;
@@ -289,8 +292,8 @@ static void _life_fold_record(size_t index, const char* type,
     json_value_t* code_v = json_get(payload, "code");
     if (_life_payload_int(payload, "corr", &corr) != 0 ||
         code_v == NULL || json_type(code_v) != JSON_STRING) {
-      log_error("lifecycle_cursor_fold: cell.run record %zu carries no int "
-                "corr or no code — skipped loud", index);
+      log_error("lifecycle_cursor_fold: cell.run record %zu carries no "
+                "non-negative int corr or no code — skipped loud", index);
       return;
     }
     if (c->cell_inflight) {
@@ -314,7 +317,7 @@ static void _life_fold_record(size_t index, const char* type,
     uint64_t corr = 0;
     if (_life_payload_int(payload, "corr", &corr) != 0) {
       log_error("lifecycle_cursor_fold: cell.result record %zu carries no "
-                "int corr — skipped loud", index);
+                "non-negative int corr — skipped loud", index);
       return;
     }
     if (!c->cell_inflight) {
@@ -400,10 +403,10 @@ int lifecycle_cursor_fold(const char* events_array_json, lifecycle_cursor_t* c) 
     }
 
     /* The record contract: "seq" (JSON int — the log's own seq, the closer
-       seqs' base) + "type" (the event's type name). A readable seq
-       occupies a real log key, so it moves last_seq EVEN when the record's
-       payload then skips — the closers' seqs can never collide with a
-       stored record's key. */
+       seqs' base, NON-negative) + "type" (the event's type name). A
+       readable seq occupies a real log key, so it moves last_seq EVEN when
+       the record's payload then skips — the closers' seqs can never collide
+       with a stored record's key. */
     json_value_t* seq_v = json_get(record, "seq");
     json_value_t* type_v = json_get(record, "type");
     if (seq_v == NULL || json_type(seq_v) != JSON_INT ||
@@ -413,8 +416,18 @@ int lifecycle_cursor_fold(const char* events_array_json, lifecycle_cursor_t* c) 
       if (owned) json_value_destroy(record);
       continue;
     }
-    uint64_t seq = (uint64_t) json_as_int(seq_v);
     const char* type = json_as_string(type_v);
+    if (json_as_int(seq_v) < 0) {
+      /* A NEGATIVE seq is the same corrupt-record class: cast to the
+         unsigned cursor it would move last_seq to a huge key and the
+         closers' seqs would collide with nothing — so the record skips
+         loud and last_seq stays at the prior real record. */
+      log_error("lifecycle_cursor_fold: record %zu (%s) carries a negative "
+                "seq — skipped loud, last_seq untouched", i, type);
+      if (owned) json_value_destroy(record);
+      continue;
+    }
+    uint64_t seq = (uint64_t) json_as_int(seq_v);
     c->last_seq = seq;
 
     /* Unknown types pass through (they move nothing). The fold also reads
@@ -520,6 +533,11 @@ int lifecycle_closers_compose(const lifecycle_cursor_t* cursor,
   /* 1. the repair brief (an open turn ALWAYS briefs) ;
      2. step.end (when open) ; 3. turn.end {reason: interrupted}. */
   size_t n = 1 + (size_t) cursor->step_open + 1;
+  /* The frozen one-batch cap is BELT-AND-SUSPENDERS, not a live contract:
+     the fold's shape bounds n at 3 (repair + optional step.end + turn.end),
+     so this refusal is unreachable today. It stands for future closer
+     shapes (e.g. multi-step turns) so a shape change can never exceed the
+     batch cap silently. */
   if (n > SA_LIFECYCLE_MAX_CLOSERS) {
     log_error("lifecycle_closers_compose: %zu closers exceed the one-batch "
               "cap (SA_LIFECYCLE_MAX_CLOSERS = %d) — refused loud", n,

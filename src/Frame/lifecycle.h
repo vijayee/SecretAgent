@@ -71,9 +71,13 @@ typedef struct lifecycle_cursor_t {
    reply's joint form, exactly what refine_fold_parse's records ride as).
    Every element's "seq" (JSON int) and "type" (string) are required — a
    readable seq occupies a real log key, so it moves last_seq even when the
-   record's payload skips. Unknown types pass through (they move nothing);
-   malformed lifecycle records log loud + skip (the render-not-crash rule);
-   turn/step numbers come from the records' OWN payloads.
+   record's payload skips. A NEGATIVE seq, or a negative turn/step/corr
+   payload int, is the same corrupt-record contract violation: the record
+   skips loud, last_seq and the cursor's state stay put (a negative cast to
+   the unsigned cursor would wrap to a huge key or number). Unknown types
+   pass through (they move nothing); malformed lifecycle records log loud +
+   skip (the render-not-crash rule); turn/step numbers come from the
+   records' OWN payloads.
    Returns 0; -1 with a loud log on NULL input or an unparseable/non-array
    tail (every refusal is loud — never a silent empty fold). */
 int lifecycle_cursor_fold(const char* events_array_json, lifecycle_cursor_t* c);

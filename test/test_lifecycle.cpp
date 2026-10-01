@@ -7,8 +7,11 @@
 
 extern "C" {
 #include "../src/Frame/lifecycle.h"
+#include "../src/Util/log.h"
 }
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -133,6 +136,54 @@ static std::string lc_closer_dom(const lifecycle_closers_t& closers,
   std::string out = (raw != nullptr) ? raw : "";
   free(raw);
   return out;
+}
+
+/* The loud-log capture: the fold's loud rule is a CONTRACT — the tests
+   below assert the ERROR log LINES, not just the resulting state (the same
+   recorder pattern test_py_agent.cpp uses). */
+#define LC_LOG_RING 64
+#define LC_LOG_LINE 256
+static struct {
+  char line[LC_LOG_LINE];
+  uint64_t seq;
+} _lc_log_ring[LC_LOG_RING];
+static uint64_t _lc_log_count = 0;
+static int _lc_log_hooked = 0;
+
+static void _lc_log_recorder(log_Event* ev) {
+  va_list ap;
+  va_copy(ap, ev->ap);
+  char line[LC_LOG_LINE];
+  vsnprintf(line, sizeof(line), ev->fmt, ap);
+  va_end(ap);
+  size_t slot = (size_t)(_lc_log_count % (uint64_t)LC_LOG_RING);
+  memcpy(_lc_log_ring[slot].line, line, strlen(line) + 1);
+  _lc_log_ring[slot].seq = _lc_log_count + 1;
+  _lc_log_count++;
+}
+
+/* Register the ERROR-level recorder once; returns the count so far (the
+   number the caller passes to lc_log_logged_since). */
+static uint64_t lc_log_start(void) {
+  if (!_lc_log_hooked) {
+    log_add_callback(_lc_log_recorder, NULL, LOG_ERROR);
+    _lc_log_hooked = 1;
+  }
+  return _lc_log_count;
+}
+
+/* How many ERROR lines logged since `from` carry the needle (only the
+   last LC_LOG_RING lines are kept — plenty for one fold's skips). */
+static size_t lc_log_logged_since(uint64_t from, const char* needle) {
+  size_t hits = 0;
+  for (int i = 0; i < LC_LOG_RING; i++) {
+    if (_lc_log_ring[i].seq > from &&
+        _lc_log_ring[i].seq <= _lc_log_count &&
+        strstr(_lc_log_ring[i].line, needle) != NULL) {
+      hits++;
+    }
+  }
+  return hits;
 }
 
 /* The pinned started shape's full text for a cell.run recorded at `seq`
@@ -723,4 +774,187 @@ TEST(TestLifecycle, TestCursorRejectsNullInputLoud) {
   EXPECT_EQ(out.items, nullptr);
   lifecycle_closers_destroy(&out);
   lifecycle_cursor_destroy(&c);
+}
+
+TEST(TestLifecycle, TestNegativeNumbersSkipLoudStateStaysPut) {
+  /* the corrupt-record class: a NEGATIVE seq (or a negative turn/step
+     payload int) is a contract violation like a missing one — cast to the
+     unsigned cursor it would wrap to a huge key/number and later collide
+     the closers' seqs. Each refuses LOUD; last_seq and the cursor's state
+     stay at the prior real record, and the fold still balances on the good
+     records around the corrupt ones. */
+  lifecycle_cursor_t c;
+  lifecycle_closers_t out;
+  memset(&c, 0, sizeof(c));
+  memset(&out, 0, sizeof(out));
+
+  /* The negative-seq turn.end never closes the turn and never moves
+     last_seq past the last REAL record's seq. */
+  std::string neg_seq = lc_joint({
+      rec_turn_start(3, 1),
+      std::string("{\"seq\":-5,\"type\":\"turn.end\",\"corr\":null,"
+                  "\"payload\":{\"turn\":1,\"reason\":{\"kind\":"
+                  "\"completed\"}}}"),
+  });
+  uint64_t from = lc_log_start();
+  ASSERT_EQ(lifecycle_cursor_fold(neg_seq.c_str(), &c), 0);
+  EXPECT_EQ(lc_log_logged_since(from, "carries a negative seq"), 1u)
+      << "the negative-seq record refuses loud";
+  EXPECT_EQ(c.last_seq, 3u) << "last_seq stays at the prior real record";
+  EXPECT_EQ(c.turn_open, 1) << "the negative-seq record closes nothing";
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  ASSERT_EQ(out.n, 2u);
+  /* the closers compose at the real last_seq's keys +1.. — no collision */
+  EXPECT_EQ(out.items[0].seq, 4u);
+  EXPECT_EQ(out.items[1].seq, 5u);
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+
+  /* A negative turn in a turn.start payload skips loud (last_seq still
+     moves — the readable seq occupied a real log key); the open turn the
+     fold already holds survives, and the good records around the corrupt
+     one still balance the tail. */
+  std::string neg_turn = lc_joint({
+      rec_turn_start(3, 1),
+      lc_record("turn.start", "{\"turn\":-2}", 4),
+      rec_step(5, "step.start", 1, 1),
+      rec_step(6, "step.end", 1, 1),
+      rec_turn_end(7, 1, "completed"),
+  });
+  from = lc_log_start();
+  ASSERT_EQ(lifecycle_cursor_fold(neg_turn.c_str(), &c), 0);
+  EXPECT_EQ(lc_log_logged_since(from, "no non-negative int turn"), 1u)
+      << "the negative-turn record refuses loud";
+  EXPECT_EQ(c.last_seq, 7u);
+  EXPECT_EQ(c.turn, 1u) << "the negative-turn record never moves the turn";
+  EXPECT_EQ(c.turn_open, 0);
+  EXPECT_EQ(c.step_open, 0);
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  EXPECT_EQ(out.n, 0u) << "the fold still balances on the good records";
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+
+  /* A negative step in a step.start payload: the same class, the same
+     refusal, the fold still balances on the good step.end/turn.end. */
+  std::string neg_step = lc_joint({
+      rec_turn_start(3, 1),
+      rec_step(4, "step.start", 1, 1),
+      lc_record("step.start", "{\"turn\":1,\"step\":-9}", 5),
+      rec_step(6, "step.end", 1, 1),
+      rec_turn_end(7, 1, "completed"),
+  });
+  from = lc_log_start();
+  ASSERT_EQ(lifecycle_cursor_fold(neg_step.c_str(), &c), 0);
+  EXPECT_EQ(lc_log_logged_since(from, "no non-negative int turn/step pair"),
+            1u) << "the negative-step record refuses loud";
+  EXPECT_EQ(c.last_seq, 7u);
+  EXPECT_EQ(c.step, 1u);
+  EXPECT_EQ(c.step_open, 0);
+  EXPECT_EQ(c.turn_open, 0);
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  EXPECT_EQ(out.n, 0u);
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+}
+
+TEST(TestLifecycle, TestOrphanCellResultFoldsLoudStillComposes) {
+  /* the orphan result (a cell.result with NO open cell.run to pair — the
+     fold's dedicated loud line): it acknowledges nothing, the records
+     around it still fold, and the tail composes its closers correctly. */
+  lifecycle_cursor_t c;
+  lifecycle_closers_t out;
+  memset(&c, 0, sizeof(c));
+  memset(&out, 0, sizeof(out));
+
+  std::string tail = lc_joint({
+      rec_turn_start(0, 2),
+      rec_cell_result(1, 9),          /* orphan — no open cell.run */
+      rec_cell_run(2, 3, "late()"),
+  });
+  uint64_t from = lc_log_start();
+  ASSERT_EQ(lifecycle_cursor_fold(tail.c_str(), &c), 0);
+  EXPECT_EQ(lc_log_logged_since(from, "has no open cell.run to pair"), 1u)
+      << "the orphan result folds loud";
+  EXPECT_EQ(c.cell_inflight, 1);
+  EXPECT_EQ(c.inflight_seq, 2u);
+  EXPECT_EQ(c.inflight_corr, 3u);
+  ASSERT_NE(c.inflight_code, nullptr);
+  EXPECT_STREQ(c.inflight_code, "late()");
+  EXPECT_EQ(c.last_seq, 2u);
+
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  ASSERT_EQ(out.n, 2u);                  /* repair (started shape), turn.end */
+  EXPECT_STREQ(out.items[0].type, LIFE_EVENT_REPAIR);
+  EXPECT_EQ(out.items[0].seq, 3u);
+  EXPECT_STREQ(out.items[1].type, LIFE_EVENT_TURN_END);
+  EXPECT_EQ(out.items[1].seq, 4u);
+  /* the closers quote the STILL-open cell — the orphan acknowledged nothing */
+  EXPECT_EQ(lc_closer_text(out, 0), lc_started_text(2, "late()"));
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+
+  /* An orphan inside an otherwise pre-lifecycle tail also moves nothing —
+     no open turn, so nothing composes. */
+  std::string pre = lc_joint({rec_msg(4), rec_cell_result(5, 1)});
+  from = lc_log_start();
+  ASSERT_EQ(lifecycle_cursor_fold(pre.c_str(), &c), 0);
+  EXPECT_EQ(lc_log_logged_since(from, "has no open cell.run to pair"), 1u);
+  EXPECT_EQ(c.cell_inflight, 0);
+  EXPECT_EQ(c.turn_open, 0);
+  EXPECT_EQ(c.last_seq, 5u);
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  EXPECT_EQ(out.n, 0u);
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+}
+
+TEST(TestLifecycle, TestPayloadComposersDirectEdges) {
+  /* the composers' direct edges (the FROZEN payload shapes): a NULL reason
+     kind refuses loud; a NULL/"" text renders the text field ABSENT (never
+     an empty string); the turn/step riders carry the raw numbers. */
+  json_value_t* ts = lifecycle_turn_start_json(7);
+  ASSERT_NE(ts, nullptr);
+  EXPECT_EQ(json_size(ts), 1u);
+  EXPECT_EQ((uint64_t)json_as_int(json_get(ts, "turn")), 7u);
+  json_value_destroy(ts);
+
+  json_value_t* st = lifecycle_step_json(7, 2);
+  ASSERT_NE(st, nullptr);
+  EXPECT_EQ(json_size(st), 2u);
+  EXPECT_EQ((uint64_t)json_as_int(json_get(st, "turn")), 7u);
+  EXPECT_EQ((uint64_t)json_as_int(json_get(st, "step")), 2u);
+  json_value_destroy(st);
+
+  /* A NULL reason kind refuses loud — no DOM. */
+  uint64_t from = lc_log_start();
+  EXPECT_EQ(lifecycle_turn_end_json(1, nullptr, "words"), nullptr);
+  EXPECT_EQ(lc_log_logged_since(from, "NULL reason kind"), 1u)
+      << "the NULL-kind refusal is loud";
+
+  /* NULL text — the text field renders ABSENT. */
+  json_value_t* te = lifecycle_turn_end_json(1, LIFE_REASON_BLOCKED, nullptr);
+  ASSERT_NE(te, nullptr);
+  EXPECT_EQ(json_size(te), 2u);      /* {turn, reason} */
+  json_value_t* reason = json_get(te, "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_EQ(json_size(reason), 1u);  /* the kind only — no text field */
+  EXPECT_STREQ(json_as_string(json_get(reason, "kind")), LIFE_REASON_BLOCKED);
+  EXPECT_EQ(json_get(reason, "text"), nullptr) << "NULL text = field absent";
+  json_value_destroy(te);
+
+  /* "" text — the text field renders ABSENT too (never an empty string). */
+  te = lifecycle_turn_end_json(2, LIFE_REASON_ABORTED, "");
+  ASSERT_NE(te, nullptr);
+  reason = json_get(te, "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_EQ(json_get(reason, "text"), nullptr) << "empty text = field absent";
+  json_value_destroy(te);
+
+  /* A real text rides verbatim. */
+  te = lifecycle_turn_end_json(3, LIFE_REASON_ABORTED, "the words");
+  ASSERT_NE(te, nullptr);
+  reason = json_get(te, "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reason, "text")), "the words");
+  json_value_destroy(te);
 }
