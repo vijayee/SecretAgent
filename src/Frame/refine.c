@@ -16,10 +16,11 @@
 
 /* refine.c — the refine slice's DATA half (the orchestrator spec: the fold,
    the edit validation, the evidence gate, the apply semantics with version
-   guards, the record's edit-element composition). The store-riding runners
-   (refine_run / refine_rollback) and the fingerprint/digest views land with
-   their own tasks; the store actor remains the only serializer this module
-   ever answers to. */
+   guards, the record's edit-element composition, and the fold's canonical
+   views — the FNV-1a-64 fingerprint and the bounded digest render). The
+   store-riding runners (refine_run / refine_rollback) land with their own
+   tasks; the store actor remains the only serializer this module ever
+   answers to. */
 
 const char* const REFINE_KINDS[REFINE_KINDS_COUNT] = {
     "prompt", "memory", "skill", "subagent",
@@ -240,6 +241,231 @@ void refine_fold_destroy(refine_fold_t* fold) {
   fold->record_lines = NULL;
   fold->nrecords = 0;
   fold->rcapacity = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* The canonical views (the FNV-1a-64 fingerprint + the bounded digest */
+/* render; the delivery gate compares fingerprints at turn commit)     */
+/* ------------------------------------------------------------------ */
+
+/* The fingerprint's salt version string — bump on ANY change to the
+   material or its serialization (refinement.ts:25-30's rule): fingerprints
+   minted under different versions never compare equal, so a changed render
+   contract can never reuse an old digest's state. */
+#define REFINE_FINGERPRINT_SALT "refine-fingerprint-v1;"
+#define REFINE_FNV64_BASIS 0xcbf29ce484222325ULL
+#define REFINE_FNV64_PRIME 0x100000001b3ULL
+
+/* FNV-1a-64 over one byte run — the rolling hash update. */
+static uint64_t _refine_fnv64(uint64_t hash, const void* bytes, size_t len) {
+  const unsigned char* p = (const unsigned char*) bytes;
+  for (size_t i = 0; i < len; i++) {
+    hash ^= (uint64_t) p[i];
+    hash *= REFINE_FNV64_PRIME;
+  }
+  return hash;
+}
+
+static uint64_t _refine_hash_string(uint64_t hash, const char* s) {
+  return _refine_fnv64(hash, s, s != NULL ? strlen(s) : 0);
+}
+
+/* A malloc'd view of the fold's LIVE rows (tombstones excluded — they
+   render nothing, so they materialize nothing). Caller frees the array,
+   never the rows it points at. */
+static const refine_entry_t** _fold_live_rows(const refine_fold_t* fold,
+                                              size_t* count) {
+  const refine_entry_t** rows =
+      get_memory((fold->nentries != 0 ? fold->nentries : 1) * sizeof(*rows));
+  size_t n = 0;
+  for (size_t i = 0; i < fold->nentries; i++) {
+    if (fold->entries[i].deleted) continue;
+    rows[n++] = &fold->entries[i];
+  }
+  *count = n;
+  return rows;
+}
+
+/* The fingerprint's normalization: (kind,id) sort (refinement.ts:783's
+   entry-order line). */
+static int _entry_material_cmp(const void* a, const void* b) {
+  const refine_entry_t* ea = *(const refine_entry_t* const*) a;
+  const refine_entry_t* eb = *(const refine_entry_t* const*) b;
+  int kind_cmp = strcmp(ea->kind, eb->kind);
+  if (kind_cmp != 0) return kind_cmp;
+  return strcmp(ea->id, eb->id);
+}
+
+/* The digest's newest-first row order, stable by id on equal seqs. */
+static int _entry_newest_cmp(const void* a, const void* b) {
+  const refine_entry_t* ea = *(const refine_entry_t* const*) a;
+  const refine_entry_t* eb = *(const refine_entry_t* const*) b;
+  if (ea->seq != eb->seq) return ea->seq > eb->seq ? -1 : 1;
+  return strcmp(ea->id, eb->id);
+}
+
+char* refine_fold_fingerprint(const refine_fold_t* fold) {
+  uint64_t hash = _refine_fnv64(REFINE_FNV64_BASIS, REFINE_FINGERPRINT_SALT,
+                                sizeof(REFINE_FINGERPRINT_SALT) - 1);
+  size_t nlive = 0;
+  const refine_entry_t** rows =
+      fold != NULL ? _fold_live_rows(fold, &nlive)
+                   : get_memory(sizeof(*rows));
+  qsort(rows, nlive, sizeof(*rows), _entry_material_cmp);
+  for (size_t i = 0; i < nlive; i++) {
+    const refine_entry_t* e = rows[i];
+    char version[16];
+    snprintf(version, sizeof(version), "%u", e->version);
+    hash = _refine_hash_string(hash, "e;");
+    hash = _refine_hash_string(hash, e->kind);
+    hash = _refine_hash_string(hash, ";");
+    hash = _refine_hash_string(hash, e->id);
+    hash = _refine_hash_string(hash, ";");
+    hash = _refine_hash_string(hash, version);
+    hash = _refine_hash_string(hash, ";");
+    hash = _refine_hash_string(hash, e->path != NULL ? e->path : "");
+    hash = _refine_hash_string(hash, ";");
+    hash = _refine_hash_string(hash, e->content != NULL ? e->content : "");
+    hash = _refine_hash_string(hash, ";");
+    /* Only skills render the kernel call contract, so another kind can
+       change these fields without changing a single digest byte. */
+    if (strcmp(e->kind, "skill") == 0) {
+      hash = _refine_hash_string(hash, "r;");
+      hash = _refine_hash_string(hash, e->reference != NULL ? e->reference : "");
+      hash = _refine_hash_string(hash, ";a;");
+      hash = _refine_hash_string(hash, e->arguments != NULL ? e->arguments : "");
+      hash = _refine_hash_string(hash, ";");
+    }
+  }
+  free(rows);
+  size_t nrecords = fold != NULL ? fold->nrecords : 0;
+  for (size_t i = 0; i < nrecords; i++) {
+    hash = _refine_hash_string(hash, "l;");
+    hash = _refine_hash_string(hash, fold->record_lines[i]);
+    hash = _refine_hash_string(hash, ";");
+  }
+  char* hex = get_memory(17);
+  snprintf(hex, 17, "%016llx", (unsigned long long) hash);
+  return hex;
+}
+
+/* A growable render buffer (the digest builds lines, then joins). */
+typedef struct _refine_buf_t {
+  char* text;
+  size_t len, capacity;
+} _refine_buf_t;
+
+static void _refine_buf_add(_refine_buf_t* buf, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  int needed = vsnprintf(NULL, 0, fmt, args);
+  va_end(args);
+  if (needed <= 0) return;
+  size_t need = buf->len + (size_t) needed + 1;
+  if (need > buf->capacity) {
+    size_t cap = buf->capacity == 0 ? 256 : buf->capacity;
+    while (cap < need) cap *= 2;
+    char* text = get_memory(cap);
+    if (buf->text != NULL) memcpy(text, buf->text, buf->len + 1);
+    free(buf->text);
+    buf->text = text;
+    buf->capacity = cap;
+  }
+  va_start(args, fmt);
+  vsnprintf(buf->text + buf->len, (size_t) needed + 1, fmt, args);
+  va_end(args);
+  buf->len += (size_t) needed;
+}
+
+/* One record line's digest form: a stored "<seq>;<trigger>;" line renders
+   "- <seq> <trigger>"; a malformed record's skip line already carries its
+   "- " label and renders verbatim (refinement.ts:479-483's render rule). */
+static void _refine_digest_record_line(_refine_buf_t* buf, const char* line) {
+  if (strncmp(line, "- ", 2) == 0) {
+    _refine_buf_add(buf, "%s\n", line);
+    return;
+  }
+  const char* semi = strchr(line, ';');
+  if (semi == NULL) {
+    char* compacted = _refine_compact(line, SA_REFINE_DIGEST_CONTENT_CHARS);
+    _refine_buf_add(buf, "- %s\n", compacted);
+    free(compacted);
+    return;
+  }
+  size_t seq_len = (size_t) (semi - line);
+  char seq[24];
+  if (seq_len >= sizeof(seq)) seq_len = sizeof(seq) - 1;
+  memcpy(seq, line, seq_len);
+  seq[seq_len] = '\0';
+  const char* trig = semi + 1;
+  size_t trig_len = strlen(trig);
+  if (trig_len > 0 && trig[trig_len - 1] == ';') trig_len--;
+  char* trigger = get_memory(trig_len + 1);
+  memcpy(trigger, trig, trig_len);
+  trigger[trig_len] = '\0';
+  char* compacted = _refine_compact(trigger, SA_REFINE_DIGEST_CONTENT_CHARS);
+  _refine_buf_add(buf, "- %s %s\n", seq, compacted);
+  free(trigger);
+  free(compacted);
+}
+
+char* refine_fold_digest(const refine_fold_t* fold) {
+  _refine_buf_t buf = {NULL, 0, 0};
+  size_t nentries = fold != NULL ? fold->nentries : 0;
+  size_t nrecords = fold != NULL ? fold->nrecords : 0;
+  size_t live_total = 0;
+  for (size_t i = 0; i < nentries; i++) {
+    if (!fold->entries[i].deleted) live_total++;
+  }
+  if (live_total == 0) {
+    _refine_buf_add(&buf, "harness: empty\n");
+  } else {
+    _refine_buf_add(&buf, "harness: %zu\n", live_total);
+  }
+
+  const refine_entry_t** rows =
+      get_memory((nentries != 0 ? nentries : 1) * sizeof(*rows));
+  for (int k = 0; k < REFINE_KINDS_COUNT; k++) {
+    const char* kind = REFINE_KINDS[k];
+    size_t n = 0;
+    for (size_t i = 0; i < nentries; i++) {
+      const refine_entry_t* e = &fold->entries[i];
+      if (e->deleted || strcmp(e->kind, kind) != 0) continue;
+      rows[n++] = e;
+    }
+    _refine_buf_add(&buf, "%s: %zu\n", kind, n);
+    if (n == 0) continue;
+    qsort(rows, n, sizeof(*rows), _entry_newest_cmp);
+    size_t rendered = n < (size_t) SA_REFINE_DIGEST_ENTRIES_PER_KIND
+                          ? n
+                          : (size_t) SA_REFINE_DIGEST_ENTRIES_PER_KIND;
+    for (size_t r = 0; r < rendered; r++) {
+      char* content =
+          _refine_compact(rows[r]->content, SA_REFINE_DIGEST_CONTENT_CHARS);
+      _refine_buf_add(&buf, "- %s %s v%u: %s\n", rows[r]->id,
+                      rows[r]->path != NULL ? rows[r]->path : "(none)",
+                      rows[r]->version, content);
+      free(content);
+    }
+    if (n > (size_t) SA_REFINE_DIGEST_ENTRIES_PER_KIND) {
+      _refine_buf_add(&buf, "- +%zu older %s entries\n",
+                      n - (size_t) SA_REFINE_DIGEST_ENTRIES_PER_KIND, kind);
+    }
+  }
+  free(rows);
+
+  if (nrecords > 0) {
+    _refine_buf_add(&buf, "refinements:\n");
+    size_t newest = nrecords < (size_t) SA_REFINE_DIGEST_REFINEMENTS
+                        ? nrecords
+                        : (size_t) SA_REFINE_DIGEST_REFINEMENTS;
+    for (size_t i = nrecords - newest; i < nrecords; i++) {
+      _refine_digest_record_line(&buf, fold->record_lines[i]);
+    }
+  }
+  if (buf.text == NULL) return _refine_dup("");
+  if (buf.text[buf.len - 1] == '\n') buf.text[buf.len - 1] = '\0';
+  return buf.text;
 }
 
 /* ------------------------------------------------------------------ */

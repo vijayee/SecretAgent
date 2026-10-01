@@ -89,6 +89,30 @@ int refine_fold_parse(const char* records_array_json, refine_fold_t* fold);
 /* The fold's lifecycle (all entries' strings + the record lines). */
 void refine_fold_destroy(refine_fold_t* fold);
 
+/* FNV-1a-64 of the fold's canonical material, as 16 lowercase hex chars
+   (malloc'd 17 bytes; caller frees). Material (the spec §4's port of
+   refinement.ts:777-843 — covered fields ONLY, order normalized):
+   "refine-fingerprint-v1;" then per entry in (kind,id) sort order:
+     "e;<kind>;<id>;<version>;<path>;<content>;" and ONLY the skill entries
+   keep going with "r;<reference>;a;<arguments>;" — then per record line in
+   stored order: "l;<record-line>;" (a malformed record's line IS its skip
+   label, so equality implies identical renders). */
+char* refine_fold_fingerprint(const refine_fold_t* fold);
+
+/* The bounded digest render (malloc'd; caller frees):
+
+   harness: <entries in scope | "empty">
+   <kind>: <count>
+   - <id> <path> v<version>: <content whitespace-compacted, 180>
+   ... (<= SA_REFINE_DIGEST_ENTRIES_PER_KIND per kind; overflow line
+       "- +<n> older <kind> entries")
+   refinements: <newest SA_REFINE_DIGEST_REFINEMENTS lines>
+   - <seq> <trigger-trim-180>
+
+   Deleted entries render NOTHING; a malformed record renders its skip
+   line; empty kinds print "0" with no entries. */
+char* refine_fold_digest(const refine_fold_t* fold);
+
 /* --- the fold's direct entry construction (the refine_entry_* helpers) ----
 
    The fold-parse and the apply path build through these; the parity tests'
