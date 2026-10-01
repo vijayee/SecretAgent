@@ -703,13 +703,6 @@ static void _store_reply_send(actor_t* reply_to, uint64_t corr, int rc,
    reply its own dispatch has to return first. The sync write paths respond
    with fire-and-post (the store's FIFO commits the batch ahead of the
    engine's next awaited trip) and the result-returning reads refuse loud. */
-/* 1 when the frame's OWN behavior is on the call stack (a NESTED sync
-   caller): such a caller must never pump this frame's mailbox — a nested
-   actor_run's pop frees the outer run's node (the sentinel queue's design;
-   the ASan-proven reentrancy hazard) and a nested await would deadlock on a
-   reply its own dispatch has to return first. The sync write paths respond
-   with fire-and-post (the store's FIFO commits the batch ahead of the
-   engine's next awaited trip) and the result-returning reads refuse loud. */
 static uint8_t _frame_nested_sync(const frame_t* f) {
   return (f != NULL && f->dispatch_depth > 0) ? 1 : 0;
 }
