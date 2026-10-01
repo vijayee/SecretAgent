@@ -39,6 +39,10 @@ if (BUILD_TESTING)
             test_scheduler.cpp
             test_refcounter.cpp
             test_json.cpp
+            # The lifecycle suite is PURE (cursor fold + closers over a json
+            # array text): no WDB, no streams — it registers on the plain
+            # gate so the OFF build keeps it.
+            test_lifecycle.cpp
             )
 
     # Same CMake-level mirror idiom as the pyrt gate above: frame store tests
