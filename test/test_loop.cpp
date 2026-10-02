@@ -1824,3 +1824,98 @@ TEST(TestLoop, TestRestartRepairsTheCutBeforeTheCellAudit) {
 }
 
 #endif /* SA_HAS_WDB */
+TEST(TestLoop, TestResumedEngineSeesItsOwnInSessionRecords) {
+  /* The substrate probe (the Task-3 implementer's engine-level claim): a
+     RESUMED session's engine runs TWO tool cycles on the SAME reopened
+     handle; the SECOND turn's derived context must carry the FIRST turn's
+     cell result (in-session post-reopen writes visible to the SAME
+     session's derives). Scratch-disk class (the documented valgrind
+     exclusion; ASan covers leaks). */
+  frame_config_t cfg = test_config();
+  std::string dir = temp_dir_mkdtemp_sa();
+  ASSERT_FALSE(dir.empty());
+  std::string loc = dir + "/db";
+
+  /* Boot 1: a durable pre-restart history to resume. */
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "amnesia probe", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  EXPECT_EQ(frame_append_msg(f, "user", "remember seven"), 0);
+  frame_destroy(f);
+  wave_db_close(db);
+
+  /* Boot 2 (the reopened session): TWO tool cycles on the SAME handle. */
+  py_agent_init();
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* resumed = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr);
+  std::vector<std::string> replies;
+  replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"print('turn one output')\"}"}}]}}]})json");
+  replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"all done"}}]})json");
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(resumed, &sm.base);
+  int loop_rc = frame_run_loop(resumed);
+  ASSERT_EQ(loop_rc, 0) << "two scripted cycles completed on the resumed frame";
+  frame_destroy(resumed);
+  wave_db_close(db);
+
+  /* THE CROSS-BOOT CHECK: the same events range read by a FRESH handle —
+     the durable truth vs what the same session's derive saw. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* fresh = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(fresh, nullptr);
+  json_value_t* fresh_events = load_events(fresh);
+  ASSERT_NE(fresh_events, nullptr);
+  printf("[  PROBE  ] fresh-handle event count = %d\n", (int)json_size(fresh_events));
+  for (size_t i = 0; i < json_size(fresh_events); i++) {
+    json_value_t* rec = json_at(fresh_events, i);
+    json_value_t* t = json_get(rec, "type");
+    printf("[  PROBE  ]   seq=%lld type=%s\n", (long long)json_as_int(json_get(rec, "seq")),
+           (t != NULL ? json_as_string(t) : "?"));
+  }
+  fflush(stdout);
+  { size_t ncr = 0;
+    for (size_t i = 0; i < json_size(fresh_events); i++) {
+      json_value_t* rec = json_at(fresh_events, i);
+      json_value_t* t = json_get(rec, "type");
+      if (t != NULL && strcmp(json_as_string(t), "cell.result") == 0) ncr++;
+    }
+    printf("[  PROBE  ] fresh handles %zu cell.result records\n", ncr);
+  }
+  fflush(stdout);
+  json_value_destroy(fresh_events);
+  frame_destroy(fresh);
+  wave_db_close(db);
+
+  /* The same-session capture asserts the HEALTHY contract (the WaveDB
+     reopen-walk publication fix, deps/wavedb 2cd6161): the SAME session's
+     turn-1 cell.result record is visible to its own turn-2 derive — the
+     projected `cell result (status 0): ...` line. (The stdout text itself
+     is a cell-backend gap, not a substrate one: the pyrt exec-only backend
+     never captures print() output — py_subprocess's backend does — asserted
+     here as the result line's PRESENCE, not its text.) */
+  EXPECT_NE(sm.captured[1].find("remember seven"), std::string::npos)
+      << "the replayed pre-restart history is visible (sanity)";
+  EXPECT_NE(sm.captured[1].find("cell result (status 0)"),
+            std::string::npos)
+      << "THE PROBE: the SAME session's turn-1 record is visible to its "
+         "own turn-2 derive (the fresh view printed the full 12-record log)";
+
+  std::filesystem::remove_all(dir);
+}
+
+
