@@ -1394,7 +1394,11 @@ TEST(TestLoop, TestTurnNumbersRestoreFromTheLog) {
      engine — its first turn is 4 (restored from the log, never renumbered
      from 1). A DEAD engine never carries the counter across a restart: this
      runs a fully separate engine process-shape (destroyed frame, reopened
-     db). */
+     db). VALGRIND EXCLUSION (as its sibling
+     TestRestartReplayRestoresSeqAndContext, recorded on Atlas S006): the
+     scratch-disk tests spin under valgrind 3.18's emulation here — the
+     leak proof for this class is the ASan suite + the non-disk
+     lifecycle/envelope filters. */
   frame_config_t cfg = test_config();
   std::string dir = temp_dir_mkdtemp_sa();
   ASSERT_FALSE(dir.empty());

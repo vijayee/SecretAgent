@@ -1323,16 +1323,6 @@ int _frame_event_batch_post(frame_t* f, const char** type_names,
 
   char** texts = (char**)get_clear_memory(nops * sizeof(char*));
   char** keys = (char**)get_clear_memory(nops * sizeof(char*));
-  if (texts == NULL || keys == NULL) {
-    log_error("frame: out of memory composing the event batch");
-    for (size_t i = 0; i < nops; i++) {
-      free(texts != NULL ? texts[i] : NULL);
-      free(keys != NULL ? keys[i] : NULL);
-    }
-    free(texts);
-    free(keys);
-    return -1;
-  }
   size_t composed = nops;
   size_t total = 0;
   int rc = 0;
@@ -1387,16 +1377,6 @@ int _frame_event_batch_post(frame_t* f, const char** type_names,
   frm_store_batch_payload_t* bp =
       get_clear_memory(sizeof(frm_store_batch_payload_t));
   bp->ops = get_clear_memory(nops * sizeof(frm_store_op_t));
-  if (bp->ops == NULL) {
-    log_error("frame: out of memory building the event batch");
-    for (size_t j = 0; j < nops; j++) {
-      free(texts[j]);
-      free(keys[j]);
-    }
-    free(texts);
-    free(keys);
-    return -1;
-  }
   for (size_t j = 0; j < nops; j++) {
     bp->ops[j].key = keys[j];              /* OWNED: the store behavior frees */
     bp->ops[j].value = (uint8_t*)texts[j]; /* OWNED */
