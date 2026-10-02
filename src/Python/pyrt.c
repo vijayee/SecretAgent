@@ -112,9 +112,16 @@ static const char _PYRT_HELPERS[] =
     "        return 0, result_txt if result_txt is not None else ''\n"
     "    except BaseException:\n"
     "        status, text = 1, traceback.format_exc()\n"
-    "        sys.stdout = old\n"
-    "        out = buf.getvalue()\n"
-    "        return status, (out + '\\n' + text) if out else text\n";
+    "        try:\n"
+    "            sys.stdout = old\n"
+    "            out = buf.getvalue()\n"
+    "            if out.endswith('\\n'):\n"
+    "                out = out[:-1]\n"
+    "            if out:\n"
+    "                text = out + '\\n' + text\n"
+    "        except BaseException:\n"
+    "            sys.stdout = old\n"
+    "        return status, text\n";
 
 /* ------------------------------------------------------------------ */
 /* Payload destroyers (pyrt_messages.h). NULL-safe, plain free().      */
@@ -171,11 +178,11 @@ static void _pyrt_post_result(pyrt_t* py, uint64_t corr, uint8_t status, char* t
                               &truncated);
   free(text);
   if (capped == NULL) {
-    /* The budget helper refused (OOM/cap 0): the corr-matched shape is
-       never abandoned — post the loud literal instead. */
+    /* The budget helper refused (OOM/cap 0): the corr-matched shape survives
+       the cap's refusal (unless the fallback copy itself fails) — post the
+       loud literal instead. */
     capped = strdup("pyrt: the result budget refused the text");
     if (capped == NULL) return;
-    truncated = 0;
   }
   (void)truncated;
   text = capped;

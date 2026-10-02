@@ -575,8 +575,11 @@ TEST(TestPyrt, TestExceptionKeepsPartialStdout) {
   EXPECT_EQ(self->results[0]->status, 1);
   ASSERT_NE(self->results[0]->text, nullptr);
   const char* text = self->results[0]->text;
-  EXPECT_NE(strstr(text, "before the crash"), nullptr);
-  EXPECT_NE(strstr(text, "ZeroDivisionError"), nullptr);
+  const char* stdout_at = strstr(text, "before the crash");
+  const char* trace_at = strstr(text, "ZeroDivisionError");
+  ASSERT_NE(stdout_at, nullptr);
+  ASSERT_NE(trace_at, nullptr);
+  EXPECT_LT(stdout_at, trace_at) << "the partial stdout rides the traceback's head";
   py_frame_free(self);
 }
 
