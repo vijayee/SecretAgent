@@ -20,8 +20,10 @@ void budget_truncate_with_marker(const char* text, size_t cap,
 
   size_t n = strlen(text);
   if (n <= cap) {
-    char* copy = strdup(text);
+    char* copy = (char*)malloc(n + 1);
     if (copy != NULL) {
+      memcpy(copy, text, n);
+      copy[n] = '\0';
       *out_text = copy;   /* clean: no marker on fitting text */
     }
     return;
@@ -33,11 +35,18 @@ void budget_truncate_with_marker(const char* text, size_t cap,
   if (m < 0 || (size_t)m >= sizeof(marker)) {
     return;   /* the marker refused to compose: a refusal, never a bad shape */
   }
-  char* out = (char*)malloc(cap + (size_t)m + 1);
+  /* Never split a UTF-8 sequence: back the cut over continuation bytes
+     (at most 3 — UTF-8's longest sequence is 4 bytes). */
+  size_t cut = cap;
+  while (cut > 0 && text[cut] != '\0' &&
+         (cap - cut) < 3 && ((unsigned char)text[cut] & 0xC0) == 0x80) {
+    cut--;
+  }
+  char* out = (char*)malloc(cut + (size_t)m + 1);
   if (out == NULL) return;
-  memcpy(out, text, cap);
-  memcpy(out + cap, marker, (size_t)m);
-  out[cap + (size_t)m] = '\0';
+  memcpy(out, text, cut);
+  memcpy(out + cut, marker, (size_t)m);
+  out[cut + (size_t)m] = '\0';
   *out_text = out;
   *out_truncated = 1;
 }

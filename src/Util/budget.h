@@ -41,7 +41,10 @@
    is nonzero only on a real cut.
    Refusal: *out_text = NULL, *out_truncated = 0 — on NULL text, cap 0, or
    out-of-memory. Refusals are LOUD at the call site (never a silent
-   truncate-to-empty). */
+   truncate-to-empty).
+   Precondition: out_text and out_truncated are both non-NULL (a NULL
+   out-param is a caller bug — the function returns without touching the
+   other output). */
 void budget_truncate_with_marker(const char* text, size_t cap,
                                  char** out_text, uint8_t* out_truncated);
 
