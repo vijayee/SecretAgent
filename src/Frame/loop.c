@@ -1663,28 +1663,34 @@ int frame_run_loop(frame_t* f) {
            cell deadline runs the SAME interrupt synthesis the pooled
            watchdog posts — the corr-matched close + poison — instead of
            giving up with the cell slot left pending. arm_cut = 0: a
-           deadline never arms a cut. The synthesis flips the compose-time
-           facts (a POSTED close leaves turn_open 0 and the engine ended),
-           so the following _loop_fail writes ONLY the cell-timeout control
-           event — both branches land balanced. A batch refusal leaves
-           turn_open untouched, and _loop_fail's rider path closes the open
-           tail itself. */
+           deadline never arms a cut. The apply ENDS THE ENGINE ITSELF on
+           every batch path — BOTH the posted close and the refused
+           pre-post call _frame_engine_terminate internally — so when the
+           apply returns, engine_live == 0 is the normal shape. The
+           discriminator below separates "the apply already ended the
+           engine" from "the apply returned without ending it" (its n==0
+           shapes: the benign already-complete-cell no-op and the OOM
+           corner). The compose-time facts follow the post: a POSTED close
+           leaves turn_open 0 with the engine ended. */
         _frame_interrupt_apply(f, 0,
                                "aborted: cell exceeded the watchdog deadline");
         if (e->engine_live == 0) {
-          /* The synthesis POSTED (and ended) the engine: the close's facts
-             are compose-time — the terminate already ran inside the apply,
-             and re-entering it here would log the loud already-ended no-op
-             on EVERY routine cell deadline. Only the cell-timeout control
-             wording remains (the same event the _loop_fail path wrote —
-             turn_open is 0, so _loop_fail's rider branch was a no-op and
-             this is its exact event set, minus the noise). */
+          /* The apply ended the engine (the posted close AND the refused
+             batch alike — the terminate already ran inside it, and
+             re-entering it here would log the loud already-ended no-op on
+             EVERY routine cell deadline). Only the cell-timeout control
+             wording remains. */
           _loop_control(f, "cell-timeout", NULL);
           break;
         }
-        /* The batch was REFUSED pre-post: the engine is STILL live with an
-           open tail — _loop_fail's rider path closes it itself (the
-           standing discipline). */
+        /* The apply returned WITHOUT ending the engine: the n==0 shapes
+           only (a deadline at an already-complete cell, or the OOM corner
+           where the cell slot closed inline without its durable record).
+           Both leave turn_open 0 — the riders exist only under an open
+           turn — so _loop_fail's rider branch is a no-op and this is its
+           plain shape: ONE cell-timeout control event + the failed
+           terminate THAT ends the engine here (its first end, not a
+           re-entry). */
         _loop_fail(f, e, "cell-timeout", NULL);
         break;
       }

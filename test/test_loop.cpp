@@ -1371,10 +1371,11 @@ TEST(TestLoop, TestPooledWatchdogInterruptsTheDeadCell) {
       << "a failed top frame keeps its status (the failure is the log's)";
   json_value_destroy(events);
 
+  scheduler_pool_stop(pool);   /* documented order: stop the pool FIRST, then
+                                  frame_destroy, then the db close, then the
+                                  pool destroy (frame.c's teardown note) */
   frame_destroy(f);   /* joins the hung pyrt thread — bounded by the 3 s
                          sleep (past here), the documented cost */
-  scheduler_pool_stop(pool);   /* documented order: stop, then close, then
-                                  destroy (the pooled tree tests' idiom) */
   wave_db_close(db);
   scheduler_pool_destroy(pool);
 }
@@ -1439,8 +1440,9 @@ TEST(TestLoop, TestPooledWatchdogDisarmsAtTheRealResult) {
   EXPECT_EQ(saw_completed, 1);
   json_value_destroy(events);
 
+  scheduler_pool_stop(pool);   /* documented order: stop the pool FIRST, then
+                                  frame_destroy (frame.c's teardown note) */
   frame_destroy(f);
-  scheduler_pool_stop(pool);
   wave_db_close(db);
   scheduler_pool_destroy(pool);
 }

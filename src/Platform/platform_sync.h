@@ -6,15 +6,18 @@
 #define SA_PLATFORM_SYNC_H
 
 /* The thread / mutex / condvar SUBSET of platform_thread.h — WITHOUT the
-   barrier prototypes. WHY it exists: WaveDB's Util/threadding.h declares
-   its OWN platform_barrier_{init,wait,destroy} family (pthread_barrier_t*/
-/* SYNCHRONIZATION_BARRIER* — the aliased, family-shared symbol set this
-   build alias-links), and those prototypes CONFLICT textually with
-   platform_thread.h's platform_barrier_create/wait/destroy. Any TU that
-   also includes WaveDB headers (frame.c's Database/ include chain) must
-   not include platform_thread.h at all — it takes this barrier-free
-   subset instead. platform_thread.c's single implementation backs BOTH
-   headers; every declaration below is copied VERBATIM from
+   barrier prototypes, DELIBERATELY. WHY it exists: WaveDB's
+   src/Util/threadding.h declares its own platform_barrier_{init,wait,destroy}
+   family (the aliased, family-shared SYNCHRONIZATION_BARRIER symbol set this
+   build alias-links), and those declarations CONFLICT textually with
+   platform_thread.h's platform_barrier_create/wait/destroy. DO NOT add a
+   barrier — or any other absent prototype — here: a barrier prototype in
+   this header would collide with WaveDB's at link time for every TU on the
+   Database/ include chain, and the link error surfaces far from the cause.
+   Any TU that also includes WaveDB headers (frame.c's Database/ include
+   chain) must not include platform_thread.h at all — it takes this
+   barrier-free subset instead. platform_thread.c's single implementation
+   backs BOTH headers; every declaration below is copied VERBATIM from
    platform_thread.h's matching block. Keep the two in sync. */
 
 #include <stdint.h>

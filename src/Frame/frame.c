@@ -819,19 +819,28 @@ static void _frame_cell_watchdog_arm(frame_t* f) {
               "unwatched this frame", f->sid_path);
     return;
   }
-  /* PUBLISH-then-thread: the pointer is stored BEFORE the run so a watcher
-     can never fire its deadline before its frame is watching it (the
-     dispatch thread is the single writer, and it is this very dispatch that
-     un-publishes on any failure). */
-  f->cell_watchdog = w;
+  /* LOCK-CREATE-PUBLISH: the thread pointer's store rides the SAME lock the
+     deadline branch reads `w->thread` under — stored after the pointer's
+     publication and OUTSIDE the lock, it had no happens-before edge to the
+     watcher (the create's return is the only synchronization the C standard
+     gives us). pthread_create cannot block on our code's locks, so holding
+     the lock across the create is safe; the watcher's first action is
+     locking w->lock, still HELD here, so the publish below happens-before
+     any watcher progress — the old PUBLISH-then-thread invariant (a
+     deadline can never fire before its frame is watching) carries over
+     intact, with the dispatch thread still the pointer's single writer. */
+  platform_mutex_lock(w->lock);
   w->thread = platform_thread_create(_frame_cell_watchdog_main, w);
   if (w->thread == NULL) {
-    f->cell_watchdog = NULL;
-    _frame_cell_watchdog_payload_destroy(w);
+    platform_mutex_unlock(w->lock);
+    _frame_cell_watchdog_payload_destroy(w);   /* never published — nothing
+                                                  to un-publish */
     log_error("frame: the cell watchdog thread refused at '%s' — cells run "
               "unwatched this frame", f->sid_path);
     return;
   }
+  f->cell_watchdog = w;
+  platform_mutex_unlock(w->lock);
 }
 
 /* The store's outgoing reply: corr-matched to the requester's actor. records
@@ -2675,9 +2684,16 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
     case FRM_INT:
       /* The interrupt entry (frame.h's frame_interrupt): the synthesis is
          ONE mechanism with the caller's wording (surface-completion spec
-         §2). No payload. The case runs in python-less builds too — the
-         apply guards its pyrt accesses internally; the FRM_INT case is
+         §2). No payload. The DISARM FIRST (the PYRT_RESULT case's own
+         discipline): an interrupt during a pooled cell ends the armed
+         watchdog's reason to exist — the apply synthesizes the cell.close
+         itself and needs no watcher; leaving it armed would let a false
+         deadline fire long after the fact (a misleading already-complete-cell
+         no-op plus the next arm's single-watch false alarm). Disarm is
+         idempotent and NULL-safe. The case runs in python-less builds too —
+         the apply guards its pyrt accesses internally; the FRM_INT case is
          unconditional. */
+      _frame_cell_watchdog_disarm(f);
       _frame_interrupt_apply(f, 1, "aborted: interrupted at the frame's request");
       break;
     case FRM_CELL_WATCHDOG: {
