@@ -55,6 +55,7 @@ typedef struct bridge_frame_t {
   std::vector<uint64_t> req_corrs;
   std::vector<std::string> req_a;    /* remember/recall key, spawn goal, report text */
   std::vector<std::string> req_b;    /* remember value, spawn context */
+  std::vector<std::string> emits;    /* PYRT_EMIT texts (the durable verb) */
 } bridge_frame_t;
 
 static void bridge_frame_dispatch(void* state, message_t* msg) {
@@ -121,6 +122,15 @@ static void bridge_frame_dispatch(void* state, message_t* msg) {
       }
       break;
     }
+    case PYRT_EMIT: {
+      /* The durable verb's outbound text transfers; recorded (copied) and
+         retired here — the harness asserts the payload content directly. */
+      pyrt_text_payload_t* t = (pyrt_text_payload_t*)msg->payload;
+      msg->payload = NULL;
+      self->emits.push_back(t && t->text ? std::string(t->text) : std::string());
+      if (t != NULL) pyrt_text_payload_destroy(t);
+      break;
+    }
     default:
       break;
   }
@@ -175,6 +185,7 @@ static void bridge_frame_free(bridge_frame_t* self) {
   self->req_corrs = std::vector<uint64_t>();
   self->req_a = std::vector<std::string>();
   self->req_b = std::vector<std::string>();
+  self->emits = std::vector<std::string>();
   free(self);
 }
 
@@ -288,6 +299,27 @@ TEST(TestPyAgent, TestReportReturnsTrueAndCoercesNonString) {
   EXPECT_STREQ(self->req_a[0].c_str(), "plain");
   EXPECT_EQ(self->req_types[1], (uint32_t)FRM_REPORT);
   EXPECT_STREQ(self->req_a[1].c_str(), "7") << "non-str coerced via repr";
+
+  bridge_frame_free(self);
+}
+
+/* The durable verb's outbound half (spec §1): emit posts PYRT_EMIT with the
+   payload text INTACT — the cap applies later, at the frame's record write,
+   not to the runtime-to-actor hop. One cell, one emit, status 0. */
+TEST(TestPyAgent, TestEmitPostsWithThePayload) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(1, NULL);
+  self->answer = 0;   /* no bridge verbs in this cell; keep the frame silent */
+
+  self->results.clear();
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(self, "import actor\nactor.emit('the report text')");
+  bridge_frame_pump(self, 30000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  ASSERT_EQ(self->results[0]->status, 0);
+  ASSERT_EQ(self->emits.size(), 1u);
+  EXPECT_EQ(self->emits[0], "the report text");
 
   bridge_frame_free(self);
 }

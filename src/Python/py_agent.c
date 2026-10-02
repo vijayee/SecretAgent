@@ -14,6 +14,7 @@
 #include "../Frame/frame_messages.h"
 #include "../Util/allocator.h"
 #include "../Util/atomic_compat.h"
+#include "../Util/budget.h"
 #include "../Util/log.h"
 #include "../Platform/platform.h"
 
@@ -21,6 +22,7 @@
 #include "pyrt_messages.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 /* WHY IT BLOCKS (the plan's documented reconciliation of the pyrt outbound
@@ -533,10 +535,34 @@ static PyObject* _py_agent_status(PyObject* self, PyObject* args) {
 
 static PyObject* _py_agent_emit(PyObject* self, PyObject* args) {
   const char* text = NULL;
-  if (!PyArg_ParseTuple(args, "s", &text)) {
+  if (!PyArg_ParseTuple(args, "s:emit", &text)) {
     return NULL;
   }
-  pyrt_post_text(PYRT_EMIT, text);
+  /* The ONE source cap (budget table, spec §4): emit's text is cut HERE,
+     at the boundary — the frame trusts bounded text from its runtime, and
+     the durable emit record never carries unbounded text. The helper's
+     marker travels with the text (the model learns the cut at its next
+     derive); a REAL cut also posts a log line naming it (the marker alone
+     is a cut shape, not an announcement). */
+  char* capped = NULL;
+  uint8_t truncated = 0;
+  budget_truncate_with_marker(text, SA_BUDGET_EMIT_BYTES, &capped,
+                              &truncated);
+  if (capped == NULL) {
+    /* The helper refused (OOM / NULL text): the loud refusal contract. */
+    PyErr_NoMemory();
+    return NULL;
+  }
+  if (truncated != 0) {
+    char cut_line[128];
+    snprintf(cut_line, sizeof(cut_line),
+             "emit: the %zu-byte text exceeded the %u-byte emit budget and "
+             "was cut with the truncation marker",
+             strlen(text), (unsigned)SA_BUDGET_EMIT_BYTES);
+    pyrt_post_text(PYRT_LOG, cut_line);
+  }
+  pyrt_post_text(PYRT_EMIT, capped);
+  free(capped);   /* pyrt_post_text copies the text out; the cap buffer retires */
   Py_RETURN_NONE;
 }
 

@@ -124,6 +124,7 @@
 #include "../Platform/platform_time.h"
 #include "../Util/allocator.h"
 #include "../Util/atomic_compat.h"
+#include "../Util/budget.h"
 #include "../Util/log.h"
 
 #include <stdarg.h>
@@ -140,25 +141,25 @@
  * truncates instead of bloating a request).
  * ------------------------------------------------------------------------- */
 
-/* Per-message cap on ANY projected text (msg.append content, cell result
-   text). 4000 chars is long enough for real prose, short enough that a
-   512-record replay stays bounded no matter what the model wrote. */
-#define SA_LOOP_MSG_CAP 4000
+/* The projection caps are the budget table's names NOW (src/Util/budget.h,
+   surface-completion spec §4): SA_BUDGET_LOOP_MSG_CAP, SA_BUDGET_LOOP_SNAPSHOT,
+   SA_BUDGET_LOOP_REPORT, SA_BUDGET_LOOP_EMIT. The loop's LOCAL structure caps
+   (how many keys / reports / trailing results ride along) stay here — they
+   bound the projection's SHAPE, not any one text's bytes. The per-message /
+   per-value / per-line byte caps live in the table alone. */
 
 /* Bounded ctx snapshot: at most this many distinct keys reach the system
    prompt (NEW keys beyond the cap are dropped; already-present keys keep
-   updating to their newest value), and each value renders at most this many
-   chars. The snapshot comes from state.remember events, so it includes
-   local/ writes too — the projection shows the model the effect history of
-   BOTH remember layers (they share the state.remember event; the ctx/local
-   split is a recall-shadowing detail the model does not need). */
+   updating to their newest value). The snapshot comes from state.remember
+   events, so it includes local/ writes too — the projection shows the model
+   the effect history of BOTH remember layers (they share the state.remember
+   event; the ctx/local split is a recall-shadowing detail the model does not
+   need). */
 #define SA_LOOP_SNAPSHOT_MAX_KEYS 24
-#define SA_LOOP_SNAPSHOT_VALUE_CAP 500
 
 /* One-line per-child report summaries: at most this many reports, each
-   flattened to its first line, each line at most this many chars. */
+   flattened to its first line. */
 #define SA_LOOP_REPORTS_MAX 8
-#define SA_LOOP_REPORT_LINE_CAP 300
 
 /* Trailing cell-result block: at most this many results ride along after the
    newest msg.append (a model that keeps calling tools without ever writing a
@@ -331,7 +332,7 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
 
   const char* goal = _frame_goal(f);
   if (goal != NULL) {
-    char* g = _loop_trunc(goal, SA_LOOP_MSG_CAP);
+    char* g = _loop_trunc(goal, SA_BUDGET_LOOP_MSG_CAP);
     _loop_sb_putf(&sb, "Goal: %s\n", g);
     free(g);
   }
@@ -340,7 +341,7 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
     _loop_sb_puts(&sb, "\nFrame state (newest value wins; JSON verbatim):\n");
     for (size_t i = 0; i < nsnaps; i++) {
       char* v = json_serialize(snaps[i].value);
-      char* vt = (v != NULL) ? _loop_trunc(v, SA_LOOP_SNAPSHOT_VALUE_CAP) : NULL;
+      char* vt = (v != NULL) ? _loop_trunc(v, SA_BUDGET_LOOP_SNAPSHOT) : NULL;
       _loop_sb_putf(&sb, "- %s = %s\n", snaps[i].key,
                     (vt != NULL && vt[0] != '\0') ? vt : "(unserializable)");
       free(v);
@@ -351,7 +352,7 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
   if (nreports > 0) {
     _loop_sb_puts(&sb, "\nChild reports:\n");
     for (size_t i = 0; i < nreports; i++) {
-      char* line = _loop_one_line(reports[i].text, SA_LOOP_REPORT_LINE_CAP);
+      char* line = _loop_one_line(reports[i].text, SA_BUDGET_LOOP_REPORT);
       _loop_sb_putf(&sb, "- %s: %s\n", reports[i].child_sid, line);
       free(line);
     }
@@ -428,7 +429,7 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
       json_value_t* role = json_get(payload, "role");
       json_value_t* content = json_get(payload, "content");
       if (role != NULL && content != NULL) {
-        char* ct = _loop_trunc(json_as_string(content), SA_LOOP_MSG_CAP);
+        char* ct = _loop_trunc(json_as_string(content), SA_BUDGET_LOOP_MSG_CAP);
         json_value_t* m = json_new_object();
         json_object_set(m, "role", json_new_string(json_as_string(role)));
         json_object_set(m, "content", json_new_string(ct));
@@ -446,13 +447,32 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
       const char* text = (text_v != NULL) ? json_as_string(text_v) : NULL;
       char* tt = _loop_trunc((text != NULL && text[0] != '\0') ? text
                                                               : "(no output)",
-                             SA_LOOP_MSG_CAP);
+                             SA_BUDGET_LOOP_MSG_CAP);
       size_t line_len = strlen("cell result (status ): ") + strlen(status_buf) +
                         strlen(tt);
       char* line = get_memory(line_len + 1);
       snprintf(line, line_len + 1, "cell result (status %s): %s", status_buf, tt);
       free(tt);
       _loop_result_push(result_ring, &nresults, line);
+    } else if (strcmp(type_name, "emit") == 0) {
+      /* The write verb's projected half (spec §1): one line per emit,
+         "emit: <text>", each capped at the table's emit line cap, event
+         order — the model sees its own deliberate artifacts again at its
+         next derive. Emits ride the same ring as cell results (only the
+         block since the newest msg.append is projected). */
+      json_value_t* text_v = json_get(payload, "text");
+      if (text_v != NULL) {
+        const char* text = json_as_string(text_v);
+        char* tt = _loop_trunc((text != NULL) ? text : "", SA_BUDGET_LOOP_EMIT);
+        size_t line_len = strlen("emit: ") + strlen(tt);
+        char* line = get_memory(line_len + 1);
+        snprintf(line, line_len + 1, "emit: %s", tt);
+        free(tt);
+        _loop_result_push(result_ring, &nresults, line);
+      }
+      /* An emit record with no text renders nothing (the render-not-crash
+         rule — the writer's compose always carries text; a corrupt stored
+         record is the fold's loud skip, not a crash here). */
     } else if (strcmp(type_name, LIFE_EVENT_REPAIR) == 0) {
       /* The crash-repair brief (spec §4): REPAIR events render as a user-
          role message, text verbatim — the model reads the full crash
@@ -464,7 +484,7 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
       json_value_t* text_v = json_get(payload, "text");
       if (text_v != NULL) {
         const char* text = json_as_string(text_v);
-        char* tt = _loop_trunc((text != NULL) ? text : "", SA_LOOP_MSG_CAP);
+        char* tt = _loop_trunc((text != NULL) ? text : "", SA_BUDGET_LOOP_MSG_CAP);
         json_value_t* m = json_new_object();
         json_object_set(m, "role", json_new_string("user"));
         json_object_set(m, "content", json_new_string(tt));
@@ -477,7 +497,9 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
     }
     /* cell.run skipped (code is not re-quoted — see the header's
        construction note); state.remember / frame.report went into pass A;
-       spawn/join/control records carry no model context. turn.start /
+       spawn/join/control records carry no model context — and the emit
+       record is rendered above (the ring), while pyrt log/status ride the
+       frame's consumption only and never reach the stream at all. turn.start /
        turn.end / step.start / step.end are log spine only (the envelope
        folds away; the `repair` brief is the ONE model-visible lifecycle
        type and rendered above). */

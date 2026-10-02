@@ -448,6 +448,69 @@ TEST(TestLoop, TestSteeringBetweenTurnsReordersCells) {
   wave_db_close(db);
 }
 
+/* The write verb's durable half (spec §1): the cell's emit becomes ONE
+   stored `emit` record in the frame's own events stream, AND the derive
+   renders it back to the model as a bounded `emit: <text>` line — the verb
+   is real in both directions. */
+TEST(TestLoop, TestEmitIsDurableAndProjected) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "emit a part", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.emit('emitted: part one')\"}"}}]}}]})json";
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"all done"}}]})json";
+  std::vector<std::string> replies = {turn1, turn2};
+
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+
+  frame_set_model_backend(f, &sm.base);
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(replies.size(), 0u);
+
+  /* Durable half: exactly one emit record in the frame's events stream, its
+     payload carrying the text verbatim. */
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_type(events, "emit"), 1u);
+  json_value_t* emit_rec = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "emit")) {
+      emit_rec = json_at(events, i);
+      break;
+    }
+  }
+  ASSERT_NE(emit_rec, nullptr);
+  json_value_t* emit_payload = payload_of(emit_rec);
+  ASSERT_NE(emit_payload, nullptr);
+  json_value_t* emit_text = json_get(emit_payload, "text");
+  ASSERT_NE(emit_text, nullptr);
+  EXPECT_STREQ(json_as_string(emit_text), "emitted: part one");
+  json_value_destroy(events);
+
+  /* Projected half: the turn-2 derive (the model's SECOND view) carries the
+     emitted line. The turn-1 derive precedes the cell, so only capture [1]
+     can show it. */
+  ASSERT_EQ(sm.captured.size(), 2u);
+  EXPECT_NE(sm.captured[1].find("emit: emitted: part one"), std::string::npos)
+      << "the derive did not project the emit: " << sm.captured[1];
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestLoop, TestTurnLimitFailsLoud) {
   py_agent_init();
   frame_config_t cfg = test_config();

@@ -2177,6 +2177,54 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       pyrt_result_payload_destroy(r);
       break;
     }
+    case PYRT_EMIT: {
+      /* The write verb's durable half (surface-completion spec §1): ONE
+         record in the frame's OWN events stream — the single-record
+         fire-and-post (corr 0, reply_to NULL), the same shape as the
+         cell.result audit write minus the lifecycle riders (emit is a side
+         effect, not a step boundary; it composes while a cell is pending,
+         between turns, and in the demo driver alike). The text arrives
+         source-capped (py_agent's SA_BUDGET_EMIT_BYTES cut — the frame
+         trusts bounded text from its runtime). Store-refused: the loud
+         pre-post refusal contract, no corr to answer. */
+      pyrt_text_payload_t* t = (pyrt_text_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (t == NULL) {
+        log_error("frame: PYRT_EMIT with no payload at '%s'", f->sid_path);
+        break;
+      }
+      json_value_t* payload = json_new_object();
+      if (payload == NULL) {
+        log_error("frame: out of memory building the emit payload at '%s'",
+                  f->sid_path);
+      } else {
+        json_object_set(payload, "text",
+                        (t->text != NULL) ? json_new_string(t->text)
+                                          : json_new_null());
+        if (_frame_event_post_fire(f, "emit", payload) != 0) {
+          log_error("frame: the emit record was refused pre-post at '%s' "
+                    "(already logged)", f->sid_path);
+        }
+      }
+      pyrt_text_payload_destroy(t);
+      break;
+    }
+    case PYRT_LOG:
+    case PYRT_STATUS: {
+      /* Deliberately NOT store records: log/status are MESSAGES (verbs —
+         narration and heartbeat), not nouns in the audit stream (spec §1);
+         the frame consumes them on receipt as loud log lines, the derive
+         never renders them. Replaying them into the store would turn the
+         frame's context into narration history. */
+      pyrt_text_payload_t* t = (pyrt_text_payload_t*)msg->payload;
+      msg->payload = NULL;
+      log_info("frame: pyrt %s at '%s': %s",
+               (msg->type == (uint32_t)PYRT_LOG) ? "log" : "status",
+               f->sid_path,
+               (t != NULL && t->text != NULL) ? t->text : "(none)");
+      if (t != NULL) pyrt_text_payload_destroy(t);
+      break;
+    }
 #endif
     case FRM_TURN:
       /* The engine's scheduled turn-step continuation (Task 3): ONE turn
