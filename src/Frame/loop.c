@@ -457,7 +457,10 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
       /* The crash-repair brief (spec §4): REPAIR events render as a user-
          role message, text verbatim — the model reads the full crash
          briefing in its next derive with the details upfront. The payload's
-         text is capped at source (the derive's msg cap). */
+         text is capped at source (the derive's msg cap). The ring flushes
+         FIRST: a repair between a cell.result and the stream's next
+         msg.append must not reorder the result line behind the brief. */
+      _loop_flush_results(out, result_ring, &nresults);
       json_value_t* text_v = json_get(payload, "text");
       if (text_v != NULL) {
         const char* text = json_as_string(text_v);
@@ -468,9 +471,9 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
         free(tt);
         json_array_append(out, m);
       }
-      /* A repair record with no text folds as nothing (malformed — the
-         render-not-crash rule; the record's loud line already happened at
-         fold time via the events parse). */
+      /* A repair record with no text renders nothing (the render-not-crash
+         rule — the brief's compose always carries text; a corrupt stored
+         record is the fold's loud skip, not a crash here). */
     }
     /* cell.run skipped (code is not re-quoted — see the header's
        construction note); state.remember / frame.report went into pass A;

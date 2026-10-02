@@ -498,8 +498,9 @@ void _frame_join_post(frame_t* parent, const char* child_sid);
    Empty closers = no-op. Refused scan/batch/deadline = resume fails loud
    (the sync family's documented consequences; resume refuses rather than
    half-repairs; `_frame_seq_rollback` releases the pre-allocated seqs on
-   the compose-refusal path). Returns 0 (repaired or already balanced), -1
-   loud otherwise.
+   the compose-refusal path). Returns 0 (repaired or already balanced), or
+   -1/-3 loud otherwise (the compose-stage WAL cap refusals pass through,
+   mirroring `_frame_event_post`'s 0/-1/-3 contract).
 
    Scope note (frame_resume's caller): a DONE subtree skips the pass
    entirely — every status=done write rode its terminal turn's close batch
