@@ -43,6 +43,9 @@ if (BUILD_TESTING)
             # array text): no WDB, no streams — it registers on the plain
             # gate so the OFF build keeps it.
             test_lifecycle.cpp
+            # The budget suite is PURE (Util constants + the marker helper):
+            # no WDB, no streams — same plain gate as test_lifecycle.
+            test_budget.cpp
             )
 
     # Same CMake-level mirror idiom as the pyrt gate above: frame store tests
