@@ -491,6 +491,52 @@ TEST(TestPyrt, TestSubprocessTruncatesAndNeverHangs) {
   py_frame_free(self);
 }
 
+/* Source cap (budget table §4): the ONE cap inside _pyrt_post_result bounds
+   every routed/durable result text for BOTH backends. A 100 KiB result through
+   the embedded backend must arrive as exactly 32 KiB of text + the marker
+   naming the ORIGINAL length. */
+TEST(TestPyrt, TestResultTextCappedAtSourceWithMarker) {
+  py_frame_t* self = py_frame_create();
+
+  /* Single-expression cell: the subinterpreter backend returns '' (status 0)
+     for a valueless multi-line exec cell, so the result-text probe must ride
+     the eval path. repr() wraps a str in quotes, so 102398 x's repr to
+     exactly 102400 bytes — the marker must name THAT original length. */
+  py_frame_execute(self, "'x' * 102398");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  pyrt_result_payload_t* r = self->results[0];
+  EXPECT_EQ(r->status, 0);
+  ASSERT_NE(r->text, nullptr);
+  /* The bounded shape (budget.h contract): cap bytes of text, then the
+     marker naming the ORIGINAL length. */
+  static const char kMarker[] = "[budget: truncated at 102400 bytes]";
+  EXPECT_EQ(strlen(r->text), 32u * 1024u + (sizeof(kMarker) - 1) + 1u);
+  EXPECT_EQ(r->text[32u * 1024u - 1u], 'x');
+  EXPECT_EQ(r->text[32u * 1024u], '\n');
+  EXPECT_EQ(r->text[32u * 1024u + 1u], '[');
+  EXPECT_NE(strstr(r->text, kMarker), nullptr);
+
+  py_frame_free(self);
+}
+
+/* A small result never touches the marker: the cap is a clean copy when the
+   text fits. */
+TEST(TestPyrt, TestSmallResultUnchangedByCap) {
+  py_frame_t* self = py_frame_create();
+
+  py_frame_execute(self, "1 + 1");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  ASSERT_NE(self->results[0]->text, nullptr);
+  EXPECT_STREQ(self->results[0]->text, "2");
+
+  py_frame_free(self);
+}
+
 #endif /* SA_HAS_PYTHON */
 
 #ifndef SA_HAS_PYTHON

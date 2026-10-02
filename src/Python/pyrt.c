@@ -14,6 +14,7 @@
 #include "../Actor/actor.h"
 #include "../Util/allocator.h"
 #include "../Util/atomic_compat.h"
+#include "../Util/budget.h"
 #include "../Util/log.h"
 #include "../Platform/platform.h"
 
@@ -142,6 +143,24 @@ static void _pyrt_post_text(pyrt_t* py, uint32_t type, const char* text) {
    happened" and is never routed. */
 static void _pyrt_post_result(pyrt_t* py, uint64_t corr, uint8_t status, char* text) {
   if (text == NULL) return;
+  /* The ONE source cap (budget table, spec §4): both backends post through
+     here, so the routed result text is bounded in one place. The marker
+     travels with the text — the model learns the cut at its next derive.
+     This function OWNS text: the cap exchange frees the old buffer. */
+  char* capped = NULL;
+  uint8_t truncated = 0;
+  budget_truncate_with_marker(text, SA_BUDGET_CELL_RESULT_BYTES, &capped,
+                              &truncated);
+  free(text);
+  if (capped == NULL) {
+    /* The budget helper refused (OOM/cap 0): the corr-matched shape is
+       never abandoned — post the loud literal instead. */
+    capped = strdup("pyrt: the result budget refused the text");
+    if (capped == NULL) return;
+    truncated = 0;
+  }
+  (void)truncated;
+  text = capped;
   if (py == NULL || py->owner == NULL) {
     free(text);
     return;
