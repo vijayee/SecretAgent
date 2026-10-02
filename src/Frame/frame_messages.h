@@ -52,10 +52,16 @@ typedef enum frame_message_type_e {
                              the cross-subtree report batch THERE (the
                              parent's actor pre-allocates the parent's seq;
                              frm_report_bind_payload_t) */
-  FRM_INT                 /* interrupt (owner -> the frame's own mailbox): cut
+  FRM_INT,                /* interrupt (owner -> the frame's own mailbox): cut
                              the pending cell + close an open turn aborted —
                              the reason union's RESERVED `aborted` first
                              writer. No payload. */
+  FRM_CELL_WATCHDOG       /* the POOLED cell's deadline fired: the SAME
+                             interrupt synthesis runs under the watchdog
+                             wording (arm_cut = 0 — a deadline never arms a
+                             cut). Payload = the frame.c-private watchdog
+                             struct, handed off whole; its destroyer frees
+                             it on the frame's thread — see frame.c */
 } frame_message_type_e;
 
 /* Event types (stored at sessions/<sid>/events/<seq>, JSON, %020d seq). ONLY

@@ -15,6 +15,7 @@ extern "C" {
 #include "../src/Frame/frame_messages.h"
 #include "../src/Frame/model.h"
 #include "../src/Frame/loop.h"
+#include "../src/Scheduler/scheduler.h"   /* the pooled tests' pool API */
 #include "../src/Util/json.h"
 #include "../src/Util/allocator.h"
 }
@@ -1091,6 +1092,10 @@ TEST(TestLoop, TestAsyncScriptedBackendDrivesTheSameEngine) {
 TEST(TestLoop, TestFrameInterruptCutsCellAndAbortsTurn) {
   py_agent_init();
   frame_config_t cfg = test_config();
+  cfg.cell_watchdog_ms = 0;   /* the deadline watchdog OFF: this is the
+                                 caller's interrupt, not the timer's — a
+                                 300 ms interrupt racing a default 5 min
+                                 deadline would only pollute the pin */
   wave_database_root_t* db = wave_db_open(NULL);
   ASSERT_NE(db, nullptr);
   frame_t* f = frame_create(db, NULL, "interrupt me", &cfg);
@@ -1240,6 +1245,204 @@ TEST(TestLoop, TestFrameInterruptArmsNoStoreWriteWhenNothingOpen) {
   free(v);
   frame_destroy(f);
   wave_db_close(db);
+}
+
+/* --- the pooled cell watchdog (surface-completion spec §2) ----------------
+
+   The POOLED shape of the interrupt seam: a watchdog thread per running
+   cell waits its deadline on a condvar; the REAL result's arrival disarms
+   it under the airtight protocol; at the deadline it hands the whole
+   watchdog struct to the frame as a FRM_CELL_WATCHDOG payload and the
+   frame's dispatch runs the SAME synthesis under the watchdog wording. The
+   pool runs everything (no joins, the test_frame.cpp pooled-tree idiom);
+   the tests poll the durable log / the terminal status. */
+
+/* Poller for the DEAD-CELL test: the frame never becomes done (a failed TOP
+   frame keeps its status — the pinned shape), so the gate is the durable
+   turn.end {aborted, watchdog wording} record itself, re-scanned off the
+   (idle-then) pooled store. */
+static bool wait_pooled_watchdog_record(frame_t* f, int round10ms) {
+  for (int i = 0; i < round10ms; i++) {
+    json_value_t* events = load_events(f);
+    if (events != NULL) {
+      for (size_t j = 0; j < json_size(events); j++) {
+        json_value_t* rec = json_at(events, j);
+        if (!event_is(rec, "turn.end")) continue;
+        json_value_t* p = payload_of(rec);
+        json_value_t* reason = (p != NULL) ? json_get(p, "reason") : NULL;
+        if (reason != NULL &&
+            strcmp(json_as_string(json_get(reason, "kind")), "aborted") == 0 &&
+            strcmp(json_as_string(json_get(reason, "text")),
+                   "aborted: cell exceeded the watchdog deadline") == 0) {
+          json_value_destroy(events);
+          return true;
+        }
+      }
+      json_value_destroy(events);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
+/* Poller for the pooled tests that end DONE (the disarm-wins race shape):
+   frame_is_done flips when the finish batch commits. */
+static bool wait_pooled_done(frame_t* f, int round10ms) {
+  for (int i = 0; i < round10ms && frame_is_done(f) == 0; i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  return frame_is_done(f) != 0;
+}
+
+/* The pooled store + frame pair for the watchdog tests (a POOLED frame
+   requires a POOLED store — frame_create refuses loud otherwise; the pooled
+   tree tests' exact setup). */
+TEST(TestLoop, TestPooledWatchdogInterruptsTheDeadCell) {
+  py_agent_init();
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  frame_config_t cfg = test_config();
+  cfg.pool = pool;
+  cfg.cell_watchdog_ms = 150;   /* short: the deadline fires inside the test */
+
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;   /* the store actor rides the SAME pool */
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "watchdog me", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* Turn 1: a tool-call cell that sleeps 3 s — the deadline (150 ms) wins
+     by two orders of magnitude. */
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import time\\nprint('started')\\ntime.sleep(3)\\n'the real result'\"}"}}]}}]})json";
+  std::vector<std::string> replies = {turn1};
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  ASSERT_EQ(frame_start(f), 0);
+
+  /* The watchdog's synthesis committed: turn.end {aborted, the watchdog
+     wording} (+ one corr-matched cell.result, status 1, the interrupt
+     wording). */
+  ASSERT_TRUE(wait_pooled_watchdog_record(f, 800))
+      << "the watchdog's synthesis never committed the aborted turn";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  int saw_result = 0;
+  size_t n_cells = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "cell.result")) continue;
+    n_cells++;
+    json_value_t* p = payload_of(rec);
+    if (p != NULL && json_as_int(json_get(p, "status")) == 1 &&
+        strstr(json_as_string(json_get(p, "text")), "interrupted") != NULL) {
+      saw_result = 1;
+    }
+  }
+  EXPECT_EQ(saw_result, 1) << "the synthesis wrote the interrupted cell's "
+                              "corr-matched result";
+  /* The hung cell's REAL result (status 0) must NEVER write a second
+     cell.result — the poison contract's quiet drop. Give the 3 s sleep its
+     run-out like the interrupt test, then re-scan. */
+  std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+  json_value_destroy(events);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  size_t n_cells_after = count_type(events, "cell.result");
+  EXPECT_EQ(n_cells_after, n_cells) << "the dead cell's real result wrote no "
+                                       "durable record (the quiet drop)";
+  /* A failed TOP frame makes no status change (the pinned
+     cap-is-a-failure shape) — done is 0, but the ENGINE ended (no further
+     turns run against the poisoned runtime; the events above are final). */
+  EXPECT_EQ(frame_is_done(f), 0)
+      << "a failed top frame keeps its status (the failure is the log's)";
+  json_value_destroy(events);
+
+  frame_destroy(f);   /* joins the hung pyrt thread — bounded by the 3 s
+                         sleep (past here), the documented cost */
+  scheduler_pool_stop(pool);   /* documented order: stop, then close, then
+                                  destroy (the pooled tree tests' idiom) */
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
+}
+
+TEST(TestLoop, TestPooledWatchdogDisarmsAtTheRealResult) {
+  /* The disarm path's pin (the watchdog-race shape): the deadline sits
+     10 s out, the pooled cell completes in milliseconds — the REAL result's
+     arrival disarms the watcher (join under the protocol) and the run is a
+     CLEAN completion. No aborted turn.end, no control event, done. */
+  py_agent_init();
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  frame_config_t cfg = test_config();
+  cfg.pool = pool;
+  cfg.cell_watchdog_ms = 10000;   /* way past a fast cell: the disarm wins */
+
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "fast cell, disarm wins", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"1 + 1\"}"}}]}}]})json";
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"the fast cell ran watched"}}]})json";
+  std::vector<std::string> replies = {turn1, turn2};
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  ASSERT_EQ(frame_start(f), 0);
+  ASSERT_TRUE(wait_pooled_done(f, 6000))
+      << "the fast cell completed and the frame finished done";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  int saw_aborted = 0;
+  int saw_completed = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "turn.end")) continue;
+    json_value_t* reason = json_get(payload_of(rec), "reason");
+    if (reason == NULL) continue;
+    if (strcmp(json_as_string(json_get(reason, "kind")), "aborted") == 0)
+      saw_aborted = 1;
+    if (strcmp(json_as_string(json_get(reason, "kind")), "completed") == 0)
+      saw_completed = 1;
+  }
+  EXPECT_EQ(saw_aborted, 0) << "the disarm won — no deadline synthesis fired";
+  EXPECT_EQ(saw_completed, 1);
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  scheduler_pool_stop(pool);
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
 }
 
 #endif /* python gate */

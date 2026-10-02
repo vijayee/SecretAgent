@@ -24,6 +24,17 @@ typedef struct frame_config_t {
                                     SA_MODEL_TIMEOUT_MS). Local models on
                                     big tool-calling turns can run minutes —
                                     the default 30 s is for cloud endpoints. */
+  unsigned cell_watchdog_ms;     /* one RUNNING CELL's bound, ms. Fires on a
+                                    POOLED frame only (the inline driver's
+                                    own phase deadline covers the inline
+                                    shape): a watchdog thread per cell waits
+                                    the deadline and a firing runs the
+                                    frame_interrupt synthesis under the
+                                    watchdog wording
+                                    ("aborted: cell exceeded the watchdog
+                                    deadline"). 0 = disabled; the
+                                    cfg-less default is budget.h's
+                                    SA_FRAME_CELL_WATCHDOG_MS. */
   /* The scheduler pool this frame's embedded actor attaches to. BORROWED —
      never owned/freed by the frame. NULL = the inline shape (tests/loop pump
      the mailbox by hand); a spawned child INHERITS the parent's pool, so a
@@ -62,6 +73,11 @@ actor_t* wave_db_store_actor(wave_database_root_t* db);
 int wave_db_pump(wave_database_root_t* db);
 
 typedef struct frame_t frame_t;
+
+/* The POOLED cell watchdog's private state (defined in frame.c — spec §2):
+   ONE short-lived condvar thread per running cell; the frame holds the
+   pointer only. */
+typedef struct frame_cell_watchdog_t frame_cell_watchdog_t;
 
 typedef struct model_backend_t model_backend_t;   /* defined by model.h (Task 9) */
 

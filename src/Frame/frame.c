@@ -134,8 +134,12 @@ void frm_report_bind_payload_destroy(void* p) {
 /* NOT platform.h: its platform_thread.h barrier declarations collide with
    WaveDB's own threadding.h barrier prototypes (the family-shared symbol
    set this build aliases) — a frame TU includes WaveDB headers via
-   Database/. The cell-wait clock only needs the TIME wrappers. */
+   Database/. The cell-wait clock needs the TIME wrappers; the POOLED cell
+   watchdog needs platform_sync.h — platform_thread.h's thread/mutex/condvar
+   subset WITHOUT the colliding barrier prototypes. */
 #include "../Platform/platform_time.h"
+#include "../Platform/platform_sync.h"
+#include "../Util/budget.h"   /* SA_FRAME_CELL_WATCHDOG_MS (the cfg-less default) */
 
 /* One effect = one root batch. A concurrent-mode batch that exceeds the WAL
    file size is REJECTED by WaveDB (default cap 128 KB); we refuse anything
@@ -265,6 +269,9 @@ struct frame_t {
   char* model_name;
   unsigned max_depth;
   unsigned model_timeout_ms;  /* 0 = built-in default (model_timeout_ms_resolve) */
+  unsigned cell_watchdog_ms;  /* one pooled RUNNING CELL's bound, ms;
+                                 0 = disabled (SA_FRAME_CELL_WATCHDOG_MS is
+                                 the cfg-less default) */
   scheduler_pool_t* pool;     /* BORROWED from the config (inherited down the
                                  lineage): the frame actor's scheduler pool;
                                  NULL = the inline shape (the owner pumps). */
@@ -299,6 +306,11 @@ struct frame_t {
                                  carries the aborted turn) */
   uint64_t cell_interrupted_corr;   /* the pyrt corr whose REAL result is
                                        expected late and drops quietly */
+  frame_cell_watchdog_t* cell_watchdog;   /* the POOLED cell's armed
+                                             watchdog (NULL = none/idle);
+                                             written ONLY on this frame's
+                                             dispatch thread — frame.c's
+                                             disarm protocol owns it */
   uint8_t stop_requested;     /* FRM_STOP: the loop drains, then stops */
   /* The nesting depth of THIS frame's behavior dispatches (0 = not inside a
      mailbox dispatch). The single-runner discipline keeps it exact; the sync
@@ -677,6 +689,149 @@ void _frame_post(actor_t* target, uint32_t type, void* payload,
     return;
   }
   (void)actor_send(target, &m);
+}
+
+/* --- the POOLED cell watchdog (surface-completion spec §2) ----------------
+   ONE short-lived thread per pooled running cell. The thread waits its
+   deadline on a condvar; the result's arrival (the disarm) sets
+   disarm_wanted + wakes it under the SAME lock, so the deadline branch and
+   the disarm are mutually exclusive decisions on ONE protected state pair
+   (disarm_wanted, handed_off) — there is no third outcome. At the deadline
+   the thread hands the WHOLE watchdog struct to the frame as a
+   FRM_CELL_WATCHDOG message payload (the frame's dispatch is the single
+   cleaner — no cross-thread free, no join of a detached thread), sets
+   handed_off BEFORE the post, and detaches. The disarm, if it arrives after
+   a handoff, drops to the incoming message's destroyer instead of joining.
+
+   THE PRIVATE MUTEX PAIR: the frame layer's store-actor discipline is
+   lock-free (single-writer dispatch threads, fire-and-post, atomics at the
+   lifetime seams); these two mutexes guard ONLY the watchdog's own
+   two-state pair across the watcher thread and this frame's dispatch
+   thread — no frame state is shared through them. */
+
+typedef struct frame_cell_watchdog_t {
+  platform_mutex_t* lock;
+  platform_condvar_t* cond;
+  platform_thread_t* thread;
+  uint8_t disarm_wanted;   /* the result's arrival, under lock */
+  uint8_t handed_off;      /* the deadline branch: set BEFORE the post, under
+                              lock — the disarm reads it under the SAME lock
+                              to decide join-vs-bail */
+  uint32_t timeout_ms;
+  frame_t* f;              /* BORROWED: the frame outlives an armed watchdog
+                              (frame_destroy disarms/joins first) */
+} frame_cell_watchdog_t;
+
+static void _frame_cell_watchdog_payload_destroy(void* p) {
+  frame_cell_watchdog_t* w = (frame_cell_watchdog_t*)p;
+  if (w == NULL) return;
+  platform_mutex_destroy(w->lock);
+  platform_condvar_destroy(w->cond);
+  free(w);
+}
+
+static void* _frame_cell_watchdog_main(void* arg) {
+  frame_cell_watchdog_t* w = (frame_cell_watchdog_t*)arg;
+  uint64_t deadline =
+      platform_monotonic_ns() + (uint64_t)w->timeout_ms * 1000000ULL;
+  platform_mutex_lock(w->lock);
+  while (w->disarm_wanted == 0) {
+    uint64_t now = platform_monotonic_ns();
+    if (now >= deadline) {
+      /* The deadline fired: hand the struct over (its destroyer frees it on
+         the frame's thread) and detach. handed_off is set under the lock
+         FIRST, so a disarm that arrives later under the same lock sees it
+         and never joins a detached thread — and with the post UNDER the
+         lock, the disarm can only ever observe a COMPLETED handoff (the
+         post precedes any handed_off read through the same mutex), so the
+         frame can never be freed under a not-yet-delivered message. The
+         FRM_CELL_WATCHDOG dispatch takes this same lock once before its
+         destroy — the handshake guarantees the watcher's unlock precedes
+         the mutex's death. _frame_post's REFUSAL branch (the target's
+         ACTOR_FLAG_DESTROY — unreachable here by wiring: every teardown
+         runs this frame's disarm FIRST, which joins a not-yet-handed-off
+         watcher) would destroy the payload while this thread holds the
+         lock; the armed watch's posting path keeps the target alive. */
+      w->handed_off = 1;
+      _frame_post(&w->f->actor, (uint32_t)FRM_CELL_WATCHDOG, w,
+                  _frame_cell_watchdog_payload_destroy, "cell watchdog");
+      platform_thread_t* self = w->thread;   /* the local survives the unlock */
+      platform_mutex_unlock(w->lock);
+      platform_thread_detach(self);
+      return NULL;
+    }
+    platform_condvar_timed_wait(w->cond, w->lock,
+                                (unsigned)((deadline - now) / 1000000ULL) + 1);
+  }
+  platform_mutex_unlock(w->lock);
+  return NULL;
+}
+
+static void _frame_cell_watchdog_disarm(frame_t* f) {
+  /* The frame's dispatch thread ONLY (the single writer of the pointer). */
+  frame_cell_watchdog_t* w = f->cell_watchdog;
+  if (w == NULL) return;
+  f->cell_watchdog = NULL;
+  platform_mutex_lock(w->lock);
+  if (w->handed_off != 0) {
+    /* The deadline won: the incoming FRM_CELL_WATCHDOG message owns the
+       struct (its destroyer frees it on the frame's thread; a refused send
+       at a dying target is freed by _frame_post's own refusal branch) and
+       the watcher thread detaches itself — do not join, do not touch the
+       lock past the unlock. */
+    platform_mutex_unlock(w->lock);
+    return;
+  }
+  w->disarm_wanted = 1;
+  platform_condvar_broadcast(w->cond);
+  platform_mutex_unlock(w->lock);
+  platform_thread_join(w->thread);
+  _frame_cell_watchdog_payload_destroy(w);
+}
+
+static void _frame_cell_watchdog_arm(frame_t* f) {
+  if (f->pool == NULL || f->cell_watchdog_ms == 0) return;   /* the inline
+    driver's phase deadline covers pool-less shapes; 0 = the watchdog is off */
+  if (f->cell_watchdog != NULL) {
+    /* INVARIANT: one cell at a time — the previous watchdog disarmed at its
+       result's arrival. Seeing one here is a bug's loud trace, and the
+       disarm-first discipline keeps the state machine safe anyway. */
+    log_error("frame: a second watchdog armed at '%s' — the cell slot's "
+              "single-watch invariant broke; disarming the stale one",
+              f->sid_path);
+    _frame_cell_watchdog_disarm(f);
+  }
+  frame_cell_watchdog_t* w =
+      (frame_cell_watchdog_t*)get_clear_memory(sizeof(frame_cell_watchdog_t));
+  if (w == NULL) {
+    log_error("frame: out of memory arming the cell watchdog at '%s' — "
+              "cells run unwatched this frame (the hung-cell cost is the "
+              "old silent wedge)", f->sid_path);
+    return;
+  }
+  w->lock = platform_mutex_create();
+  w->cond = platform_condvar_create();
+  w->timeout_ms = f->cell_watchdog_ms;
+  w->f = f;
+  if (w->lock == NULL || w->cond == NULL) {
+    _frame_cell_watchdog_payload_destroy(w);
+    log_error("frame: the cell watchdog failed to build at '%s' — cells run "
+              "unwatched this frame", f->sid_path);
+    return;
+  }
+  /* PUBLISH-then-thread: the pointer is stored BEFORE the run so a watcher
+     can never fire its deadline before its frame is watching it (the
+     dispatch thread is the single writer, and it is this very dispatch that
+     un-publishes on any failure). */
+  f->cell_watchdog = w;
+  w->thread = platform_thread_create(_frame_cell_watchdog_main, w);
+  if (w->thread == NULL) {
+    f->cell_watchdog = NULL;
+    _frame_cell_watchdog_payload_destroy(w);
+    log_error("frame: the cell watchdog thread refused at '%s' — cells run "
+              "unwatched this frame", f->sid_path);
+    return;
+  }
 }
 
 /* The store's outgoing reply: corr-matched to the requester's actor. records
@@ -1497,14 +1652,43 @@ void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
                                 reason_text);
   }
   if (n == 0) {
+    if (cell_was_pending != 0) {
+      /* The OOM corner (the review's finding): the cell.result record
+         itself OOM'd AND there are no riders — without this branch the
+         pending slot would never clear and the case-3 log below would
+         misreport the corner as an already-complete cell. The interrupt's
+         contract never waits on an OOM: the slot STILL closes inline (no
+         durable result record exists — the missing one is the
+         resume-repair-visible gap the OOM log above already named) and the
+         poison stands, so no later cell can claim the wedged runtime. The
+         engine, if it is still live, keeps awaiting a corr whose next real
+         result drops quietly — the poisoned refusal and the deadline
+         bounds are the containment. */
+      log_error("frame: the interrupted cell at '%s' closes WITHOUT its "
+                "durable cell.result (out of memory) — the tail's missing "
+                "record is resume-repair-visible loud", f->sid_path);
+      f->cell_interrupted_corr = f->cell_pyrt_corr;
+      f->cell_pending = 0;
+      f->cell_status = 1;
+      f->pyrt_poisoned = 1;
+#ifdef SA_HAS_PYTHON
+      if (f->pyrt != NULL) pyrt_interrupt(f->pyrt);
+#endif
+      return;
+    }
     if (arm_cut != 0) {
       /* Case 3, true interrupt: the boundary cut, and nothing else. */
 #ifdef SA_HAS_PYTHON
       if (f->pyrt != NULL) pyrt_interrupt(f->pyrt);
 #endif
+      log_info("frame: the interrupt armed the boundary cut at '%s' "
+               "(nothing open was cut)",
+               (f->sid_path != NULL) ? f->sid_path : "?");
     } else {
-      /* A deadline firing at nothing-open: the cell completed before the
-         deadline's dispatch ran — a benign race, logged once. */
+      /* A deadline firing at nothing open: the cell completed before the
+         deadline's dispatch ran — a benign race, logged once. Truthful
+         wording only when NO cell was pending (the OOM corner above owns
+         the pending one). */
       log_info("frame: the cell deadline fired at an already-complete cell "
                "at '%s' — no-op", f->sid_path);
     }
@@ -2224,6 +2408,11 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         break;
       }
       f->cell_pending = 1;
+      _frame_cell_watchdog_arm(f);   /* POOLED only: the deadline watches
+                                        this one cell (spec §2); the arm's
+                                        pool check makes pool-less shapes
+                                        free, and the SYNCHRONOUS refusal
+                                        paths above never reach it */
 #else
       log_error("frame: FRM_CELL_EXECUTE at '%s' but this build has no python "
                 "runtime — answering as a failed cell (corr %llu)",
@@ -2246,6 +2435,13 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         log_error("frame: PYRT_RESULT with no payload at '%s'", f->sid_path);
         break;
       }
+      /* The disarm FIRST (surface-completion spec §2): the real result's
+         arrival ends the armed watchdog's reason to exist for BOTH the
+         matched and the quiet-drop (poisoned frame's late) outcomes — the
+         struct's f->cell_watchdog is NULLed here, so a later
+         FRM_CELL_WATCHDOG message can never double-apply. The frame's
+         dispatch thread is the disarm's single writer. */
+      _frame_cell_watchdog_disarm(f);
       if (f->cell_pending && r->corr != 0 && r->corr == f->cell_pyrt_corr) {
         json_value_t* result_payload = json_new_object();
         if (result_payload == NULL) {
@@ -2484,6 +2680,27 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          unconditional. */
       _frame_interrupt_apply(f, 1, "aborted: interrupted at the frame's request");
       break;
+    case FRM_CELL_WATCHDOG: {
+      /* The deadline won (surface-completion spec §2): the payload OWNS the
+         watchdog struct — it is no longer f->cell_watchdog (the
+         disarm-or-handoff protocol settled it; the handoff's post ran
+         UNDER the watchdog lock, and the lock/unlock handshake below
+         guarantees the watcher has unlocked before the mutex here dies).
+         Clean the pointer, free the struct, then run the synthesis under
+         the watchdog wording. arm_cut = 0: a deadline never arms a cut
+         against a FUTURE legitimate cell. If the cell completed between
+         the deadline and this dispatch (the result won the race), the
+         apply is a benign no-op — cell_pending is the frame's truth. */
+      frame_cell_watchdog_t* w = (frame_cell_watchdog_t*)msg->payload;
+      msg->payload = NULL;
+      if (f->cell_watchdog == w) f->cell_watchdog = NULL;
+      platform_mutex_lock(w->lock);
+      platform_mutex_unlock(w->lock);
+      _frame_cell_watchdog_payload_destroy(w);
+      _frame_interrupt_apply(f, 0,
+                             "aborted: cell exceeded the watchdog deadline");
+      break;
+    }
     default:
       break;
   }
@@ -3028,6 +3245,7 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
   if (cfg != NULL) {
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
     f->model_timeout_ms = cfg->model_timeout_ms;
+    f->cell_watchdog_ms = cfg->cell_watchdog_ms;
     f->pool = cfg->pool;        /* BORROWED, exactly like `backend` */
     if (cfg->model_base_url != NULL) {
       f->model_base_url = strdup(cfg->model_base_url);
@@ -3046,6 +3264,8 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
        pool (a tree always sits on ONE pool). */
     f->max_depth = parent->max_depth;
     f->model_timeout_ms = parent->model_timeout_ms;
+    f->cell_watchdog_ms = parent->cell_watchdog_ms;   /* a pooled tree's
+        children run their cells under the same one-cell bound */
     f->pool = parent->pool;
     if (parent->model_base_url != NULL) {
       f->model_base_url = strdup(parent->model_base_url);
@@ -3060,7 +3280,11 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
       if (f->model_name == NULL) goto fail;
     }
   } else {
+    /* The cfg-less, parent-less create (frame_spawn's inherit path passes
+       cfg NULL AND a parent; this branch is the plain cfg-less top frame):
+       the budget table's default governs the pooled cell bound. */
     f->max_depth = 4;
+    f->cell_watchdog_ms = SA_FRAME_CELL_WATCHDOG_MS;
   }
 
   if (goal != NULL) {
@@ -3396,6 +3620,7 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
   if (cfg != NULL) {
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
     f->model_timeout_ms = cfg->model_timeout_ms;
+    f->cell_watchdog_ms = cfg->cell_watchdog_ms;
     f->pool = cfg->pool;        /* BORROWED, exactly like the model strings */
     if (cfg->model_base_url != NULL) {
       f->model_base_url = strdup(cfg->model_base_url);
@@ -3681,6 +3906,14 @@ void frame_destroy(frame_t* f) {
               "ignored (the deferred teardown's owner runs it)");
     return;
   }
+  /* The POOLED cell watchdog disarms/joins FIRST (spec §2): before the
+     pyrt destroy's own join and before the mailbox teardown, so a not-yet-
+     handed-off watcher provably exits (joined, struct freed) and an
+     already-handed-off one has ALREADY delivered its message (the handoff
+     posts under the watchdog lock before any handed_off read) — the
+     delivering message rides the drain below, its destroyer the struct's
+     single cleaner. */
+  _frame_cell_watchdog_disarm(f);
   uint32_t expect = 0;
   if (atomic_compare_exchange_strong(&f->engine.pending_submits, &expect,
                                      SA_ENGINE_SUBMIT_CLAIM)) {

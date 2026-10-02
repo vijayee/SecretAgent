@@ -1671,6 +1671,20 @@ int frame_run_loop(frame_t* f) {
            tail itself. */
         _frame_interrupt_apply(f, 0,
                                "aborted: cell exceeded the watchdog deadline");
+        if (e->engine_live == 0) {
+          /* The synthesis POSTED (and ended) the engine: the close's facts
+             are compose-time — the terminate already ran inside the apply,
+             and re-entering it here would log the loud already-ended no-op
+             on EVERY routine cell deadline. Only the cell-timeout control
+             wording remains (the same event the _loop_fail path wrote —
+             turn_open is 0, so _loop_fail's rider branch was a no-op and
+             this is its exact event set, minus the noise). */
+          _loop_control(f, "cell-timeout", NULL);
+          break;
+        }
+        /* The batch was REFUSED pre-post: the engine is STILL live with an
+           open tail — _loop_fail's rider path closes it itself (the
+           standing discipline). */
         _loop_fail(f, e, "cell-timeout", NULL);
         break;
       }
