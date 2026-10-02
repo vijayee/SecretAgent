@@ -1502,4 +1502,325 @@ TEST(TestLoop, TestTurnNumbersRestoreFromTheLog) {
   std::filesystem::remove_all(dir);
 }
 
+/* --- the resume repair (the plan's Task-3 step 1; spec §4 + §7 [13/14]) ---
+   Python-independent: the restarted engine's scripted turns are content-only
+   (no cell ever EXECUTES — the cell only appears as a SEEDED audit record the
+   crash "cut" after). Scratch-disk idiom: fresh mkdtemp dirs created and
+   destroyed by the test, never sa-demo-db. */
+
+/* The cell.run seed record — the frozen event-record shape with the audit's
+   payload {code, corr} (make_record_json covers the envelope's payloads only;
+   the fold pairs cell.run/cell.result by the payload's corr). */
+static std::string make_cell_run_record(long long seq,
+                                        const std::string& sid_path,
+                                        const std::string& code,
+                                        long long corr) {
+  json_value_t* rec = json_new_object();
+  json_object_set(rec, "seq", json_new_int(seq));
+  json_object_set(rec, "type", json_new_string("cell.run"));
+  json_object_set(rec, "frame", json_new_string(sid_path.c_str()));
+  json_object_set(rec, "corr", json_new_null());
+  json_object_set(rec, "at", json_new_string("2026-10-01T00:00:00Z"));
+  json_object_set(rec, "cause", json_new_int(seq - 1));
+  json_value_t* payload = json_new_object();
+  json_object_set(payload, "code", json_new_string(code.c_str()));
+  json_object_set(payload, "corr", json_new_int(corr));
+  json_object_set(rec, "payload", payload);
+  char* text = json_serialize(rec);
+  EXPECT_NE(text, nullptr);
+  json_value_destroy(rec);
+  std::string out((text != nullptr) ? text : "");
+  free(text);
+  return out;
+}
+
+/* A reloaded record's byte echo (the seed texts and the echoes are all
+   json_serialize outputs, so equality here is BYTE-identical, whitespace
+   included — the append-only pin's shape). */
+static std::string echo_record(json_value_t* rec) {
+  char* raw = json_serialize(rec);
+  std::string out((raw != nullptr) ? raw : "");
+  free(raw);
+  return out;
+}
+
+/* The reloaded record at an exact log seq (NULL when absent). */
+static json_value_t* record_at_seq(json_value_t* events, long long seq) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (rec_seq(rec) == seq) return rec;
+  }
+  return nullptr;
+}
+
+/* The pinned started-shape brief for a cell audited at `seq` (spec §2's
+   wording verbatim — mirrors test_lifecycle.cpp's lc_started_text). */
+static std::string loop_started_brief(long long seq, const std::string& code) {
+  std::string out =
+      "The previous turn was interrupted before its result was recorded.\n";
+  out += "The cell was executing (harness-log seq " + std::to_string(seq) +
+         "):\n";
+  out += code + "\n";
+  out +=
+      "Its outcome is unknown. Decide whether to retry from the cell's "
+      "semantics: retry only if the operation is read-only or idempotent; "
+      "if it may have side effects, first verify external state or ask the "
+      "user. Do not retry blindly.";
+  return out;
+}
+
+/* The pinned not-started brief (no code quote — the shape's whole point). */
+static const char* kLoopNotStartedBrief =
+    "The previous turn was interrupted before the cell started. No cell "
+    "execution was recorded. Retry it if it is still needed.";
+
+/* The serialized user-role message the derive's repair branch must produce
+   (the model-visible pin: the brief rides the derived request VERBATIM, as a
+   user message, before anything else of the turn). */
+static std::string user_msg_json(const std::string& content) {
+  json_value_t* m = json_new_object();
+  json_object_set(m, "role", json_new_string("user"));
+  json_object_set(m, "content", json_new_string(content.c_str()));
+  char* raw = json_serialize(m);
+  json_value_destroy(m);
+  std::string out((raw != nullptr) ? raw : "");
+  free(raw);
+  return out;
+}
+
+TEST(TestLoop, TestRestartRepairsTheCutAfterTheCellAudit) {
+  /* The crashed-tail restart, cut AFTER the cell audit (the plan's Task-3
+     step 1a; spec §4 + §7 [13]): the committed cell.run with NO cell.result
+     repairs BEFORE any engine runs — ONE atomic closer batch [repair
+     (quoting the cell's seq + code), step.end, turn.end {reason
+     interrupted}] — and the next derive carries the brief VERBATIM as a
+     user message; the originals are byte-identical after (append-only) and
+     the repaired tail is balanced.
+
+     SUBSTRATE NOTE (the recorded WaveDB defect, same class as the sibling
+     restart tests): a boot-restored session's OWN writes are invisible to
+     THAT session's scans (durable — the next fresh session materializes
+     them). The closer batch commits in the reopened session, so the batch's
+     AFTERMATH is verified in the FRESH session: the closers sitting at seqs
+     4..6 ahead of any engine record, and the fresh engine's derive (a
+     restored session reads every pre-boot record) carrying the brief.
+     VALGRIND EXCLUSION (the sibling convention recorded on
+     TestRestartReplayRestoresSeqAndContext): scratch-disk tests spin under
+     valgrind's emulation here — the leak proof for this class is the ASan
+     suite (this test runs there unexcluded). */
+
+  frame_config_t cfg = test_config();
+  std::string dir = temp_dir_mkdtemp_sa();
+  ASSERT_FALSE(dir.empty());
+  std::string loc = dir + "/db";
+
+  /* The cut: turn 1 opened, its step started, the cell audited at seq 3 —
+     no result, no step.end, no turn.end (the tail a crash leaves). */
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "cut after the audit", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  const std::string cell_code = "print('interrupted mid-flight')";
+  std::string seed[3];
+  /* The seed ops ride the HEAP — the sync batch TRANSFERS the array's
+     ownership and frees it on every path (the composer-never-frees rule). */
+  frm_store_op_t* seed_ops =
+      (frm_store_op_t*)get_clear_memory(3 * sizeof(frm_store_op_t));
+  static const char* seed_types[3] = {"turn.start", "step.start", "cell.run"};
+  for (size_t i = 0; i < 3; i++) {
+    long long seq = (long long)i + 1;
+    seed[i] = (i == 2)
+                  ? make_cell_run_record(seq, sid, cell_code, 77)
+                  : make_record_json(seq, sid, seed_types[i], 1,
+                                     (i == 1) ? 1 : -1, NULL);
+    char key[96];
+    snprintf(key, sizeof(key), "%s/events/%020lld", sid.c_str(), seq);
+    seed_ops[i].key = strdup(key);
+    seed_ops[i].value = (uint8_t*)strdup(seed[i].c_str());
+    seed_ops[i].value_len = seed[i].size();
+  }
+  ASSERT_EQ(_frame_sync_batch(f, seed_ops, 3, "cut-tail seed"), 0);
+  frame_destroy(f);   /* the crash — no engine ran after the audit */
+  wave_db_close(db);
+
+  /* The reopened session: frame_resume RETURNS only after the closer
+     batch's commit is confirmed (the sync family awaits the store's batch
+     answer) — the repair runs before any engine exists on this handle. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* resumed = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr) << "the cut tail repairs at resume";
+  frame_destroy(resumed);   /* no engine started: the closers only */
+  wave_db_close(db);
+
+  /* The fresh session: the repaired tail is durable, the engine's first
+     derive reads it whole (pre-boot records are visible in a restored
+     session — see the substrate note). */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* check = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(check, nullptr);
+  json_value_t* events = load_events(check);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(json_size(events), 6u)
+      << "the cut tail plus ONE closer batch, committed BEFORE the engine "
+         "(nothing else wrote between them)";
+
+  /* The originals are byte-identical after (append-only — the closer batch
+     never mutated a record). */
+  for (long long seq = 1; seq <= 3; seq++) {
+    json_value_t* rec = record_at_seq(events, seq);
+    ASSERT_NE(rec, nullptr) << "seed record " << seq;
+    EXPECT_EQ(echo_record(rec), seed[seq - 1])
+        << "seed record " << seq << " mutated";
+  }
+
+  /* The closers in the pinned order, contiguous seqs 4..6: repair (turn 1,
+     the STARTED brief quoting the cell's seq 3 + its code verbatim),
+     step.end {turn 1, step 1}, turn.end {turn 1, interrupted}. */
+  json_value_t* rep = record_at_seq(events, 4);
+  json_value_t* se = record_at_seq(events, 5);
+  json_value_t* te = record_at_seq(events, 6);
+  ASSERT_NE(rep, nullptr);
+  ASSERT_NE(se, nullptr);
+  ASSERT_NE(te, nullptr);
+  EXPECT_TRUE(event_is(rep, "repair"));
+  EXPECT_TRUE(event_is(se, "step.end"));
+  EXPECT_TRUE(event_is(te, "turn.end"));
+  json_value_t* rp = payload_of(rep);
+  ASSERT_NE(rp, nullptr);
+  EXPECT_EQ((long long)json_as_int(json_get(rp, "turn")), 1);
+  ASSERT_NE(json_get(rp, "text"), nullptr);
+  EXPECT_STREQ(json_as_string(json_get(rp, "text")),
+               loop_started_brief(3, cell_code).c_str())
+      << "the brief quotes the interrupted cell's seq + code (details "
+         "upfront)";
+  EXPECT_EQ(json_as_int(json_get(payload_of(se), "step")), 1);
+  EXPECT_EQ((long long)json_as_int(json_get(payload_of(se), "turn")), 1);
+  EXPECT_EQ(turn_end_kind(te), "interrupted")
+      << "balance restored: the log's newest lifecycle record is a turn.end";
+  EXPECT_EQ((long long)json_as_int(json_get(payload_of(te), "turn")), 1);
+
+  /* The next derive carries the brief VERBATIM as a user message. */
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"repaired"}}]})json");
+  frame_set_model_backend(check, &rm.base);
+  EXPECT_EQ(frame_run_loop(check), 0);
+  ASSERT_EQ(rm.captured.size(), 1u);
+  EXPECT_NE(rm.captured[0].find(user_msg_json(loop_started_brief(3, cell_code))),
+            std::string::npos)
+      << "the repair brief reaches the model VERBATIM as a user message";
+
+  /* Still append-only after the engine's own run: the originals unchanged,
+     the repair brief exactly once (the engine's turn-2 envelope never
+     re-briefed). */
+  json_value_destroy(events);
+  events = load_events(check);
+  ASSERT_NE(events, nullptr);
+  for (long long seq = 1; seq <= 3; seq++) {
+    json_value_t* rec = record_at_seq(events, seq);
+    ASSERT_NE(rec, nullptr) << "seed record " << seq;
+    EXPECT_EQ(echo_record(rec), seed[seq - 1])
+        << "seed record " << seq << " mutated by the run";
+  }
+  EXPECT_EQ(count_type(events, "repair"), 1u);
+  EXPECT_EQ(frame_is_done(check), 1);
+
+  json_value_destroy(events);
+  frame_destroy(check);
+  wave_db_close(db);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(TestLoop, TestRestartRepairsTheCutBeforeTheCellAudit) {
+  /* The crashed-tail restart, cut BEFORE any cell audit (the plan's Task-3
+     step 1b; repair.spec's not-started wording): turn.start committed, NO
+     step/cell records — the closers are [repair (the NOT-STARTED brief, no
+     code quote), turn.end {reason interrupted}] and NO step.end exists (no
+     open step; DSH's order holds). The disk/substrate discipline is the
+     sibling's (see TestRestartRepairsTheCutAfterTheCellAudit): asserts ride
+     the fresh session; VALGRIND EXCLUSION there applies to this test too. */
+
+  frame_config_t cfg = test_config();
+  std::string dir = temp_dir_mkdtemp_sa();
+  ASSERT_FALSE(dir.empty());
+  std::string loc = dir + "/db";
+
+  /* The cut: ONLY the turn's opener committed — the crash fell between the
+     model's turn decision and the cell audit. */
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "cut before the cell", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  std::string seed = make_record_json(1, sid, "turn.start", 1, -1, NULL);
+  /* The seed op rides the HEAP — the sync batch transfers the array's
+     ownership (see the sibling restart test's seed shape). */
+  frm_store_op_t* seed_ops =
+      (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  char seed_key[96];
+  snprintf(seed_key, sizeof(seed_key), "%s/events/%020lld", sid.c_str(),
+           (long long)1);
+  seed_ops[0].key = strdup(seed_key);
+  seed_ops[0].value = (uint8_t*)strdup(seed.c_str());
+  seed_ops[0].value_len = seed.size();
+  ASSERT_EQ(_frame_sync_batch(f, seed_ops, 1, "cut-tail seed"), 0);
+  frame_destroy(f);
+  wave_db_close(db);
+
+  /* The reopened session: the repair commits before the engine exists. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* resumed = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr) << "the not-started cut repairs at resume";
+  frame_destroy(resumed);
+  wave_db_close(db);
+
+  /* The fresh session: [turn.start, repair {turn 1, the NOT-STARTED brief},
+     turn.end {turn 1, interrupted}] — no step.end anywhere. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* check = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(check, nullptr);
+  json_value_t* events = load_events(check);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(json_size(events), 3u)
+      << "the opener + ONE closer batch: repair, turn.end — no step.end";
+
+  json_value_t* rec1 = record_at_seq(events, 1);
+  ASSERT_NE(rec1, nullptr);
+  EXPECT_EQ(echo_record(rec1), seed) << "the original record is untouched";
+
+  json_value_t* rep = record_at_seq(events, 2);
+  json_value_t* te = record_at_seq(events, 3);
+  ASSERT_NE(rep, nullptr);
+  ASSERT_NE(te, nullptr);
+  EXPECT_TRUE(event_is(rep, "repair"));
+  json_value_t* rp = payload_of(rep);
+  ASSERT_NE(rp, nullptr);
+  EXPECT_EQ((long long)json_as_int(json_get(rp, "turn")), 1);
+  ASSERT_NE(json_get(rp, "text"), nullptr);
+  EXPECT_STREQ(json_as_string(json_get(rp, "text")), kLoopNotStartedBrief)
+      << "the not-started shape: no code quote, the pinned wording";
+  EXPECT_EQ(json_get(rp, "code"), nullptr)
+      << "the not-started brief carries no code quote";
+  EXPECT_TRUE(event_is(te, "turn.end"));
+  EXPECT_EQ(turn_end_kind(te), "interrupted");
+  EXPECT_EQ((long long)json_as_int(json_get(payload_of(te), "turn")), 1);
+
+  /* The step.close never fired: no open step existed — the closers' order
+     (repair, turn.end) is the whole batch. */
+  EXPECT_EQ(count_type(events, "step.end"), 0u);
+  EXPECT_EQ(count_type(events, "step.start"), 0u);
+  EXPECT_EQ(count_type(events, "repair"), 1u) << "no second brief";
+
+  json_value_destroy(events);
+  frame_destroy(check);
+  wave_db_close(db);
+  std::filesystem::remove_all(dir);
+}
+
 #endif /* SA_HAS_WDB */

@@ -453,10 +453,31 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
       snprintf(line, line_len + 1, "cell result (status %s): %s", status_buf, tt);
       free(tt);
       _loop_result_push(result_ring, &nresults, line);
+    } else if (strcmp(type_name, LIFE_EVENT_REPAIR) == 0) {
+      /* The crash-repair brief (spec §4): REPAIR events render as a user-
+         role message, text verbatim — the model reads the full crash
+         briefing in its next derive with the details upfront. The payload's
+         text is capped at source (the derive's msg cap). */
+      json_value_t* text_v = json_get(payload, "text");
+      if (text_v != NULL) {
+        const char* text = json_as_string(text_v);
+        char* tt = _loop_trunc((text != NULL) ? text : "", SA_LOOP_MSG_CAP);
+        json_value_t* m = json_new_object();
+        json_object_set(m, "role", json_new_string("user"));
+        json_object_set(m, "content", json_new_string(tt));
+        free(tt);
+        json_array_append(out, m);
+      }
+      /* A repair record with no text folds as nothing (malformed — the
+         render-not-crash rule; the record's loud line already happened at
+         fold time via the events parse). */
     }
     /* cell.run skipped (code is not re-quoted — see the header's
        construction note); state.remember / frame.report went into pass A;
-       spawn/join/control records carry no model context. */
+       spawn/join/control records carry no model context. turn.start /
+       turn.end / step.start / step.end are log spine only (the envelope
+       folds away; the `repair` brief is the ONE model-visible lifecycle
+       type and rendered above). */
   }
   _loop_flush_results(out, result_ring, &nresults);
 

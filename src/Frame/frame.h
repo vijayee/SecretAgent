@@ -72,8 +72,12 @@ frame_t* frame_create(wave_database_root_t* db, frame_t* parent,
    restart path): opens the subtree at `sid` (the full path, e.g.
    "sessions/<hex>"), refuses loudly WITHOUT writes when the birth record
    (meta/created) is missing, restores the seq counter past every persisted
-   event, and reads meta/depth + meta/parent back into the frame. It writes
-   NOTHING (no meta, no events — restart changes no durable state) and does
+   event, and reads meta/depth + meta/parent back into the frame. The ONE
+   durable write a resume may make is the CRASH-REPAIR PASS on a NOT-done
+   frame (the turn-lifecycle slice): an open tail is closed by ONE atomic
+   batch of synthesized lifecycle closer records (turn-lifecycle spec §4) —
+   balanced/pre-lifecycle tails compose nothing and stay untouched, and a
+   DONE subtree skips the pass entirely (the read-only handle shape). It does
    NOT start the turn loop (loop.h's frame_run_loop does).
    `cfg` is the post-restart model config (copied in; NULL = none carried).
    The goal is not separately persisted and comes back NULL; the lineage

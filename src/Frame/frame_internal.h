@@ -486,6 +486,29 @@ int _frame_report_bind_post(frame_t* child, uint64_t bridge_corr,
    best-effort, the resume still happens. */
 void _frame_join_post(frame_t* parent, const char* child_sid);
 
+/* --- the resume repair (spec §4) ------------------------------------------ */
+
+/* The crash-repair pass frame_resume runs before the engine starts, on the
+   caller's thread (the sync family's discipline): fold the tail scan's
+   events into a lifecycle cursor (SA_LIFECYCLE_TAIL_EVENTS window),
+   compose the closers when the tail is UNBALANCED (the newest lifecycle
+   record is not a turn.end), and commit ONE atomic batch of the closer
+   records as event puts on the frame's events keys (the seq pre-allocation
+   + rollback discipline; the seq counter advances by the closers' count).
+   Empty closers = no-op. Refused scan/batch/deadline = resume fails loud
+   (the sync family's documented consequences; resume refuses rather than
+   half-repairs; `_frame_seq_rollback` releases the pre-allocated seqs on
+   the compose-refusal path). Returns 0 (repaired or already balanced), -1
+   loud otherwise.
+
+   Scope note (frame_resume's caller): a DONE subtree skips the pass
+   entirely — every status=done write rode its terminal turn's close batch
+   (the balance rule already holds), and the done handle's documented
+   read-only shape keeps its sync round trips off. The pass therefore runs
+   only on a NOT-done frame, i.e. only on the subtrees a crash could leave
+   open. */
+int _frame_resume_repair(frame_t* f);
+
 /* The meta/status=done put, FIRE-AND-POST (the top engine's end-rule fix-up:
    a finish batch composed while live children were pending carries no status
    put — the CHILDREN yield's frame stays "running" — so an engine ending

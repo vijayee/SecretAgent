@@ -2974,6 +2974,179 @@ frame_t* frame_create(wave_database_root_t* root, frame_t* parent,
   return f;
 }
 
+/* --- the resume repair (spec §4; frame_internal.h's contract) --------------
+   The crash's open tail is repaired ON THE CALLER'S THREAD before any engine
+   can start: one tail scan (the sync family) -> the cursor fold -> the
+   closer compose (pure) -> ONE awaited atomic batch committing the closer
+   records as event puts on the frame's zero-padded events keys. The balance
+   rule is the whole crash check: a repaired tail — or a never-truncated
+   one — folds nothing, and a second resume composes nothing. */
+
+/* The closer batch's compose + the ONE awaited post (the only commit path;
+   `_frame_resume_repair` calls it when the compose returned closers). The
+   records compose at the frame's OWN pre-allocated seqs — the seq counter
+   continues the events range's KEYS (the store's key truth), so a tail whose
+   newest record's payload skipped can never collide a stored record's key,
+   which a fold-seq-based key could. The ops transfer into the sync batch
+   (the composer-never-frees rule); the record compose consumed the closer
+   payloads, so the closers' destroyer only releases what the compose left. */
+static int _frame_resume_repair_commit(frame_t* f,
+                                       lifecycle_closers_t* closers) {
+  size_t n = closers->n;
+  if (n == 0) return 0;   /* balanced / empty tail — NOTHING to commit */
+
+  /* The seqs pre-allocate CONTIGUOUSLY in one stretch (single-flight — this
+     is the resume's caller thread and nothing else allocates between them);
+     the range rolls back in reverse on every pre-post refusal (the
+     `_frame_seq_rollback` single-flight discipline). */
+  uint64_t first = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint64_t s = _frame_seq_alloc(f);
+    if (i == 0) first = s;
+  }
+
+  /* The compose mirrors the event batch's stages: full event records (the
+     frozen shape — each record's seq matches its key), per-record and
+     total WAL cap checks loud, keys on the zero-padded events key shape. */
+  char** texts = (char**)get_clear_memory(n * sizeof(char*));
+  char** keys = (char**)get_clear_memory(n * sizeof(char*));
+  size_t total = 0;
+  int rc = 0;
+  for (size_t i = 0; i < n; i++) {
+    /* _frame_event_json CONSUMES the payload (on failure too). */
+    texts[i] = _frame_event_json(f, first + i, closers->items[i].type,
+                                 closers->items[i].payload);
+    closers->items[i].payload = NULL;
+    if (texts[i] == NULL) {
+      rc = -1;
+      break;
+    }
+  }
+  if (rc == 0) {
+    for (size_t j = 0; j < n; j++) {
+      if (strlen(texts[j]) > SA_FRAME_MAX_BATCH_BYTES) {
+        log_error("frame: the resume repair's closer record %zu is %zu "
+                  "bytes, exceeding the %d-byte WAL batch cap — refusing, "
+                  "never truncating", j, strlen(texts[j]),
+                  (int)SA_FRAME_MAX_BATCH_BYTES);
+        rc = -3;
+        break;
+      }
+      total += strlen(texts[j]);
+      keys[j] = _frame_event_key(f->sid_path, first + j);
+      if (keys[j] == NULL) {
+        rc = -1;
+        break;
+      }
+      total += strlen(keys[j]);
+    }
+    if (rc == 0 && total > SA_FRAME_MAX_BATCH_BYTES) {
+      log_error("frame: the resume repair's closer batch at '%s' is %zu "
+                "bytes, exceeding the %d-byte WAL batch cap — refusing, "
+                "never truncating", f->sid_path, total,
+                (int)SA_FRAME_MAX_BATCH_BYTES);
+      rc = -3;
+    }
+  }
+  if (rc != 0) {
+    for (size_t j = 0; j < n; j++) {
+      free(texts[j]);
+      free(keys[j]);
+    }
+    free(texts);
+    free(keys);
+    for (size_t i = n; i > 0; i--) _frame_seq_rollback(f, first + i - 1);
+    lifecycle_closers_destroy(closers);   /* the compose's leftovers */
+    return rc;
+  }
+
+  frm_store_op_t* ops =
+      (frm_store_op_t*)get_clear_memory(n * sizeof(frm_store_op_t));
+  for (size_t j = 0; j < n; j++) {
+    ops[j].key = keys[j];              /* OWNED: the store round trip frees */
+    ops[j].value = (uint8_t*)texts[j]; /* OWNED */
+    ops[j].value_len = strlen(texts[j]);
+  }
+  free(texts);   /* the arrays only — the strings moved into the ops */
+  free(keys);
+  lifecycle_closers_destroy(closers);   /* the payloads were consumed
+                                           (NULLed); the items array dies */
+  int rc2 = _frame_sync_batch(f, ops, n, "resume repair");
+  if (rc2 != 0) {
+    /* The store's refusal or the deadline — nothing composed here frees
+       (the ops transferred at the post; the sync family owns their teardown
+       on every path). A deadline's late commit still leaves a BALANCED
+       tail: the NEXT resume folds nothing — the balance rule is the whole
+       guarantee. Resume refuses rather than half-repairs. */
+    log_error("frame: the resume repair's closer batch at '%s' did not "
+              "commit (rc %d) — resume refuses loud", f->sid_path, rc2);
+    return -1;
+  }
+  return 0;
+}
+
+int _frame_resume_repair(frame_t* f) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: resume repair on a dead frame");
+    return -1;
+  }
+  /* The sync family's inline-only pre-post refusals, checked BEFORE any seq
+     is pre-allocated (resume refuses rather than half-repairs). */
+  if (_frame_sync_store_refused(f, "resume repair")) return -1;
+  if (_frame_nested_sync(f)) {
+    log_error("frame: the resume repair at '%s' refuses loud — a caller "
+              "inside the frame's own dispatch cannot await the closer "
+              "batch's commit", f->sid_path);
+    return -1;
+  }
+
+  /* 1. THE TAIL SCAN (spec §4.1): ONE sync scan over the frame's events
+        range (the ABSOLUTE root-level composed bounds — the events-range
+        scan discipline), the newest SA_LIFECYCLE_TAIL_EVENTS window. This
+        is the closer path's ONLY scan — the reply rides back as one joint
+        JSON-ARRAY text, exactly what the fold consumes. */
+  char* lo = _frame_subkey(f->sid_path, "events");
+  char* hi = _frame_subkey(f->sid_path, "events0");
+  if (lo == NULL || hi == NULL) {
+    free(lo);
+    free(hi);
+    return -1;
+  }
+  char* tail = NULL;
+  int rc = _frame_sync_scan(f, lo, hi, SA_LIFECYCLE_TAIL_EVENTS, &tail);
+  free(lo);
+  free(hi);
+  if (rc != 0) {
+    log_error("frame: the resume repair's tail scan at '%s' was refused "
+              "(%d) — resume refuses rather than half-repairs", f->sid_path,
+              rc);
+    return -1;
+  }
+
+  /* 2. THE CURSOR FOLD (pure): the tail's state-of-the-world — an EMPTY, a
+        pre-lifecycle, or a balanced tail folds turn_open == 0. */
+  lifecycle_cursor_t cursor;
+  rc = lifecycle_cursor_fold(tail, &cursor);
+  free(tail);
+  if (rc != 0) {
+    log_error("frame: the resume repair's fold at '%s' refused loud — the "
+              "tail is not a parseable event-record array", f->sid_path);
+    return -1;
+  }
+  /* 3. THE CLOSERS (pure): a balanced tail composes nothing — the resume
+        proceeds exactly as it did before the slice existed. */
+  lifecycle_closers_t closers;
+  memset(&closers, 0, sizeof(closers));
+  rc = lifecycle_closers_compose(&cursor, &closers);
+  lifecycle_cursor_destroy(&cursor);
+  if (rc != 0) {
+    log_error("frame: the resume repair's closer compose at '%s' refused "
+              "loud", f->sid_path);
+    return -1;
+  }
+  return _frame_resume_repair_commit(f, &closers);
+}
+
 /* Boot-time restore (frame.h contract): open the existing subtree, refuse
    without ANY write when the birth record is missing, restore seq via the
    same reverse scan frame_create boots with, read depth + parent path back.
@@ -3085,6 +3258,33 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
   ATOMIC_STORE(&f->engine.pending_submits, 0);
   ATOMIC_STORE(&f->engine.die_requested, 0);
   ATOMIC_STORE(&f->engine.submit_inflight, 0);
+
+  /* The crash-repair pass (spec §4): a NOT-DONE resumed frame's tail may be
+     truncated by the crash that killed the previous process — the repair
+     folds the tail and, when it is UNBALANCED, commits ONE atomic closer
+     batch on this caller thread (the SYNC family awaits the store's batch
+     answer), so frame_resume returns only past a closed tail and no engine
+     can ever start on an open one. A DONE subtree skips the pass entirely:
+     every status=done write rode its terminal turn's close batch (the
+     balance rule already holds — the log's newest lifecycle record is a
+     turn.end), and the done handle's documented read-only shape keeps its
+     sync round trips off (frame_start refuses done frames — no engine ever
+     runs on this handle). A refusal makes the whole resume fail loud
+     (frame_destroy; the caller retries when the store can answer) — resume
+     refuses rather than half-repairs. */
+  char* resume_status = _frame_subtree_text(f->st, "meta/status");
+  uint8_t done = (resume_status != NULL &&
+                  strcmp(resume_status, SA_FRAME_STATUS_DONE) == 0);
+  free(resume_status);
+  if (!done) {
+    if (_frame_resume_repair(f) != 0) {
+      log_error("frame_resume: the crash-repair pass at '%s' was refused — "
+                "the frame is not resumable in this state (refusing loud "
+                "rather than half-repairing)", f->sid_path);
+      frame_destroy(f);
+      return NULL;
+    }
+  }
   return f;
 
 fail:

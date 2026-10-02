@@ -973,6 +973,219 @@ TEST(TestFrame, TestReportBindIsOneCrossSubtreeBatch) {
   wave_db_close(db);
 }
 
+/* --- the resume repair (the plan's Task-3 step 1; spec §4's idempotency,
+       pre-lifecycle, and pooled-refusal pins) --------------------------------
+
+   The seed machinery hand-composes event records in the FROZEN shape
+   ({"seq","type","frame","corr","at","cause","payload"}) and commits them at
+   the frame's own zero-padded events keys through the sync family — the
+   same shape the engine's writes ride. Scratch-disk idiom: fresh mkdtemp
+   dirs created and destroyed by the test, never sa-demo-db; write-after-
+   write assertions ride the NEXT session (the recorded WaveDB defect — a
+   boot-restored session's own writes are invisible to that session's scans,
+   durable and visible to the fresh one). */
+
+#include <cstdlib>
+#include <filesystem>
+#include <vector>
+
+/* One event record of the frozen shape; consumes `payload`. */
+static std::string fr_record_head(long long seq, const std::string& sid,
+                                  const char* type_name,
+                                  json_value_t* payload) {
+  json_value_t* rec = json_new_object();
+  EXPECT_NE(rec, nullptr);
+  json_object_set(rec, "seq", json_new_int(seq));
+  json_object_set(rec, "type", json_new_string(type_name));
+  json_object_set(rec, "frame", json_new_string(sid.c_str()));
+  json_object_set(rec, "corr", json_new_null());
+  json_object_set(rec, "at", json_new_string("2026-10-01T00:00:00Z"));
+  json_object_set(rec, "cause",
+                  (seq > 1) ? json_new_int(seq - 1) : json_new_null());
+  json_object_set(rec, "payload", payload);
+  char* text = json_serialize(rec);
+  json_value_destroy(rec);
+  std::string out((text != nullptr) ? text : "");
+  free(text);
+  return out;
+}
+
+/* The seed records the tests below use (the pre-lifecycle log's vocabulary:
+   msg.append + the cell.run/cell.result pair — NO lifecycle types at all). */
+static std::string fr_msg_record(long long seq, const std::string& sid,
+                                 const char* role, const char* content) {
+  json_value_t* payload = json_new_object();
+  json_object_set(payload, "role", json_new_string(role));
+  json_object_set(payload, "content", json_new_string(content));
+  return fr_record_head(seq, sid, "msg.append", payload);
+}
+
+static std::string fr_cell_run_record(long long seq, const std::string& sid,
+                                      const char* code, long long corr) {
+  json_value_t* payload = json_new_object();
+  json_object_set(payload, "code", json_new_string(code));
+  json_object_set(payload, "corr", json_new_int(corr));
+  return fr_record_head(seq, sid, "cell.run", payload);
+}
+
+static std::string fr_cell_result_record(long long seq, const std::string& sid,
+                                         long long corr) {
+  json_value_t* payload = json_new_object();
+  json_object_set(payload, "corr", json_new_int(corr));
+  json_object_set(payload, "status", json_new_int(0));
+  json_object_set(payload, "text", json_new_string("ok"));
+  return fr_record_head(seq, sid, "cell.result", payload);
+}
+
+static std::string fr_turn_start_record(long long seq, const std::string& sid,
+                                        long long turn) {
+  json_value_t* payload = json_new_object();
+  json_object_set(payload, "turn", json_new_int(turn));
+  return fr_record_head(seq, sid, "turn.start", payload);
+}
+
+/* Seed the records at the frame's own events keys (seqs 1..n, the ZERO-
+   PADDED key shape the engine's writes use) as ONE atomic batch. */
+static int fr_seed(frame_t* f, const std::string& sid,
+                   const std::vector<std::string>& records) {
+  frm_store_op_t* ops =
+      (frm_store_op_t*)get_clear_memory(records.size() * sizeof(frm_store_op_t));
+  for (size_t i = 0; i < records.size(); i++) {
+    char key[96];
+    snprintf(key, sizeof(key), "%s/events/%020llu", sid.c_str(),
+             (unsigned long long)i + 1);
+    ops[i].key = strdup(key);
+    ops[i].value = (uint8_t*)strdup(records[i].c_str());
+    ops[i].value_len = records[i].size();
+  }
+  return _frame_sync_batch(f, ops, records.size(), "resume-repair seed");
+}
+
+/* A reloaded record's byte echo (the seeds and echoes are all
+   json_serialize outputs — equality here is byte-identical). */
+static std::string fr_echo(json_value_t* rec) {
+  char* raw = json_serialize(rec);
+  std::string out((raw != nullptr) ? raw : "");
+  free(raw);
+  return out;
+}
+
+/* The reloaded record at an exact log seq (NULL when absent). */
+static json_value_t* fr_at_seq(json_value_t* events, long long seq) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    json_value_t* v = json_get(rec, "seq");
+    if (v != NULL && (long long)json_as_int(v) == seq) return rec;
+  }
+  return nullptr;
+}
+
+static size_t fr_count_type(json_value_t* events, const char* type_name) {
+  size_t n = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), type_name)) n++;
+  }
+  return n;
+}
+
+TEST(TestFrame, TestPreLifecycleLogResumesUntouched) {
+  /* The pre-lifecycle log (the plan's Task-3 step 1): records with NO
+     lifecycle types at all (msg.append + the cell.run/cell.result pair) —
+     the envelope's absence is NOT a truncation: the balance rule composes
+     NOTHING at resume, the resume proceeds untouched, and the log is
+     byte-identical after. Scratch-disk idiom; the write-read assertions ride
+     the NEXT session (the recorded WaveDB same-session write-invisibility —
+     see the block comment above). VALGRIND EXCLUSION (the sibling
+     convention test_loop.cpp records for its scratch-disk restart tests):
+     spinning under valgrind's emulation here — the ASan suite runs this
+     test unexcluded. */
+  frame_config_t cfg = test_config();
+  char tmpl[] = "/tmp/sa-repair-XXXXXX";
+  char* got = mkdtemp(tmpl);
+  ASSERT_NE(got, nullptr);
+  std::string dir(got);
+  std::string loc = dir + "/db";
+
+  /* Session 1: the pre-lifecycle log, seeded at the events keys. */
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "pre-lifecycle era", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  std::vector<std::string> seed;
+  seed.push_back(fr_msg_record(1, sid, "user", "pre-lifecycle era"));
+  seed.push_back(fr_cell_run_record(2, sid, "pass()", 9));
+  seed.push_back(fr_cell_result_record(3, sid, 9));
+  ASSERT_EQ(fr_seed(f, sid, seed), 0);
+  frame_destroy(f);   /* not done, no lifecycle records — a LEGAL old shape */
+  wave_db_close(db);
+
+  /* Session 2: the resume composes NOTHING (balanced) — no refuse, no
+     hang; the frame stays exactly as it was. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* resumed = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr)
+      << "a pre-lifecycle log resumes untouched (balanced)";
+  frame_destroy(resumed);
+  wave_db_close(db);
+
+  /* Session 3: byte-identical, no lifecycle types anywhere. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* handle = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(handle, nullptr);
+  json_value_t* events = load_events(handle);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(json_size(events), 3u) << "nothing composed, nothing appended";
+  for (size_t i = 0; i < 3; i++) {
+    json_value_t* rec = fr_at_seq(events, (long long)i + 1);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(fr_echo(rec), seed[i]) << "seed record " << i + 1 << " mutated";
+  }
+  EXPECT_EQ(fr_count_type(events, "repair"), 0u);
+  EXPECT_EQ(fr_count_type(events, "turn.start"), 0u);
+  EXPECT_EQ(fr_count_type(events, "turn.end"), 0u);
+  EXPECT_EQ(fr_count_type(events, "step.start"), 0u);
+  EXPECT_EQ(fr_count_type(events, "step.end"), 0u);
+  json_value_destroy(events);
+  frame_destroy(handle);
+  wave_db_close(db);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(TestFrame, TestResumeRepairRefusesOnPooledStore) {
+  /* The pooled-store refusal (spec §4.5): the repair is a SYNC-FAMILY flow —
+     the caller's thread must pump its awaited commit — so the NOT-done
+     resume's repair on a POOLED store refuses LOUD before anything is
+     pre-allocated or posted: resume refuses rather than half-repairs, and
+     NEVER hangs (no post, no pump on a store whose pacing belongs to its
+     scheduler workers). */
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_config_t pooled = test_config();
+  pooled.pool = pool;
+  frame_t* f = frame_create(db, NULL, NULL, &pooled);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  frame_destroy(f);   /* not done — no engine ever ran on it */
+
+  EXPECT_EQ(frame_resume(db, sid.c_str(), &pooled), nullptr)
+      << "the not-done frame's repair refuses loud on a POOLED store — "
+         "no hang, no half-repair";
+
+  scheduler_pool_stop(pool);       /* documented order: stop, close, destroy */
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
+}
+
 /* --- Task 5: the orchestration slice (spawn = admit + start; the parent
    yields at FRAME_PHASE_CHILDREN and resumes on child reports) -------------
 
@@ -1612,6 +1825,122 @@ TEST(TestFrame, TestChildrenYieldTurnEndRidesTheFinishBatch) {
   frame_destroy(parent);   /* the CHILD's record dies with the parent's
                               teardown list (the engine-less caller's shape) */
   wave_db_close(db);
+}
+
+TEST(TestFrame, TestSecondResumeComposesNothing) {
+  /* Idempotency (the plan's Task-3 step 1; spec §4.6): the balance rule is
+     the whole guarantee — the resume repair's compose is empty whenever the
+     tail is balanced, whatever the frame's pause semantics.
+     (a) On disk: a repaired tail re-resumes into NOTHING — the second
+         resume's closer-compose is empty, and the next fresh session proves
+         no second batch ever landed (no second repair brief). The scratch-
+         disk idiom + the next-session read discipline (the recorded WaveDB
+         defect: a restored session's own writes are invisible to that
+         session's scans).
+     (b) In-memory: the ENGINE-PAUSED shape — a children-yield frame (its
+         yield batch ended the turn completed; the engine parked at
+         FRAME_PHASE_CHILDREN with live children) re-resumed fresh composes
+         nothing: the CHILDREN phase is engine scheduling, not turn
+         lifecycle.
+     VALGRIND EXCLUSION (the sibling convention test_loop.cpp records for
+     its scratch-disk restart tests): this test spins under valgrind's
+     emulation here — the ASan suite runs it unexcluded. */
+
+  /* --- (a) the repaired tail's second resume ------------------------------ */
+  frame_config_t cfg = test_config();
+  char tmpl1[] = "/tmp/sa-repair-XXXXXX";
+  char* got1 = mkdtemp(tmpl1);
+  ASSERT_NE(got1, nullptr);
+  std::string dir1(got1);
+  std::string loc = dir1 + "/db";
+
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "repair idempotency", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  std::vector<std::string> seed;
+  seed.push_back(fr_turn_start_record(1, sid, 1));
+  ASSERT_EQ(fr_seed(f, sid, seed), 0);
+  frame_destroy(f);   /* the crash-cut frame, closed durable */
+  wave_db_close(db);
+
+  /* The first resume repairs: [repair (not-started brief), turn.end]. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* first = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(first, nullptr);
+  frame_destroy(first);
+  wave_db_close(db);
+
+  /* THE SECOND resume over the repaired tail: balanced — composes nothing,
+     succeeds (no refuse, no hang). */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* second = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(second, nullptr)
+      << "a repaired tail is balanced; the second resume is a no-op";
+  frame_destroy(second);
+  wave_db_close(db);
+
+  /* The fresh session: exactly ONE closer batch exists — no second repair
+     brief, no second turn.end. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* handle = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(handle, nullptr);
+  json_value_t* events = load_events(handle);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(json_size(events), 3u)
+      << "opener + ONE closer batch [repair, turn.end] — nothing else";
+  EXPECT_EQ(fr_count_type(events, "repair"), 1u)
+      << "no second repair brief composed";
+  EXPECT_EQ(fr_count_type(events, "turn.end"), 1u);
+  json_value_destroy(events);
+  frame_destroy(handle);
+  wave_db_close(db);
+  std::filesystem::remove_all(dir1);
+
+  /* --- (b) the ENGINE-PAUSED (children-yield) shape ----------------------- */
+  py_agent_init();
+  wave_database_root_t* idb = wave_db_open(NULL);
+  ASSERT_NE(idb, nullptr);
+  frame_t* parent = frame_create(idb, NULL, "yielded repair probe", &cfg);
+  ASSERT_NE(parent, nullptr);
+  goal_keyed_model_t gk = {};   /* zero-init: the vtable's members set below */
+  gk.base.complete = goal_keyed_complete;
+  gk.queues["yielded repair probe"].push_back(canned_cell_body(
+      "import actor\nactor.spawn('probe leaf', None)\nprint('spawned')"));
+  gk.queues["yielded repair probe"].push_back(
+      canned_content_body("parent waits on the leaf"));
+  gk.queues["probe leaf"].push_back(canned_content_body("leaf done quietly"));
+  frame_set_model_backend(parent, &gk.base);
+
+  EXPECT_EQ(frame_run_loop(parent), 2) << "yielded awaiting children";
+
+  /* The yielded frame's tail is BALANCED (the yield's turn ended completed)
+     — capture the log's record count before the second handle resumes. */
+  json_value_t* before = load_events(parent);
+  ASSERT_NE(before, nullptr);
+  size_t count_before = json_size(before);
+  json_value_destroy(before);
+
+  /* The fresh handle on the SAME session (in-memory: every write visible —
+     the shape where a repaired log's briefs actually reach derives today):
+     the repair scans the tail, folds the CLOSED turn, composes nothing. */
+  frame_t* fresh = frame_resume(idb, frame_sid(parent), &cfg);
+  ASSERT_NE(fresh, nullptr)
+      << "the child-pending frame's tail is balanced — resume composes nothing";
+  json_value_t* after = load_events(fresh);
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(json_size(after), count_before)
+      << "the paused engine's balanced tail composed NOTHING at resume";
+  EXPECT_EQ(fr_count_type(after, "repair"), 0u);
+  json_value_destroy(after);
+  frame_destroy(fresh);
+
+  frame_destroy(parent);   /* the live spawn's teardown (loud, expected) */
+  wave_db_close(idb);
 }
 
 #endif /* python gate */
