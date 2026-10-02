@@ -181,8 +181,9 @@ typedef struct frame_sync_slot_t {
    orchestration slice made cell-verb spawns OVERLAPPABLE — a pooled parent's
    cell can start the next actor.spawn while a previous one's store reply is
    still routing (the py-agent's bounded bridge wait can also give up on a
-   busy mailbox: the post is still DELIVERED — actor_send's was_empty return
-   is not a delivery/refusal answer), so one slot would strand the older
+   busy mailbox: the post is still DELIVERED into a busy mailbox (actor_send
+   answers delivered-vs-refused, busy included — false is the only refusal),
+   so one slot would strand the older
    admission's child. Every admission carries its own entry; every store
    reply corr-matches ITS entry. The list is the parent's dispatch-thread
    single-writer. */
@@ -693,8 +694,9 @@ static int _frame_bridge_pending_take(frame_t* f, uint64_t corr,
 /* A post that hands ownership to the actor system (frame_internal.h's
    contract — the store behaviors, the frame behaviors, AND the turn engine's
    handlers all post through it): the DESTROY/dropped-send case is checked
-   from the target's flag (actor_send's return value means "was busy", not
-   "refused" — a queued message at a busy mailbox is still delivered).
+   from the target's flag (actor_send answers delivered-vs-refused, busy
+   included — a queued message at a busy mailbox is still delivered; false is
+   the only refusal).
    Refusals log loud. */
 void _frame_post(actor_t* target, uint32_t type, void* payload,
                  void (*destroy)(void*), const char* what) {
@@ -874,9 +876,9 @@ static void _frame_cell_watchdog_arm(frame_t* f) {
    below KEYS_MAX + 1 a fully-materialized clamped scan can no longer prove
    truncation by count alone, so the marker then depends on the window —
    never silently widened here. */
-#define _FRAME_KEYS_SCAN_CAP                                              \
-  ((SA_BUDGET_KEYS_MAX + 1 > SA_FRAME_DEBUG_MAX_EVENTS)                   \
-       ? (size_t)SA_FRAME_DEBUG_MAX_EVENTS                                \
+#define SA_FRAME_KEYS_SCAN_CAP                                                \
+  ((SA_BUDGET_KEYS_MAX + 1 > SA_FRAME_DEBUG_MAX_EVENTS)                       \
+       ? (size_t)SA_FRAME_DEBUG_MAX_EVENTS                                    \
        : (size_t)(SA_BUDGET_KEYS_MAX + 1))
 
 static void _store_reply_send(actor_t* reply_to, uint64_t corr, int rc,
@@ -1465,13 +1467,13 @@ static void _store_behavior(void* state, message_t* msg) {
                         "scan reply");
               rc = -1;
             } else {
-              /* The scan honors the clamped cap (_FRAME_KEYS_SCAN_CAP,
+              /* The scan honors the clamped cap (SA_FRAME_KEYS_SCAN_CAP,
                  compile-time: KEYS_MAX + 1 clamped to the shared events
                  window — see the macro's honest-clamp note). */
-              char* names[_FRAME_KEYS_SCAN_CAP];   /* scan order (descending) */
+              char* names[SA_FRAME_KEYS_SCAN_CAP];   /* scan order (descending) */
               n = 0;
               int oom = 0;
-              while (n < _FRAME_KEYS_SCAN_CAP) {
+              while (n < SA_FRAME_KEYS_SCAN_CAP) {
                 path_t* k = NULL;
                 identifier_t* v = NULL;
                 int src = database_scan_prev(iter, &k, &v);
@@ -1529,10 +1531,9 @@ static void _store_behavior(void* state, message_t* msg) {
       }
       _store_reply_send(kp->reply_to, kp->corr, rc, records,
                         records != NULL ? n : 0);
-      if (rc != 0 && records != NULL) {
-        for (size_t i = 0; i < n; i++) free(records[i]);
-        free(records);
-      }
+      /* The records' ownership left with the reply (or died inside the
+         fire-and-post send): every rc != 0 path here refuses with
+         records == NULL, so nothing is cleaned after the send. */
       frm_store_keys_payload_destroy(kp);
       break;
     }
@@ -2792,18 +2793,31 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         log_error("frame: PYRT_EMIT with no payload at '%s'", f->sid_path);
         break;
       }
+      /* The text value is composed FIRST and refused pre-post when it fails:
+         a json_object_set on a NULL value silently drops the key and the
+         record would ship hollow ({}) — an empty durable emit, no loud
+         trace. (A NULL t->text still composes the JSON null — a null emit is
+         a shape, not a failure.) */
+      json_value_t* text_value =
+          (t->text != NULL) ? json_new_string(t->text) : json_new_null();
+      if (text_value == NULL) {
+        log_error("frame: out of memory building the emit payload's text at "
+                  "'%s' — the emit record is refused pre-post", f->sid_path);
+        pyrt_text_payload_destroy(t);
+        break;
+      }
       json_value_t* payload = json_new_object();
       if (payload == NULL) {
-        log_error("frame: out of memory building the emit payload at '%s'",
-                  f->sid_path);
-      } else {
-        json_object_set(payload, "text",
-                        (t->text != NULL) ? json_new_string(t->text)
-                                          : json_new_null());
-        if (_frame_event_post_fire(f, "emit", payload) != 0) {
-          log_error("frame: the emit record was refused pre-post at '%s' "
-                    "(already logged)", f->sid_path);
-        }
+        json_value_destroy(text_value);
+        log_error("frame: out of memory building the emit payload at '%s' — "
+                  "the emit record is refused pre-post", f->sid_path);
+        pyrt_text_payload_destroy(t);
+        break;
+      }
+      json_object_set(payload, "text", text_value);
+      if (_frame_event_post_fire(f, "emit", payload) != 0) {
+        log_error("frame: the emit record was refused pre-post at '%s' "
+                  "(already logged)", f->sid_path);
       }
       pyrt_text_payload_destroy(t);
       break;

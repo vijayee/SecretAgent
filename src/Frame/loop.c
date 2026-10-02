@@ -461,18 +461,26 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
          next derive. Emits ride the same ring as cell results (only the
          block since the newest msg.append is projected). */
       json_value_t* text_v = json_get(payload, "text");
-      if (text_v != NULL) {
-        const char* text = json_as_string(text_v);
-        char* tt = _loop_trunc((text != NULL) ? text : "", SA_BUDGET_LOOP_EMIT);
+      const char* text = (text_v != NULL) ? json_as_string(text_v) : NULL;
+      /* Only non-empty text renders a line — {"text": null} and "" render
+         NOTHING (json_as_string on null is ""; guarding here keeps the
+         branch's claim honest: no text renders nothing).
+         The line cap is SA_BUDGET_LOOP_EMIT (300): a source-capped emit's
+         marker ("\n[budget: truncated at N bytes]") sits PAST this cut's
+         300-byte window and is not carried into the projection — accepted,
+         the same accepted pattern as cell results' 32 KiB vs 4000. */
+      if (text != NULL && text[0] != '\0') {
+        char* tt = _loop_trunc(text, SA_BUDGET_LOOP_EMIT);
         size_t line_len = strlen("emit: ") + strlen(tt);
         char* line = get_memory(line_len + 1);
         snprintf(line, line_len + 1, "emit: %s", tt);
         free(tt);
         _loop_result_push(result_ring, &nresults, line);
       }
-      /* An emit record with no text renders nothing (the render-not-crash
-         rule — the writer's compose always carries text; a corrupt stored
-         record is the fold's loud skip, not a crash here). */
+      /* An emit record without renderable text (no key, null, or empty)
+         renders nothing (the render-not-crash rule — the writer's compose
+         always carries text; a corrupt stored record is the fold's loud
+         skip, not a crash here). */
     } else if (strcmp(type_name, LIFE_EVENT_REPAIR) == 0) {
       /* The crash-repair brief (spec §4): REPAIR events render as a user-
          role message, text verbatim — the model reads the full crash
@@ -754,9 +762,10 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
 }
 
 /* Repost the turn continuation (engine -> itself; never a wait). The
-   refusal is the DESTROY flag only — actor_send's return value means
-   "the mailbox was busy" (was_empty), NOT "refused": a continuation pushed
-   into a non-empty mailbox is still delivered. */
+   refusal here is the DESTROY flag only — actor_send answers
+   delivered-vs-refused (busy included: a continuation pushed into a
+   non-empty mailbox is still delivered; false is the only refusal, never
+   re-judged from the return below). */
 static int _loop_post_turn(frame_t* f) {
   actor_t* actor = _frame_actor(f);
   if (actor == NULL || (atomic_load(&actor->flags) & ACTOR_FLAG_DESTROY)) {

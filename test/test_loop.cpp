@@ -592,6 +592,101 @@ TEST(TestLoop, TestKeysListsOwnStateKeysOnly) {
   wave_db_close(db);
 }
 
+/* The over-cap keys listing (the budget table's KEYS_MAX at the store
+   boundary): more than SA_BUDGET_KEYS_MAX names in the frame's own subtree —
+   the listing clips at 256 with the "[budget: keys truncated]" marker record
+   APPENDED (the reply is still one quoted array: 257 elements render —
+   256 names + the marker).
+
+   Shape note (same as TestKeysListsOwnStateKeysOnly): a report ends the top
+   frame's loop, so the listing turn's result is carried by a second turn
+   that reports. */
+TEST(TestLoop, TestKeysListingTruncationCarriesTheMarker) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "keys truncation", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* Seed 260 local keys: k000..k259 — lexicographic, sort-proven, seeded
+     BEFORE the scripted turn. The store's scan window is
+     SA_BUDGET_KEYS_MAX + 1 = 257, so the reply carries the lexicographically
+     HIGHEST 257 (k003..k259); the reply router sorts ascending and keeps the
+     first 256 (k003..k258): 'k000' sits below the scan window's cut and
+     'k259' is what the clip drops — the over-cap count is what rides the
+     truncation tell. */
+  char key[8];
+  for (int i = 0; i < 260; i++) {
+    snprintf(key, sizeof(key), "k%03d", i);
+    ASSERT_EQ(frame_remember_local(f, key, "\"0\""), 0);
+  }
+
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nls = 'local: ' + str(actor.keys('local'))\"}"}}]}}]})json";
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"actor.report(ls)\"}"}}]}}]})json";
+  std::vector<std::string> replies = {turn1, turn2};
+
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+
+  frame_set_model_backend(f, &sm.base);
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(replies.size(), 0u);
+
+  /* THE pin: the report's text carries the clipped listing — the first two
+     sorted names, the marker as the LAST array element, and exactly 257
+     array elements (256 names + the marker = 256 "', '" separators). */
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(count_type(events, "frame.report"), 1u);
+  json_value_t* report_rec = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "frame.report")) {
+      report_rec = json_at(events, i);
+      break;
+    }
+  }
+  ASSERT_NE(report_rec, nullptr);
+  json_value_t* report_payload = payload_of(report_rec);
+  ASSERT_NE(report_payload, nullptr);
+  json_value_t* report_text = json_get(report_payload, "text");
+  ASSERT_NE(report_text, nullptr);
+  std::string text(json_as_string(report_text));
+  size_t ls_at = text.find("local: [");
+  ASSERT_NE(ls_at, std::string::npos) << "report text: " << text;
+  /* The reported string IS the listing (turn 2 reports `ls` alone), so the
+     suffix from "local: [" is the whole rendered array — no mid-text "]" cut
+     (the marker itself carries one). */
+  std::string listing = text.substr(ls_at);
+  EXPECT_NE(listing.find("['k003', 'k004'"), std::string::npos)
+      << "report text: " << text;
+  EXPECT_NE(listing.find("'[budget: keys truncated]']"),
+            std::string::npos)
+      << "the marker is the listing's last element; report text: " << text;
+  size_t separators = 0;
+  for (size_t p = listing.find("', '"); p != std::string::npos;
+       p = listing.find("', '", p + 1)) {
+    separators++;
+  }
+  EXPECT_EQ(separators, 256u)
+      << "the listing renders 257 elements (256 names + the marker)";
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestLoop, TestTurnLimitFailsLoud) {
   py_agent_init();
   frame_config_t cfg = test_config();

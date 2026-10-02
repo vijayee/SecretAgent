@@ -31,6 +31,22 @@ TEST(TestBudget, TestExactBoundaryIsClean) {
   free(out);
 }
 
+TEST(TestBudget, TestCapPlusOneAddsTheMarker) {
+  std::string s(6, 'a');
+  s += "b";   /* 7 bytes, cap 6 = exactly under-the-wire cut */
+  char* out = NULL;
+  uint8_t truncated = 0;
+  budget_truncate_with_marker(s.c_str(), 6, &out, &truncated);
+  ASSERT_NE(out, nullptr);
+  EXPECT_EQ(truncated, 1);
+  EXPECT_NE(strstr(out, "[budget: truncated at 7 bytes]"), nullptr);
+  /* The head is still a valid prefix (starts 'aaaaaa', marker appended in
+     place of nothing — UTF-8 safe trivially here). */
+  EXPECT_EQ(out[0], 'a');
+  EXPECT_EQ(out[5], 'a');
+  free(out);
+}
+
 TEST(TestBudget, TestTruncationAppendsTheMarker) {
   std::string big(100, 'x');
   char* out = NULL;

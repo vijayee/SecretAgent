@@ -35,7 +35,9 @@
 
 /* Truncate a text to cap bytes, appending the one marker shape
    ("\n[budget: truncated at <original-length> bytes]") when a cut happened.
-   The OUTPUT is min(strlen(text), cap) bytes of text + the marker, so the
+   The OUTPUT is at most cap bytes of text (the cut backs over any UTF-8
+   sequence straddling the boundary, so on such a cut the head may fall a few
+   bytes short of cap) + the marker, so the
    total never exceeds cap + strlen(marker) and the marker names the ORIGINAL
    length. Clean copy (no marker) when strlen(text) <= cap; *out_truncated
    is nonzero only on a real cut.
