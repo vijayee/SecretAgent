@@ -1410,7 +1410,11 @@ static void _store_behavior(void* state, message_t* msg) {
     case FRM_STORE_KEYS: {
       /* The keys verb's bounded scan (spec §3), run INSIDE this dispatch =
          one serialized read (the frame's behavior stays lock-free). The
-         reverse range read over the frame's OWN state/<scope> subtree —
+         FORWARD range walk over the frame's OWN state/<scope> subtree.
+         The listing is lexicographic first-N (spec §3): the FORWARD walk is
+         the first-N in one bounded pass — no sort needed in the router for
+         the un-clipped case (FRM_STORE_SCAN keeps its reverse walk: it
+         exists for newest-events-first).
          ABSOLUTE composed bounds (WaveDB's subtree bounded scans are broken
          in both directions: the root-level discipline, unchanged) —
          materializes the scanned keys' NAME tail segments as the reply's
@@ -1461,23 +1465,31 @@ static void _store_behavior(void* state, message_t* msg) {
             rc = -1;
           } else {
             database_iterator_t* iter =
-                database_scan_start_reverse(root->db, start, end);
+                database_scan_start(root->db, start, end);
             if (iter == NULL) {
-              log_error("store: keys reverse scan failed — refusing the "
-                        "scan reply");
+              log_error("store: keys scan failed — refusing the scan reply");
               rc = -1;
             } else {
               /* The scan honors the clamped cap (SA_FRAME_KEYS_SCAN_CAP,
                  compile-time: KEYS_MAX + 1 clamped to the shared events
                  window — see the macro's honest-clamp note). */
-              char* names[SA_FRAME_KEYS_SCAN_CAP];   /* scan order (descending) */
+              char* names[SA_FRAME_KEYS_SCAN_CAP];   /* scan order (ascending) */
               n = 0;
               int oom = 0;
               while (n < SA_FRAME_KEYS_SCAN_CAP) {
                 path_t* k = NULL;
                 identifier_t* v = NULL;
-                int src = database_scan_prev(iter, &k, &v);
-                if (src != 0) break;             /* -1: out of records */
+                int src = database_scan_next(iter, &k, &v);
+                if (src != 0) {
+                  /* -1: out of records; -2: the walk errored mid-pass —
+                     the reply carries what was gathered, loud (the scan
+                     case's error shape). */
+                  if (src < -1) {
+                    log_error("store: keys scan failed mid-pass (%d) — the "
+                              "reply carries the %zu names it got", src, n);
+                  }
+                  break;
+                }
                 if (k != NULL && path_length(k) >= 1) {
                   /* The KEY NAME tail segment (the values are never read):
                      the _frame_restore_seq extraction idiom, unchanged. */
@@ -2250,12 +2262,13 @@ static int _frame_keys_cmp(const void* a, const void* b) {
   return strcmp(*sa, *sb);
 }
 
-/* The keys verb's reply text: sort ALL the scanned names ascending (the
-   records are the store reply payload's — reordered IN PLACE, never freed
-   here), keep the lexicographic FIRST SA_BUDGET_KEYS_MAX, and — ONLY when
-   the scan carried more than the cap — close with the marker. An empty scan
-   composes "[]". Returns a heap text the caller frees, or NULL loud on an
-   OOM refusal. */
+/* The keys verb's reply text: the store's forward walk already emits the
+   names ascending, so the records arrive sorted — the qsort stays as the
+   router's own defense (the records are reordered IN PLACE, never freed
+   here). The clip + marker are the contract: keep the lexicographic FIRST
+   SA_BUDGET_KEYS_MAX, and — ONLY when the scan carried more than the cap —
+   close with the marker. An empty scan composes "[]". Returns a heap text
+   the caller frees, or NULL loud on an OOM refusal. */
 static char* _frame_keys_reply_text(char** records, size_t n) {
   size_t listed = (n > SA_BUDGET_KEYS_MAX) ? SA_BUDGET_KEYS_MAX : n;
   if (records != NULL && n > 0) {

@@ -611,10 +611,10 @@ TEST(TestLoop, TestKeysListingTruncationCarriesTheMarker) {
 
   /* Seed 260 local keys: k000..k259 — lexicographic, sort-proven, seeded
      BEFORE the scripted turn. The store's scan window is
-     SA_BUDGET_KEYS_MAX + 1 = 257, so the reply carries the lexicographically
-     HIGHEST 257 (k003..k259); the reply router sorts ascending and keeps the
-     first 256 (k003..k258): 'k000' sits below the scan window's cut and
-     'k259' is what the clip drops — the over-cap count is what rides the
+     SA_BUDGET_KEYS_MAX + 1 = 257, and the FORWARD walk is the true
+     lexicographic first-N (spec §3): the reply carries the LOWEST 257
+     (k000..k256); the reply router keeps the first 256 (k000..k255) and
+     'k256' is what the clip drops — the over-cap count is what rides the
      truncation tell. */
   char key[8];
   for (int i = 0; i < 260; i++) {
@@ -669,7 +669,7 @@ TEST(TestLoop, TestKeysListingTruncationCarriesTheMarker) {
      suffix from "local: [" is the whole rendered array — no mid-text "]" cut
      (the marker itself carries one). */
   std::string listing = text.substr(ls_at);
-  EXPECT_NE(listing.find("['k003', 'k004'"), std::string::npos)
+  EXPECT_NE(listing.find("['k000', 'k001'"), std::string::npos)
       << "report text: " << text;
   EXPECT_NE(listing.find("'[budget: keys truncated]']"),
             std::string::npos)
