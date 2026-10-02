@@ -102,10 +102,14 @@ store/model/actor code. Caps under the `SA_` ifndef discipline (`-D` overridable
   malformed lifecycle record (a second `turn.start` over an open turn, corrupt payloads)
   is logged loud and skipped — the refine fold's render-not-crash rule.
 - **`lifecycle_closers(tail, cause)`** — pure, deterministic: returns the synthetic
-  closer events to append after the tail, in seq order, empty for a balanced/empty tail:
-  1. `step.end` for the open step (if any) — closes BEFORE the turn (DSH's order).
-  2. `turn.end {reason: "interrupted"}` — always when the turn is open.
-  3. `repair {turn, text}` — the model-visible brief (§4's wording).
+  closer events to append after the tail, in seq order, empty for a balanced/empty tail
+  (the plan pinned the ORDER as repair-first — an open turn ALWAYS briefs, both shapes —
+  which also keeps §4's idempotency rule trivially true: `turn.end` stays the tail's
+  newest lifecycle record after the closer batch; DSH's step-before-turn order holds
+  between the two closers):
+  1. `repair {turn, text}` — the model-visible brief (§4's wording).
+  2. `step.end` for the open step (if any) — closes BEFORE the turn (DSH's order).
+  3. `turn.end {reason: "interrupted"}` — always when the turn is open.
   Seqs continue the log contiguously (`last.seq + 1`, each closer + 1); no timestamps are
   invented — our records carry seqs, not times, so "reuse the last real event's time" has
   no analogue (the refine fold's discipline applies instead: the record lines render from
@@ -175,9 +179,9 @@ On the caller's thread, after the seq restore, before the engine starts:
    exactly as today. Open turn → compose the closers (§2's order, one cell in flight
    today).
 3. **ONE atomic closer batch** through the sync family (`_frame_sync_batch`):
-   `step.end` + `turn.end {reason:"interrupted"}` + `repair {turn, text}` (+ the resume's
-   own `meta/status` put when the resumed configuration starts the engine — same batch,
-   one round trip). Cap-checked before the post (loud).
+   `repair {turn, text}` + `step.end` (if open) + `turn.end {reason:"interrupted"}`
+   — ONLY the closer event puts (a crashed frame's status is already "running"; no
+   meta/status write rides this batch). Cap-checked before the post (loud).
 4. **Then the engine starts.** The next derive projects the `repair` brief as a user-role
    message — the model reads the full crash briefing in its very next context: what was
    cut, the interrupted cell's code and seq, the outcome-unknown fact, and the retry
@@ -218,8 +222,10 @@ On the caller's thread, after the seq restore, before the engine starts:
 changes are EXACTLY: `src/Frame/lifecycle.{h,c}` (new), `loop.c` (the turn-entry batch, the
 boundary riders in the batches named §3, the derive's one `repair` branch, the turn-number
 restore), `frame.c` (frame_resume's closer scan/batch), `frame_internal.h` (the
-declarations), and the tests. No locks anywhere (`src/Frame/`'s standing grep: model.c's
-recorded exceptions unchanged). NO TODO/FIXME/XXX/HACK anywhere. Reference dirs read-only.
+declarations), `frame.h` (frame_resume's doc line only — its old "writes NOTHING" claim
+became false the moment the repair moved into resume), and the tests. No locks anywhere
+(`src/Frame/`'s standing grep: model.c's recorded exceptions unchanged). NO
+TODO/FIXME/XXX/HACK anywhere. Reference dirs read-only.
 Conventional commits, no Co-Authored-By.
 
 ## 7. Test parity plan (`test/test_lifecycle.cpp` new; extends test_loop.cpp / test_frame.cpp)
