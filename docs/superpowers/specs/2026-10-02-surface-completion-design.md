@@ -69,7 +69,8 @@ and a comment saying WHY they are deliberately not store records (messages are v
 consumed on receipt). The derive does not render them — `log`/`status` stay narration.
 
 **The derive.** Emitted records render in the model projection as one bounded line group (the
-existing report-line group's shape): one line per emit, `"emit: <text>"`, newest-first, each
+existing report-line group's shape): one line per emit, `"emit: <text>"`, in event order (the
+projection's one ordering), each
 capped at `SA_BUDGET_LOOP_EMIT` (300, table §4). This makes the verb real in both directions: the
 model can emit durable output and will see it again in its own context.
 

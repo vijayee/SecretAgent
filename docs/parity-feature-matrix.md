@@ -44,11 +44,11 @@ docs/superpowers/specs/2026-09-29-cpython-as-actor-design.md.
 | 22 | **Lazy interpreter boot** (frames that never run code pay nothing) | DA msg 4208 + PA #294 lesson; CP §"Capacity" | **L** — `pyrt_boot` on first EXECUTE (`src/Python/pyrt.c`) | L1/L2 | `test/test_pyrt.cpp` lazy-boot test |
 | 23 | **Interpreter pool cap + queued-then-drained overflow** (K interpreters; boot would exceed → queue, never drop) | CP §"Capacity" 2; PA #294 (AR) | **L** — `test/test_pyrt_poolcap.cpp` | L1 | PA none; CP's own test spec |
 | 24 | **Idle eviction of interpreters (opt-in knob)** | CP §"Capacity" 3 | **P** (knob not built; documented opt-in) | L1 | new |
-| 25 | **Interrupt a running cell** | DA msgs 4208/4214; CP §"Interrupts" | **PARTIAL** — `pyrt_interrupt` exists and is tested; the *frame* exposes no interrupt entry (`tools/frame-demo/main.c:26-32`: frame owns pyrt privately); pooled engine has no cell watchdog (OR §6 escalated) | L2/L3 | `test/test_pyrt.cpp` interrupt | 
+| 25 | **Interrupt a running cell** | DA msgs 4208/4214; CP §"Interrupts" | **L** — `frame_interrupt` + the pooled cell watchdog (interrupt + poison: the corr-matched synthesis closes the cell, `pyrt_interrupt` arms the boundary cut, an open turn ends `aborted`, the runtime poisons — further cells refuse loud until teardown; cooperative-only limits documented, the subprocess SIGKILL seam a recorded candidate) | L2/L3 | `test/test_pyrt.cpp` interrupt + `test/test_loop.cpp` TestFrameInterrupt* / TestPooledWatchdog* |
 | 26 | **Dill snapshot of the namespace** | DA msg 4206 (axis 2 = PA's "weakness"); AR (PA reject-list) | **DEV** — "the live namespace is for *thinking*; WaveDB is for *remembering*" (DA msgs 4204-4206, 4222); no snapshot ever | L2 | n/a (deliberate) |
 | 27 | **Fingerprinted digest re-delivered on turn commit; parked-on-abort re-arm** | AR (PA `agent-session.ts:7155-7245`) | **P** (row 14's mechanism detail) | L5 | PA `refinement.test.ts` |
 | 28 | **Generation counters before touching restarted state** | AR (PA steal-list; `repl-manager.ts:226-227,341-420`) | **P** — corr matching covers the cell path only | L2 | new |
-| 29 | **One budget function per boundary** (per-frame, per-turn, aggregate caps; oversized source fails its own actor) | AR (PA steer-list "budget-everything"; `shared.ts:41-46,300`, `repl-manager.ts:73-86`) | **PARTIAL** — derive caps + `_HTTP_BODY_MAX`/`_HTTP_READ_MAX` (ST §"Failure semantics") + frame protocol; no single table per boundary | L4 | new |
+| 29 | **One budget function per boundary** (per-frame, per-turn, aggregate caps; oversized source fails its own actor) | AR (PA steer-list "budget-everything"; `shared.ts:41-46,300`, `repl-manager.ts:73-86`) | **L** — `src/Util/budget.{h,c}`: ONE table of named caps + the shared truncate-marker helper applied at every source boundary (cell result, emit, bridge values); loop.c's projection trio moved onto the table; transport stays cross-referenced | L4 | `test/test_budget.cpp` |
 | 30 | **Fail-loud refusal at every policy boundary** (unknown kwargs rejected; missing model fails) | AR (PA strengths; `agent-session.ts:12602-12645`) | **L** — spawn/bridge refuse paths write loud paired status-1 `cell.result` (OR §1 reply path) | L2 | `test/test_py_agent.cpp` refusal tests |
 | 31 | **Transition-record turn loop** (State + named transition reason; recovery paths assertable) | AR (CC steal-list #1; `query.ts:204-217,1099-1305`) | **L-equivalent** — frame phase machine + `control.*` events as the resume/audit record (OR §1; `7a3ab17`) | L3 | `test/test_loop.cpp` (engine transitions pinned) |
 | 32 | **Loop-exit by observed behavior, not provider status** | AR (CC steal-list #3; `query.ts:552-558`) | **L** — loop exit from whether tool calls arrived, not provider hints | L3 | FT test 3 |
@@ -70,6 +70,7 @@ docs/superpowers/specs/2026-09-29-cpython-as-actor-design.md.
 | 48 | **VectorDB / GraphQL / materialized views** | FT:48 ("deliberately NOT in this model") | **DEV** (n/a) | L0 | n/a |
 | 49 | **LLM-facing error protocol surface + provider-agnostic streaming client** | AR (onyx reject/steal list, "tool ABI" line) | **PARTIAL** — `model_backend_t` vtable = the completion/submit boundary (OR §3); no streaming deltas (row 10) | L4 | `test_model_decode.cpp` |
 | 50 | **Windows verification** (PCBuild cpython branch; IOCP backend compiles) | CP §"Cross-platform"; ST §"Evidence bar" 4 | **P** — no toolchain on this machine; tracked on Atlas nodes | all | n/a here |
+| 51 | **`inspect` pull-forward** (list the frame's own state keys — "find", not just "recall a value") | Section 2's YAGNI deferral resolved by slice 3's Q6 | **L (DEV)** — `agent.keys(scope)` only (own-subtree key names, closed scope set, first-N + marker); events-scan/child-listing/read(path) YAGNI-unchanged. Source: slice 3's Q6 resolution (this slice) | L2/L4 | `test/test_py_agent.cpp` + `test/test_loop.cpp` keys tests |
 
 ---
 
@@ -83,15 +84,18 @@ frame's own subtree, sharing ONLY via `report()` up and a parent's API projectio
 | Verb (design name) | Contract (msg 4202 / DA §7) | Landed shape | Asymmetries / missing |
 |---|---|---|---|
 | **read** | see anything in the subtree/filesystem/results | Merged into `recall` — "write=`remember`, read=`recall` cut as synonyms" (FT:19, Verbs row) | `recall` resolves only a *state key* up the lineage (`frame.h:123`; `_frame_store_recall` max_hops walk). It cannot read events, read a child's subtree, or read by path. No `read(path)` semantics — P |
-| **inspect** | structured query: scan, lineage, graph — "what's in my subtree, who are my children" | **Deliberately deferred (YAGNI)** (FT:19) | Only implicit exists: the derive's internal bounded scan (engine-side), never model-visible. Without inspect the agent can recall a value but not *find* — pull forward only if real sessions demand it (recorded YAGNI, not a bug) |
-| **write** | mutate state, emit output | Cut as a `remember` synonym (FT:19) + `emit` exists as the durable-payload candidate channel (`py_agent.c:546`, `pyrt_messages.h:18`) | **emit is not durable yet**: PYRT_EMIT reaches the frame mailbox and is currently dropped (no `case PYRT_EMIT` in `src/Frame/frame.c`; CP:63 reserved it for the "persistence slice wires it into WaveDB later"). The durable `write` verb's missing half = P |
-| **execute** | run code, close the loop, free by default | The pyrt cell: corr-matched EXECUTE→RESULT (`frame.c:1880`), lazy boot (row 22), pool cap (row 23), `agent.log/status` stream up, `traceback` on failure | (a) single cell per turn — one execute tool per model turn (FT Goal, loop.c); (b) no frame-level interrupt entry (row 25); (c) cells are sequential — matches DA msg 4206 axis 3; (d) no per-result output cap yet inside the tool path (row 29) |
+| **inspect** | structured query: scan, lineage, graph — "what's in my subtree, who are my children" | **Deliberately deferred (YAGNI)** (FT:19) — with ONE member pulled forward this slice: `agent.keys(scope)` (row 51, the keys half of "list what's in my subtree") | Only implicit exists: the derive's internal bounded scan (engine-side), never model-visible. The keys member landed (`agent.keys`, row 51 — list/keys is no longer "inspect's domain" alone); events scan, child listing, and `read(path)` stay YAGNI-deferred until real sessions demand them (recorded, not a bug) |
+| **write** | mutate state, emit output | Cut as a `remember` synonym (FT:19) + `emit` exists as the durable-payload channel (`py_agent.c:546`, `pyrt_messages.h:18`) — **now DURABLE**: PYRT_EMIT lands as a store-bound `emit` event in the frame's batch (the missing half is closed; `0387f01`), rendered back into the derive as bounded emit lines (source-capped, the budget table §row-29 marker) | The remaining P is none: write = `remember` (subtree mutation) + `emit` (durable output) both land. Emit's *result-ring projection* reuses the report-line group shape (spec §1); its derive ordering is the projection's one ordering |
+| **execute** | run code, close the loop, free by default | The pyrt cell: corr-matched EXECUTE→RESULT (`frame.c:1880`), lazy boot (row 22), pool cap (row 23), `agent.log/status` stream up, `traceback` on failure | (a) single cell per turn — one execute tool per model turn (FT Goal, loop.c); (b) interrupt IS landed: `frame_interrupt` + the pooled watchdog (row 25, `5d6aee1`..`14077b3` — cooperative-only, subprocess SIGKILL seam recorded); (c) cells are sequential — matches DA msg 4206 axis 3; (d) per-result output cap landed at source (row 29's budget table) |
 | **spawn** | fork a child frame; admission-only in PA | `frame_spawn(parent, goal, context_json)` (`frame.h:143`); cell-side `agent.spawn` (`py_agent.c:552`) → FRM_SPAWN: depth cap, one batch (spawn event + lineage triples + child subtree + meta), then **started** (DEV, row 18) | Spawn spec is `{goal, context}` only — no model/thinking override (PA `12630-12644`); child inherits pool/turn-cap/backend (`memory/project_secretagent.md` orchestration notes). Child-name reservation/uniqueness semantics: sid = generated (root rng + counter, `frame.c:379`), no user-chosen names to collide — OK |
 | **report** | return a value to the parent | `frame_report` / cell-side `agent.report` → ONE `frame.report` at child's pre-allocated seq + parent's bound event + child done, ONE batch, then FRM_CHILD_REPORT resumes the parent (OR §4) | Quiet completion is added (DEV beyond contract: a content-only child reports its content implicitly — OR escalation 1, owner-approved). Top-frame report binds to itself (no parent) — `_frame_report_top_post`, `frame.c:1430` |
-| **remember** | only write that survives the frame; own subtree | `frame_remember_local`/`frame_remember_ctx` (`frame.h:120-121`) + cell-side `agent.remember` which writes the **inheritable** ctx layer ("durable, shared-by-default", `frame.c:1754` comment) | Two notes: (1) cell-side remember is ctx/ — children *down* inherit its values via the recall walk; that is the "API over the parent's subtree" shape (DA msgs 4191-4196) and fixes #819 by scoping, but differs from msg 4202's "private only" reading — the ctx/local split is the settled compromise (FT data model). (2) No *list/keys* operation (inspect's domain). No session-scoping knob (`scope=local/global` from PA row 14) |
+| **remember** | only write that survives the frame; own subtree | `frame_remember_local`/`frame_remember_ctx` (`frame.h:120-121`) + cell-side `agent.remember` which writes the **inheritable** ctx layer ("durable, shared-by-default", `frame.c:1754` comment) | Two notes: (1) cell-side remember is ctx/ — children *down* inherit its values via the recall walk; that is the "API over the parent's subtree" shape (DA msgs 4191-4196) and fixes #819 by scoping, but differs from msg 4202's "private only" reading — the ctx/local split is the settled compromise (FT data model). (2) The *list/keys* operation landed as `agent.keys(scope)` (row 51 — only the frame's OWN subtree, no lineage scan); a session-scoping knob (`scope=local/global` from PA row 14) stays unbuilt |
 
-**Verdict:** the surface is 5 verbs + a 6th half-built (`emit`/`write` durability) + 1 deferred
-(`inspect`). All 153 tests pin what exists; nothing violates the no-third-path sharing rule.
+**Verdict:** the surface is 6 verbs whole — read/recall, write/remember+emit (durable, `0387f01`),
+execute (with `frame_interrupt` + the pooled watchdog, `5d6aee1`..`14077b3`), spawn, report,
+remember (and `inspect`'s keys member pulled forward as `agent.keys`, row 51) — plus one deferred
+half (`inspect`'s events scan / child listing / `read(path)`, YAGNI). All 242 tests pin what
+exists; nothing violates the no-third-path sharing rule.
 
 ---
 
@@ -231,7 +235,7 @@ project memory (msg 4148's second layer) is the ctx/ layer + L3 refine state, ne
    `state/local|ctx` + child listing, scan-based); one budget table per boundary (derive caps +
    tool-result cap + bridge payload cap) with fail-loud truncation-at-source.
    *Tests:* extend `test/test_py_agent.cpp` (emit durability), `test/test_pyrt.cpp` (interrupt at
-   frame level), new inspect/budget tests.
+   frame level), new inspect/budget tests. (LANDED — commits `f1c2f1f..1ed9933`)
 4. **Steering & multi-source input slice** (L3; PA's admission discipline, only when needed)
    steering writes between turns exist (`msg.append` between turns); formalize into the admission
    state machine ONLY if a second input source lands (desktop REST, heartbeats): legal-transition
@@ -258,11 +262,13 @@ what refine's "trajectory review" reads; 4 waits until a second input source exi
 2. **Refine scope root-vs-frame** and digest placement history-vs-re-anchor (Section 3 Q2/Q3) —
    both affect child visibility (#819) and the cache-stable prefix (row 36).
 3. **Rollback semantics**: recomposition vs inverse-edit batch (Section 3).
-4. **Pooled-engine cell watchdog** (OR escalation 3, still open): hangs silently until destroy;
-   decide accept vs pull interrupt forward into slice 3.
+4. **Pooled-engine cell watchdog** (OR escalation 3): **RESOLVED** — interrupt + poison (the
+   corr-matched synthesis lives in `_frame_interrupt_apply`, `src/Frame/frame.c`; commit chain
+   `5d6aee1`..`14077b3`; row 25 **L**). Cooperative-only limits documented; the subprocess SIGKILL
+   seam is a recorded candidate, not landed.
 5. **Spawn model-override**: accept inherit-only (subtree property, OR §2) or add spec override
    (PA `12630-12644`) — affects slice 3's surface.
-6. **`inspect` pull-forward** (Section 2): keep deferred until 1-3 create demand, or include list/
-   scan now while slice 3's budget table is being written?
+6. **`inspect` pull-forward** (Section 2): **RESOLVED** — `agent.keys(scope)` landed (`ae1ba56`,
+   `1ed9933`; row 51 **L (DEV)**); events-scan/child-listing/`read(path)` stay YAGNI-deferred.
 7. Durable **cancel fence / wake latching** — fold into slice 2's lifecycle or later with the
    desktop interrupt story?
