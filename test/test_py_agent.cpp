@@ -434,6 +434,37 @@ TEST(TestPyAgent, TestBridgeValuesCappedAtSource) {
   bridge_frame_free(self);
 }
 
+/* The durable verb's own cap (spec §4, SA_BUDGET_EMIT_BYTES): emit's text is
+   cut HERE, at the boundary — pyrt_post_text records the POST-cap shape, so
+   the durable payload carries cap bytes of the original text + the one
+   truncate-marker naming the ORIGINAL length (16384 + "\n" + the 35-byte
+   bracketed line). (A real cut also posts a log announcement; these tests
+   don't record PYRT_LOG.) */
+TEST(TestPyAgent, TestEmitCappedAtSource) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(0, NULL);
+  self->answer = 0;   /* no bridge verbs in this cell; keep the frame silent */
+
+  self->results.clear();
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(self, "import actor\nactor.emit('w' * 100000)");
+  bridge_frame_pump(self, 30000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  ASSERT_EQ(self->results[0]->status, 0);
+  /* The emit payload is capped: cap bytes of text + the marker naming the
+     ORIGINAL bytes. */
+  ASSERT_EQ(self->emits.size(), 1u);
+  const size_t cap = 16u * 1024u;
+  const size_t marker_len = strlen("[budget: truncated at 100000 bytes]");
+  EXPECT_EQ(self->emits[0].size(), cap + marker_len + 1u);
+  EXPECT_NE(self->emits[0].find("[budget: truncated at 100000 bytes]"),
+            std::string::npos);
+  EXPECT_EQ(self->emits[0].substr(0, 16), std::string(16, 'w'));
+
+  bridge_frame_free(self);
+}
+
 /* A silent owner (no reply ever) must answer every verb as failure through
    the bounded wait — four 500 ms waits (~2 s total), never a hang. */
 TEST(TestPyAgent, TestSilentFrameTimeoutsAnswerFailure) {

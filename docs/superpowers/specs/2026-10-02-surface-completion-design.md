@@ -128,10 +128,12 @@ the deadline is a real thread, created per pooled cell:
   into the frame's own mailbox; its dispatch runs `_frame_interrupt_apply` with the watchdog
   wording. The thread is frame-owned and joined in `frame_destroy` (normally already exited; the
   wait is bounded by the deadline it lives under).
-- **Inline driver unification (behavior change, deliberate):** today `_frame_cell_wait`'s deadline
-  gives up and returns -1, leaving the cell NOT abandoned (frame.c:2663). The inline driver's
-  deadline now invokes `_frame_interrupt_apply` with the watchdog wording first — both waiters run
-  one policy. `loop.c`'s `cell-timeout` control wording stays as its surface text.
+- **Inline driver unification (behavior change, deliberate):** the inline driver's phase-deadline
+  branch (loop.c's bounded pump loop) now invokes `_frame_interrupt_apply` with the watchdog
+  wording first — both waiters run one policy. `loop.c`'s `cell-timeout` control wording stays as
+  its surface text. (NOTE: the design once cited `_frame_cell_wait` (frame.c's give-up-and-return
+  deadline); it was found caller-less — dead code — and its shape was superseded by the unified
+  inline deadline above.)
 
 **What interrupt does NOT touch.** `FRM_STOP` keeps its contract (drain-at-boundary control,
 never cuts, never stores); `blocked` stays reserved for the steering slice; nothing about the loop's
