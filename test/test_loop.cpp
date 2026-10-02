@@ -55,6 +55,117 @@ static frame_config_t test_config(void) {
 /* NOTE on the guard idiom: C preprocessor macros cannot be joined with `&&` —
    the plan's listing note is honored by writing the real form below:
      #if defined(SA_HAS_WDB) && defined(SA_HAS_PYTHON)   */
+
+/* The audit-trail surface: load frame_debug_events and search it. */
+static json_value_t* load_events(frame_t* f) {
+  char* json = frame_debug_events(f);
+  EXPECT_NE(json, nullptr);
+  if (json == NULL) return nullptr;
+  char* err = NULL;
+  json_value_t* arr = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  EXPECT_NE(arr, nullptr);
+  if (arr != nullptr) EXPECT_EQ(json_type(arr), JSON_ARRAY);
+  if (arr == nullptr || json_type(arr) != JSON_ARRAY) {
+    if (arr != nullptr) json_value_destroy(arr);
+    return nullptr;
+  }
+  return arr;
+}
+
+static bool event_is(json_value_t* rec, const char* type_name) {
+  json_value_t* type_v = json_get(rec, "type");
+  return type_v != NULL && strcmp(json_as_string(type_v), type_name) == 0;
+}
+
+/* --- the turn-envelope tests' readers (the records are the frozen shape:
+       {"seq","type","frame","corr","at","cause","payload"}) --------------- */
+
+static long long rec_seq(json_value_t* rec) {
+  json_value_t* seq = json_get(rec, "seq");
+  return (seq != NULL) ? (long long)json_as_int(seq) : -1;
+}
+
+static json_value_t* payload_of(json_value_t* rec) {
+  return json_get(rec, "payload");
+}
+
+static size_t count_type(json_value_t* events, const char* type_name) {
+  size_t n = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), type_name)) n++;
+  }
+  return n;
+}
+
+static long long first_seq_of(json_value_t* events, const char* type_name) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, type_name)) return rec_seq(rec);
+  }
+  return -1;
+}
+
+/* The FIRST record of `type_name` whose payload `turn` matches (NULL when
+   absent — the callers assert on it). */
+static json_value_t* life_record_of_turn(json_value_t* events,
+                                         const char* type_name,
+                                         long long turn) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, type_name)) continue;
+    json_value_t* payload = payload_of(rec);
+    json_value_t* turn_v = (payload != NULL) ? json_get(payload, "turn") : NULL;
+    if (turn_v != NULL && (long long)json_as_int(turn_v) == turn) return rec;
+  }
+  return NULL;
+}
+
+/* Count the records of `type_name` whose payload `turn` matches. */
+static size_t count_turn(json_value_t* events, const char* type_name,
+                         long long turn) {
+  size_t n = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, type_name)) continue;
+    json_value_t* payload = payload_of(rec);
+    json_value_t* turn_v = (payload != NULL) ? json_get(payload, "turn") : NULL;
+    if (turn_v != NULL && (long long)json_as_int(turn_v) == turn) n++;
+  }
+  return n;
+}
+
+/* The FIRST msg.append record with the given role + content (NULL when
+   absent). */
+static json_value_t* find_msg_append(json_value_t* events, const char* role,
+                                     const char* content) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "msg.append")) continue;
+    json_value_t* payload = payload_of(rec);
+    json_value_t* role_v = (payload != NULL) ? json_get(payload, "role") : NULL;
+    json_value_t* content_v =
+        (payload != NULL) ? json_get(payload, "content") : NULL;
+    if (role_v != NULL && content_v != NULL &&
+        strcmp(json_as_string(role_v), role) == 0 &&
+        strcmp(json_as_string(content_v), content) == 0) {
+      return rec;
+    }
+  }
+  return NULL;
+}
+
+/* The turn.end's reason kind ("" when the record is malformed — the caller
+   asserts against a kind name; reading the kind directly pins "the reason
+   is never NULL" without an invented default). */
+static std::string turn_end_kind(json_value_t* rec) {
+  json_value_t* payload = payload_of(rec);
+  json_value_t* reason = (payload != NULL) ? json_get(payload, "reason") : NULL;
+  json_value_t* kind = (reason != NULL) ? json_get(reason, "kind") : NULL;
+  return (kind != NULL) ? std::string(json_as_string(kind)) : std::string();
+}
+
 #if defined(SA_HAS_PYTHON)
 
 /* Scripted model: pops pre-queued raw OpenAI-shaped replies; when the queue
@@ -184,116 +295,6 @@ static int scripted_complete(void* self, json_value_t* messages, json_value_t* t
     return -1;
   }
   return scripted_decode(body, reply_out, error_out) == 0 ? 0 : -1;
-}
-
-/* The audit-trail surface: load frame_debug_events and search it. */
-static json_value_t* load_events(frame_t* f) {
-  char* json = frame_debug_events(f);
-  EXPECT_NE(json, nullptr);
-  if (json == NULL) return nullptr;
-  char* err = NULL;
-  json_value_t* arr = json_parse(json, strlen(json), &err);
-  if (err != NULL) free(err);
-  free(json);
-  EXPECT_NE(arr, nullptr);
-  if (arr != nullptr) EXPECT_EQ(json_type(arr), JSON_ARRAY);
-  if (arr == nullptr || json_type(arr) != JSON_ARRAY) {
-    if (arr != nullptr) json_value_destroy(arr);
-    return nullptr;
-  }
-  return arr;
-}
-
-static bool event_is(json_value_t* rec, const char* type_name) {
-  json_value_t* type_v = json_get(rec, "type");
-  return type_v != NULL && strcmp(json_as_string(type_v), type_name) == 0;
-}
-
-/* --- the turn-envelope tests' readers (the records are the frozen shape:
-       {"seq","type","frame","corr","at","cause","payload"}) --------------- */
-
-static long long rec_seq(json_value_t* rec) {
-  json_value_t* seq = json_get(rec, "seq");
-  return (seq != NULL) ? (long long)json_as_int(seq) : -1;
-}
-
-static json_value_t* payload_of(json_value_t* rec) {
-  return json_get(rec, "payload");
-}
-
-static size_t count_type(json_value_t* events, const char* type_name) {
-  size_t n = 0;
-  for (size_t i = 0; i < json_size(events); i++) {
-    if (event_is(json_at(events, i), type_name)) n++;
-  }
-  return n;
-}
-
-static long long first_seq_of(json_value_t* events, const char* type_name) {
-  for (size_t i = 0; i < json_size(events); i++) {
-    json_value_t* rec = json_at(events, i);
-    if (event_is(rec, type_name)) return rec_seq(rec);
-  }
-  return -1;
-}
-
-/* The FIRST record of `type_name` whose payload `turn` matches (NULL when
-   absent — the callers assert on it). */
-static json_value_t* life_record_of_turn(json_value_t* events,
-                                         const char* type_name,
-                                         long long turn) {
-  for (size_t i = 0; i < json_size(events); i++) {
-    json_value_t* rec = json_at(events, i);
-    if (!event_is(rec, type_name)) continue;
-    json_value_t* payload = payload_of(rec);
-    json_value_t* turn_v = (payload != NULL) ? json_get(payload, "turn") : NULL;
-    if (turn_v != NULL && (long long)json_as_int(turn_v) == turn) return rec;
-  }
-  return NULL;
-}
-
-/* Count the records of `type_name` whose payload `turn` matches. */
-static size_t count_turn(json_value_t* events, const char* type_name,
-                         long long turn) {
-  size_t n = 0;
-  for (size_t i = 0; i < json_size(events); i++) {
-    json_value_t* rec = json_at(events, i);
-    if (!event_is(rec, type_name)) continue;
-    json_value_t* payload = payload_of(rec);
-    json_value_t* turn_v = (payload != NULL) ? json_get(payload, "turn") : NULL;
-    if (turn_v != NULL && (long long)json_as_int(turn_v) == turn) n++;
-  }
-  return n;
-}
-
-/* The FIRST msg.append record with the given role + content (NULL when
-   absent). */
-static json_value_t* find_msg_append(json_value_t* events, const char* role,
-                                     const char* content) {
-  for (size_t i = 0; i < json_size(events); i++) {
-    json_value_t* rec = json_at(events, i);
-    if (!event_is(rec, "msg.append")) continue;
-    json_value_t* payload = payload_of(rec);
-    json_value_t* role_v = (payload != NULL) ? json_get(payload, "role") : NULL;
-    json_value_t* content_v =
-        (payload != NULL) ? json_get(payload, "content") : NULL;
-    if (role_v != NULL && content_v != NULL &&
-        strcmp(json_as_string(role_v), role) == 0 &&
-        strcmp(json_as_string(content_v), content) == 0) {
-      return rec;
-    }
-  }
-  return NULL;
-}
-
-/* The turn.end's reason kind ("" when the record is malformed — the caller
-   asserts against a kind name; reading the kind directly pins "the reason
-   is never NULL" without an invented default). */
-static std::string turn_end_kind(json_value_t* rec) {
-  json_value_t* payload = payload_of(rec);
-  json_value_t* reason = (payload != NULL) ? json_get(payload, "reason") : NULL;
-  json_value_t* kind = (reason != NULL) ? json_get(reason, "kind") : NULL;
-  return (kind != NULL) ? std::string(json_as_string(kind)) : std::string();
 }
 
 TEST(TestLoop, TestScriptedLoopRunsCellAndCompletes) {
@@ -2428,6 +2429,13 @@ TEST(TestLoop, TestRestartRepairsTheCutBeforeTheCellAudit) {
 }
 
 #endif /* SA_HAS_WDB */
+
+/* The reopened-walk probe runs REAL tool cycles through the frame's own
+   pyrt (py_agent_init + the scripted model drive cells), so it needs BOTH
+   gates: test_loop.cpp is registered under the WDB gate in test/
+   CMakeLists.txt, and the python half is the nested real form. */
+#if defined(SA_HAS_WDB) && defined(SA_HAS_PYTHON)
+
 TEST(TestLoop, TestResumedEngineSeesItsOwnInSessionRecords) {
   /* The substrate probe (the Task-3 implementer's engine-level claim): a
      RESUMED session's engine runs TWO tool cycles on the SAME reopened
@@ -2521,5 +2529,7 @@ TEST(TestLoop, TestResumedEngineSeesItsOwnInSessionRecords) {
 
   std::filesystem::remove_all(dir);
 }
+
+#endif /* the reopened-walk probe's WDB+PYTHON gate */
 
 

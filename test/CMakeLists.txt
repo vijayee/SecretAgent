@@ -58,6 +58,21 @@ if (BUILD_TESTING)
       # WaveDB's API opened DIRECTLY, on the aliased archive this harness
       # links — the thinnest reproducer for bisecting the defect.
       target_sources(testsecretagent PRIVATE test_wdb_reopen_probe.cpp)
+      # The reopen probe opens WaveDB's API directly (thinnest reproducer):
+      # its header chain needs src's module dirs PLUS the WDB-facing
+      # third-party dirs the root's SA_ENABLE_WDB block gives the library
+      # (Database/database.h -> HBTrie/identifier.h -> <cbor.h>). Its OWN
+      # gate is this WDB gate — a WDB-only test must not sit behind the
+      # streams gate even though the same probe's older copy once rode it
+      # (a streams-off/WDB-on configure registers the probe with no include
+      # path otherwise: test_wdb_reopen_probe.cpp fails at Database/database.h,
+      # then at <cbor.h>).
+      target_include_directories(testsecretagent PRIVATE
+        ${WDB_ROOT}/src
+        ${WDB_ROOT}/deps/libcbor/src
+        ${WDB_BUILD}/deps/libcbor
+        ${WDB_BUILD}/deps/libcbor/src
+        ${WDB_ROOT}/deps/hashmap/include)
       # The refine slice rides the same WDB gate as test_frame (its types live
       # on frame.h's surface); the review-call tests also need the streams
       # gate, added with Task 4's step.
@@ -98,11 +113,6 @@ if (BUILD_TESTING)
         ${WDB_BUILD}/deps/libcbor
         ${WDB_BUILD}/deps/libcbor/src
         ${WDB_ROOT}/deps/hashmap/include)
-      # The reopen probe opens WaveDB's API directly (thinnest reproducer):
-      # its headers need src's module dirs + libcbor's config root.
-      target_include_directories(testsecretagent PRIVATE
-        ${WDB_ROOT}/src
-        ${WDB_ROOT}/deps/libcbor)
     endif()
 
     if(SA_HAS_PYTHON)
