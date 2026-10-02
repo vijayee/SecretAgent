@@ -366,6 +366,74 @@ TEST(TestPyAgent, TestEmitPostsWithThePayload) {
   bridge_frame_free(self);
 }
 
+/* The bridge value caps (spec §4, SA_BUDGET_BRIDGE_VALUE_BYTES): remember's
+   JSON VALUE, report's TEXT, and spawn's CONTEXT are cut at the SOURCE with
+   the one truncate-marker shape — each capped payload carries the marker
+   naming the ORIGINAL length, and its bounded length is cap bytes of text +
+   the marker. All three verbs fire in one cell; the answering harness sees
+   every request arrive. (remember's value is JSON-encoded at the boundary —
+   100000 y's arrive as the 100002-byte JSON string, so the marker names
+   100002; report/spawn texts travel verbatim, so theirs name 100000.) */
+TEST(TestPyAgent, TestBridgeValuesCappedAtSource) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(1, "sessions/cafebeef/frames/deadbeef");
+
+  self->results.clear();
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(self,
+                       "import actor\n"
+                       "actor.remember('kkkkkkkkkkkkkkkkkkkk', 'y' * 100000)\n"
+                       "actor.report('z' * 100000)\n"
+                       "actor.spawn('goal', 'g' * 100000)\n");
+  bridge_frame_pump(self, 30000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  ASSERT_EQ(self->results[0]->status, 0);
+  /* The three requests arrived in cell order; remember's value is the
+     JSON-encoded 100002-byte string, so the cap cut it at 16384 text bytes +
+     "\n[budget: truncated at 100002 bytes]" (36). report/spawn travel
+     verbatim, so their markers name the original 100000. NOTE the harness's
+     recording vectors per kind: req_a records remember-key/report-text/
+     spawn-goal, req_b records remember-value/spawn-context; FRM_REPORT
+     pushes NO req_b entry, so each vector is indexed by its own running
+     counter, not the request index. */
+  ASSERT_EQ(self->req_types.size(), 3u);
+  EXPECT_EQ(self->req_types[0], (uint32_t)FRM_REMEMBER);
+  EXPECT_EQ(self->req_types[1], (uint32_t)FRM_REPORT);
+  EXPECT_EQ(self->req_types[2], (uint32_t)FRM_SPAWN);
+  ASSERT_EQ(self->req_a.size(), 3u);   /* key, report text, spawn goal */
+  ASSERT_EQ(self->req_b.size(), 2u);   /* remember value, spawn context */
+
+  const size_t cap = 16u * 1024u;
+  const size_t marker_len = strlen("[budget: truncated at 100000 bytes]");
+
+  /* remember: the key is NOT a budgeted value (it stays 20 y's of 'k...');
+     the VALUE carries cap bytes of the JSON-encoded text + the marker. */
+  EXPECT_EQ(self->req_a[0].size(), 20u) << "the key is NOT capped";
+  EXPECT_EQ(self->req_a[0], std::string(20, 'k'));
+  EXPECT_EQ(self->req_b[0].size(), cap + marker_len + 1u);
+  EXPECT_NE(self->req_b[0].find("[budget: truncated at 100002 bytes]"),
+            std::string::npos);
+  EXPECT_EQ(self->req_b[0].substr(0, 2), "\"y") << "JSON string shape preserved in the cut";
+
+  /* report: the TEXT rides req_a; capped at the same 16384 + marker. */
+  EXPECT_EQ(self->req_a[1].size(), cap + marker_len + 1u);
+  EXPECT_NE(self->req_a[1].find("[budget: truncated at 100000 bytes]"),
+            std::string::npos);
+  EXPECT_EQ(self->req_a[1].substr(0, 16), std::string(16, 'z'));
+
+  /* spawn: the CONTEXT rides req_b verbatim and is budgeted; the goal is
+     NOT in the table (spec §4 names remember's value, spawn's context,
+     report's text — nothing else). */
+  EXPECT_EQ(self->req_a[2].size(), 4u) << "the goal is NOT budgeted";
+  EXPECT_EQ(self->req_b[1].size(), cap + marker_len + 1u);
+  EXPECT_NE(self->req_b[1].find("[budget: truncated at 100000 bytes]"),
+            std::string::npos);
+  EXPECT_EQ(self->req_b[1].substr(0, 16), std::string(16, 'g'));
+
+  bridge_frame_free(self);
+}
+
 /* A silent owner (no reply ever) must answer every verb as failure through
    the bounded wait — four 500 ms waits (~2 s total), never a hang. */
 TEST(TestPyAgent, TestSilentFrameTimeoutsAnswerFailure) {

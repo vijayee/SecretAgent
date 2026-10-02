@@ -339,7 +339,9 @@ static char* _py_agent_text_of(PyObject* obj) {
    `value` is encoded with the interpreter's json.dumps at the boundary (a
    bare python str 'wave' stores as the JSON string "wave"; containers and
    bools/None encode the same way) — the python surface speaks python, the
-   store contract is JSON. Bridges to FRM_REMEMBER; the frame's durable-ctx
+   store contract is JSON. The encoded value is cut at the bridge value
+   budget (SA_BUDGET_BRIDGE_VALUE_BYTES, spec §4) before it crosses. Bridges
+   to FRM_REMEMBER; the frame's durable-ctx
    remember runs on the frame's dispatch thread and answers corr-matched
    through the sink. */
 static PyObject* _py_agent_remember(PyObject* self, PyObject* args) {
@@ -356,6 +358,32 @@ static PyObject* _py_agent_remember(PyObject* self, PyObject* args) {
     free(key);
     return NULL;
   }
+
+  /* The bridge value budget (budget table, spec §4): remember's VALUE is cut
+     HERE, at the source — the store never holds unbounded text. The helper's
+     marker travels with the value (the model learns the cut at its next
+     recall); a REAL cut also posts a log line naming it. */
+  char* capped = NULL;
+  uint8_t truncated = 0;
+  budget_truncate_with_marker(value, SA_BUDGET_BRIDGE_VALUE_BYTES, &capped,
+                              &truncated);
+  if (capped == NULL) {
+    /* The helper refused (OOM / NULL text): the loud refusal contract. */
+    free(key);
+    free(value);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  if (truncated != 0) {
+    char cut_line[128];
+    snprintf(cut_line, sizeof(cut_line),
+             "remember: the %zu-byte value exceeded the %u-byte bridge budget "
+             "and was cut with the truncation marker",
+             strlen(value), (unsigned)SA_BUDGET_BRIDGE_VALUE_BYTES);
+    pyrt_post_text(PYRT_LOG, cut_line);
+  }
+  free(value);
+  value = capped;
 
   frm_remember_payload_t* rp = get_clear_memory(sizeof(frm_remember_payload_t));
   if (rp == NULL) {
@@ -473,7 +501,9 @@ static PyObject* _py_agent_keys(PyObject* self, PyObject* args) {
    Bridges to FRM_SPAWN (admission-only child spawn on the frame); a
    delivered success carries the child sid path, returned as a python
    string. context=None posts NO handoff key (the py_agent contract: spawn
-   without handoff context); a context string is stored verbatim — the frame
+   without handoff context); a context string is stored verbatim and cut at
+   the bridge value budget (SA_BUDGET_BRIDGE_VALUE_BYTES, spec §4) first — the
+   frame
    validates it as JSON and refuses (loud, status 1 → None) otherwise. */
 static PyObject* _py_agent_spawn(PyObject* self, PyObject* args) {
   (void)self;
@@ -491,6 +521,32 @@ static PyObject* _py_agent_spawn(PyObject* self, PyObject* args) {
       free(goal);
       return NULL;
     }
+    /* The bridge value budget (budget table, spec §4): the handoff CONTEXT
+       is cut HERE, at the source — the child never reads unbounded handoff
+       text. A context=None spawn posts no key (the legitimate case above);
+       only PRESENT context text is capped. A REAL cut also posts a log line
+       naming it. */
+    char* capped = NULL;
+    uint8_t truncated = 0;
+    budget_truncate_with_marker(context, SA_BUDGET_BRIDGE_VALUE_BYTES, &capped,
+                                &truncated);
+    if (capped == NULL) {
+      /* The helper refused (OOM / NULL text): the loud refusal contract. */
+      free(context);
+      free(goal);
+      PyErr_NoMemory();
+      return NULL;
+    }
+    if (truncated != 0) {
+      char cut_line[128];
+      snprintf(cut_line, sizeof(cut_line),
+               "spawn: the %zu-byte context exceeded the %u-byte bridge "
+               "budget and was cut with the truncation marker",
+               strlen(context), (unsigned)SA_BUDGET_BRIDGE_VALUE_BYTES);
+      pyrt_post_text(PYRT_LOG, cut_line);
+    }
+    free(context);
+    context = capped;
   }
 
   frm_spawn_payload_t* sp = get_clear_memory(sizeof(frm_spawn_payload_t));
@@ -522,9 +578,10 @@ static PyObject* _py_agent_spawn(PyObject* self, PyObject* args) {
 /* report(value) -> bool.
 
    Bridges to FRM_REPORT: the report text is the value (str verbatim, any
-   other object coerced through repr — the loop-slice callers hand strings).
-   A delivered success is True; refusal, send failure, and timeout are
-   False. */
+   other object coerced through repr — the loop-slice callers hand strings),
+   cut at the bridge value budget (SA_BUDGET_BRIDGE_VALUE_BYTES, spec §4)
+   before it crosses. A delivered success is True; refusal, send failure, and
+   timeout are False. */
 static PyObject* _py_agent_report(PyObject* self, PyObject* args) {
   (void)self;
   PyObject* val_o = NULL;
@@ -533,6 +590,31 @@ static PyObject* _py_agent_report(PyObject* self, PyObject* args) {
   }
   char* text = _py_agent_text_of(val_o);
   if (text == NULL) return NULL;
+
+  /* The bridge value budget (budget table, spec §4): the report TEXT is cut
+     HERE, at the source — the loop's projection (SA_BUDGET_LOOP_REPORT) then
+     sees bounded durable text. The helper's marker travels with the text (the
+     next derive learns the cut); a REAL cut also posts a log line naming it. */
+  char* capped = NULL;
+  uint8_t truncated = 0;
+  budget_truncate_with_marker(text, SA_BUDGET_BRIDGE_VALUE_BYTES, &capped,
+                              &truncated);
+  if (capped == NULL) {
+    /* The helper refused (OOM / NULL text): the loud refusal contract. */
+    free(text);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  if (truncated != 0) {
+    char cut_line[128];
+    snprintf(cut_line, sizeof(cut_line),
+             "report: the %zu-byte text exceeded the %u-byte bridge budget "
+             "and was cut with the truncation marker",
+             strlen(text), (unsigned)SA_BUDGET_BRIDGE_VALUE_BYTES);
+    pyrt_post_text(PYRT_LOG, cut_line);
+  }
+  free(text);
+  text = capped;
 
   frm_report_payload_t* rp = get_clear_memory(sizeof(frm_report_payload_t));
   if (rp == NULL) {
