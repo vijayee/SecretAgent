@@ -1,5 +1,23 @@
 {
   "schema": "rp036-improvement-proposals-v1",
   "revision": 1,
-  "proposals": []
+  "proposals": [
+    {
+      "id": "wavedb-reopen-walk-publication-fix",
+      "title": "WaveDB reopen-walk publication fix adopted from the turn-lifecycle slice",
+      "status": "adopted",
+      "category": "substrate",
+      "sourceSliceId": "turn-step-lifecycle-crash-repair",
+      "problem": "Recorded on S003 (gate review finding F1): in WaveDB CONCURRENT mode a write committed after a reopen is durable and replayable by a fresh handle but INVISIBLE to the SAME handle's own walks and point-gets — the restart replay proof had to assert through a third session, and every same-session scan consumer carried the caveat.",
+      "minimalChange": "Root-caused and fixed on the WaveDB repo itself (d517ef6 the same-handle reopen-amnesia reproducer; 2cd6161 recovery-open walks re-materialize has_value=0 children into a second trie_child copy the write path never sees), the same commits in both WaveDB trees, with the SecretAgent deps pin re-pointed at 2cd6161 and two probe suites pinning the healthy contract: test/test_wdb_reopen_probe.cpp (WaveDB level) and TestLoop.TestResumedEngineSeesItsOwnInSessionRecords (engine level). Build-tree lesson riding with the adoption: bumping a deps ExternalProject's pin does not re-run its stamps (CMakeLists.txt's NOTE) — the ASan build tree silently kept the PRE-fix libwavedb.a and reproduced the now-fixed defect until the build-dir deps/wavedb was wiped and the wavedb-ext step stamps cleared to force a fresh configure+build.",
+      "whyNonObvious": "The defect surfaced at the ENGINE level first (a resumed frame's turn-2 derive missing its turn-1 cell result) while the WaveDB-level probes read healthy — recovery walks' has_value=0 children hide from point-gets and only betray themselves on post-reopen walk paths, and the stale ExternalProject library masked the fix until the probe failed the suite.",
+      "whyHighLeverage": "Every same-handle scan consumer depends on the fix, not one workaround: the derive per turn, the refine slice's shared-scope scans (S003 review note F3), and any future replay/inbox machinery — it removes a whole class of 'invisible to myself' substrate caveats from the runtime.",
+      "ownerReview": "2026-10-01 session: the owner took the fix WaveDB-side (d517ef6/2cd6161 committed in both WaveDB trees), authorized the deps re-pin with the probes as standing evidence (fb6ee1a/d3bc39c), and the WaveDB repo's own suite measured 45/45 green at the fix.",
+      "failureReplayAndControl": {
+        "replay": "d517ef6's reproducer: batch-write after a reopen, then walk and point-get on the SAME handle — the pre-fix walk returns stale children the write path never published.",
+        "control": "TestLoop.TestResumedEngineSeesItsOwnInSessionRecords fails loudly on the pre-fix library (verified this session on the stale ASan build tree before the wipe) and passes on the fixed pin; test_wdb_reopen_probe.cpp pins the same-handle get and scan at the WaveDB level."
+      },
+      "validationState": "adopted"
+    }
+  ]
 }

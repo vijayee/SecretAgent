@@ -1,7 +1,7 @@
 {
   "schema": "rp036-atlas-v1",
-  "revision": 7,
-  "lastUpdated": "2026-10-01T18:54:21.069Z",
+  "revision": 8,
+  "lastUpdated": "2026-10-02T04:00:30.827Z",
   "project": {
     "id": "SECRETAGENT",
     "label": "SecretAgent — embeddable agent runtime and its desktop agent",
@@ -22,7 +22,8 @@
         "remember-session-across-restarts",
         "subdivide-session-into-accountable-agents",
         "run-agent-as-desktop",
-        "refine-continual-harness"
+        "refine-continual-harness",
+        "turn-step-lifecycle-crash-repair"
       ],
       "requires": [],
       "completionRoute": "Four delivered slices with independent review per record: the runtime executes agent code without blocking, sessions survive restarts replayably, sessions subdivide into an accountable agent tree, and the desktop agent drives real work on top of the library. Cross-platform builds and the full gtest suite stay green at every completion."
@@ -185,6 +186,32 @@
         ],
         "onRejection": "Keep in-progress and correct only within this slice's boundary (subtree schema, evidence gate, batch composition, rollback composition)."
       }
+    },
+    "turn-step-lifecycle-crash-repair": {
+      "id": "turn-step-lifecycle-crash-repair",
+      "label": "Turn/step lifecycle envelope in the log + crash repair with model-visible closers",
+      "kind": "leaf",
+      "intent": "delivery",
+      "status": "in-progress",
+      "description": "The turn-lifecycle slice (spec docs/superpowers/specs/2026-10-01-turn-lifecycle-design.md; the parity-feature-matrix §3 rows 4/5 — the two strongest un-landed DSH essences): turn/step boundaries and the turn.end reason union land as FIVE new event records on the EXISTING write path (turn.start {turn}, turn.end {turn, reason:{kind,text?}}, step.start {turn, step}, step.end {turn, step}, repair {turn, text}) — the log machinery derives fold away exactly like control today, except `repair`, the ONE model-visible lifecycle type. THE ENVELOPE'S BATCH-RIDING SHAPE (spec §3): the boundaries ride the engine's EXISTING atomic store batches — step.start rides the turn's first durable record batch (the FRAME_STORE_CELL_RUN audit on the tool path, the content path's FRAME_STORE_FINISH batch), [step.end + turn.end] ride the cell.result batch (tool cycles) or the finish/fail batch — so a healthy turn adds NO new round trip beyond turn entry's ONE fire-and-post batch (turn.start alone, the control events' discipline), posted through the NEW _frame_event_batch_post fire variant (frame_internal.h: _frame_event_batch_post / _frame_event_batch_post_fire — every op an event record at the frame's pre-allocated seqs, allocated as ONE CONTIGUOUS seq stretch and composed per seq into one FRM_STORE_BATCH; the awaited shape routes corr/reply, corr 0 = fire-and-post; the store's one-atomic-batch rule keeps the record group from ever half-applying; on a pre-post refusal the whole seq range rolls back). THE REASON UNION (DSH TurnEndReasonMap's port, open): WRITTEN members — completed (the turn's cycle answered; the final turn of an ok run also ends completed), error (the engine's failure surfaces: model error after its retry, cell loss, commit refusal, the OOM/lost-reply shapes — the record's text carries the existing control kind's wording verbatim, never invented twice), interrupted (the resume repair's cause; the ONLY reason whose turn.end is written on a caller thread). turn-limit is RESERVED WITH NO WRITER this slice (the cap check precedes turn entry — the refused turn never opened, so no turn.end can carry it; the vocabulary's completeness + the steering slice's budget turns). aborted/blocked are RESERVED names for the steering/interrupt slice (spec §9) — no writer. THE FINALLY-DISCIPLINE (DSH agent.ts:354-385, ported as a rule): EVERY exit path of a turn closes it — the reason is never NULL — and turn numbering restores from the log (newest recorded turn + 1, once per engine begin/resume, gaps loud; the balance rule means a repaired tail re-resumes into a no-op and a pre-lifecycle log resumes untouched). THE BALANCE RULE (the resume check's whole truth): the log is balanced iff the newest lifecycle record is a turn.end — no crash flag, no extra state; the log alone says whether repair is needed. THE RESUME REPAIR (frame_resume, spec §4): after the seq restore, a bounded tail scan (SA_LIFECYCLE_TAIL_EVENTS=512) folds the lifecycle cursor (pure module src/Frame/lifecycle.{h,c} — cursor + the deterministic composer lifecycle_closers: step.end first, then turn.end {interrupted}, then the repair brief; malformed lifecycle records fold loud-and-skip, never crash the derive), and an open tail composes closers into ONE atomic append-only closer batch through the sync family (_frame_sync_batch: closers + the resume's meta/status put in the same batch, one round trip; scan/batch refusals are the sync family's documented loud consequences — pooled store refuses loud, TestFrame.TestResumeRepairRefusesOnPooledStore; resume refuses rather than half-repairs). Append-only: closer records are NEW records carrying the cut's recorded facts — the original records are never mutated or deleted (the refine slice's DB-as-log discipline). THE BRIEF'S TWO PINNED SHAPES (details UPFRONT — OWNER DECISION, never a one-line pointer that forces a multi-step chase; DSH repair.spec.ts's verbatim-wording table adapted): started (an open cell.run — the crash cut between the cell's audit commit and its result) leads with 'The previous turn was interrupted before its result was recorded.', then QUOTES the interrupted cell's seq and its code verbatim (capped SA_LIFECYCLE_BRIEF_CODE_CHARS=1200, truncation-at-source loud), then 'Its outcome is unknown.' and the retry guidance (retry only if the operation is read-only or idempotent; otherwise verify external state or ask first — never blindly); not-started (the turn opened, no cell recorded) says 'No cell execution was recorded.' with 'Retry it if it is still needed.' and no code quote. The derive renders a `repair` record as ONE user-role message, text verbatim — the model reads the full crash briefing in its very next context. THE DELIBERATE NON-PORTS (spec §5): NO dangling-provider problem — our derive sends a FRESH plain-roles array every turn (no tool_call history reconstructed), so DSH's per-pending-call synthetic tool-calls do not port; NO live ToolCallRecovery class — every in-run failure path records (a paired cell.result) or writes nothing, so an unanswered RECORDED cell is only ever a crash, which only ever repairs through resume; FLAT records — the existing events keep their payloads untouched, only the five new types carry turn/step numbers (DSH's per-event tagging is a later slice's need). SUBSTRATE FIX ON THE RECORD (2026-10-01): the slice's engine probe exposed the gate-reviewed WaveDB reopen defect (S003's review finding F1: a post-reopen write is durable but invisible to the same session's own walks/point-gets) as BLOCKING the healthy contract — the resumed engine's own turn-2 derive was missing its turn-1 cell.result — and the fix landed WaveDB-SIDE: WaveDB commits d517ef6 (the same-handle reopen-amnesia reproducer) + 2cd6161 ('fix: recovery-open walks re-materialize has_value=0 children into a second trie_child copy the write path never sees'), the same commits in both WaveDB trees, with this repo's deps/wavedb pin re-pointed at 2cd6161 (fb6ee1a) and the probes committed as the healthy contract's standing evidence (test/test_wdb_reopen_probe.cpp at the WaveDB level — same-handle get AND reverse-scan see post-reopen writes — and TestLoop.TestResumedEngineSeesItsOwnInSessionRecords at the engine level). The old restart tests' third-session workaround notes remain in the test files as the historical record of the recorded defect. Recorded build-tree lesson from the re-pin: bumping a deps ExternalProject's pin does not re-run its stamps (CMakeLists.txt's NOTE) — the ASan build tree silently kept the PRE-fix libwavedb.a and reproduced the (now-fixed) defect until cmake-build-asan/deps/wavedb was wiped and the wavedb-ext step stamps cleared to force the fresh configure+build; the engine probe fails loudly on the stale tree, which is the probe working. EVIDENCE (commits 302f166..d3bc39c: 302f166 the lifecycle cursor/reason union/composers; 3724b21 + aa3b4d7 fold hardening; 5d03c9f the engine envelope with terminal reasons; e5375c3 + e381662 store-side batch naming; df016a9 the resume repair; 694c84f the repair-brief ring flush; fb6ee1a the WaveDB re-pin + probes; d3bc39c the probe registration): test/test_lifecycle.cpp (16 tests — balanced/open closes, the started/not-started wording pinned verbatim, determinism + contiguous seqs, corr-mismatch and malformed-record folds, refused-turn-start tolerance), test_loop.cpp TestEngineRunWritesTheTurnEnvelopeInOrder + TestMultiCycleTurnsEachClose + TestModelFailureClosesTheTurnWithError + TestTurnCapRefusesBeforeTurnEntry + TestRestartRepairsTheCutAfterTheCellAudit + TestRestartRepairsTheCutBeforeTheCellAudit + TestResumedEngineSeesItsOwnInSessionRecords, test_frame.cpp TestChildrenYieldTurnEndRidesTheFinishBatch + TestResumeRepairRefusesOnPooledStore, test_wdb_reopen_probe.cpp (registered under the WDB gate); TestLifecycle registers on the plain gate so the OFF build carries it. SUITE (measured 2026-10-01): 218/218 debug + 218/218 ASan (both setarch -R; the ASan count AFTER the stale-wavedb rebuild above), 78/78 OFF; valgrind breadth over this slice's filters (TestLifecycle.*, TestWdbReopenProbe.*, the envelope/cap/failure/children-turn-end/pooled-refusal filters — 23 tests verified executing): 0 errors, 0 definitely-lost, 0 possibly-lost (the scratch-disk restart tests remain valgrind-excluded per their comments); the WaveDB repo's own suite at the fix: 45/45. No new lock anywhere: the frame-engine grep stays clean (model.c's recorded off-dispatch exceptions unchanged); the store actor remains the sole serializer. Windows verification tracked on S003/S006 (Linux-proven only).",
+      "contains": [],
+      "requires": [
+        "drive-model-driven-frame-tree"
+      ],
+      "route": {
+        "completionEvidence": [
+          "Every turn/step boundary rides an existing engine batch (or the ONE turn-entry fire-and-post batch) — the log shows the paired envelope on every alive-engine exit, turn numbering restores from the log: TestLoop.TestEngineRunWritesTheTurnEnvelopeInOrder, TestLoop.TestMultiCycleTurnsEachClose, TestFrame.TestChildrenYieldTurnEndRidesTheFinishBatch",
+          "Every exit closes with a union member (completed / error carrying the control kind's text; turn-limit reserved-with-no-writer; aborted/blocked reserved for the steering/interrupt slice): TestLoop.TestModelFailureClosesTheTurnWithError, TestLoop.TestTurnCapRefusesBeforeTurnEntry",
+          "A truncated tail repairs on frame_resume with ONE atomic append-only closer batch and the brief's details (seq + cell code) quoted verbatim in the model's next context; a second resume composes nothing; the pooled store refuses loud: TestLoop.TestRestartRepairsTheCutAfterTheCellAudit, TestLoop.TestRestartRepairsTheCutBeforeTheCellAudit, TestFrame.TestResumeRepairRefusesOnPooledStore, the TestLifecycle wording/determinism suite",
+          "The same session's in-session writes are visible to its own derives (the WaveDB reopen-walk publication fix, WaveDB 2cd6161, deps re-pinned fb6ee1a): TestLoop.TestResumedEngineSeesItsOwnInSessionRecords + test_wdb_reopen_probe.cpp (WDB-level same-handle get and reverse-scan)",
+          "Suite measured 2026-10-01: 218/218 debug + 218/218 ASan (setarch -R), 78/78 OFF (TestLifecycle on the plain gate), valgrind breadth on this slice's filters 23 tests verified executing with 0 errors / 0 definitely-lost, WaveDB repo suite 45/45 at the fix; Windows tracked on S003/S006 — Linux-proven"
+        ],
+        "reviewPlanned": "Create a native review record (registry entry with reviewedNodeSha256) before completion.",
+        "next": [
+          "remember-session-across-restarts"
+        ],
+        "onRejection": "Keep in-progress and correct only within this slice's boundary (lifecycle types, batch riders, closer composition, brief wording)."
+      }
     }
   },
   "edges": {
@@ -212,6 +239,10 @@
       {
         "from": "atlas-root",
         "to": "refine-continual-harness"
+      },
+      {
+        "from": "atlas-root",
+        "to": "turn-step-lifecycle-crash-repair"
       }
     ],
     "requires": [
@@ -246,11 +277,15 @@
       {
         "from": "refine-continual-harness",
         "to": "drive-model-driven-frame-tree"
+      },
+      {
+        "from": "turn-step-lifecycle-crash-repair",
+        "to": "drive-model-driven-frame-tree"
       }
     ]
   },
   "references": {
-    "next": 8,
+    "next": 9,
     "byId": {
       "atlas-root": "S001",
       "execute-agent-code-without-blocking": "S002",
@@ -258,7 +293,8 @@
       "subdivide-session-into-accountable-agents": "S004",
       "run-agent-as-desktop": "S005",
       "drive-model-driven-frame-tree": "S006",
-      "refine-continual-harness": "S007"
+      "refine-continual-harness": "S007",
+      "turn-step-lifecycle-crash-repair": "S008"
     }
   },
   "lifecycle": {
