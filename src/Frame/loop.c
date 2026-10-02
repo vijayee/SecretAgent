@@ -77,6 +77,17 @@
 //      report event into the parent's log, a top frame has no parent log to
 //      bind into and reports into its OWN log.)
 //
+// TURN-LIFECYCLE ENVELOPE (Task 2, the turn-lifecycle slice): every engine
+// action opens/closes the audit envelope — turn.start at the turn entry
+// (after the cap check, before the model dispatch — the derive's scan reply
+// dispatch, because the counter restore reads that scan), step.start riding
+// the turn's first durable record batch (the cell.run audit / the finish
+// batch), and the close [step.end + turn.end {reason}] riding the cell.result
+// batch (tool cycles) or the finish batch (content turns). EVERY live-engine
+// exit closes its turn (the DSH finally-discipline: _loop_fail carries
+// turn.end {error + the control kind}) — the balance is a TESTED RULE
+// (test_loop.cpp). The counter restores once per engine run through the log.
+//
 // MESSAGE-ARRAY CONSTRUCTION SIMPLIFICATION (documented): NO
 // tool_call/tool-role history is reconstructed. Each turn sends a FRESH
 // plain-roles array (system + projected msg.appends + trailing cell results
@@ -106,6 +117,7 @@
 #include "loop.h"
 #include "frame_internal.h"
 #include "frame_messages.h"
+#include "lifecycle.h"
 #include "model.h"
 #include "model_internal.h"
 #include "../Actor/actor.h"
@@ -485,6 +497,116 @@ static void _loop_control(frame_t* f, const char* kind, const char* text) {
   }
 }
 
+/* The turn counter's lazy restore (Task 2 rider 1): the FIRST entry of an
+   engine run restores the current turn's number from the derive's scanned
+   events — the NEWEST recorded lifecycle turn number + 1; no extra round
+   trip (the scan already materialized them). The _frame_restore_seq
+   discipline: monotonic restore, gaps LOGGED LOUD and continued, never a
+   lock, never a second writer — the restore reads, and only the engine's
+   entry writes. A log with no lifecycle records at all (a pre-lifecycle
+   tail — the envelope's absence is not a truncation) starts the counter at
+   1. Malformed lifecycle records skip (the render-not-crash rule; the fold
+   already logged them). */
+static uint64_t _loop_turn_counter_restore(frame_t* f,
+                                           const json_value_t* events) {
+  uint64_t newest = 0;
+  uint64_t last = 0;
+  uint8_t any = 0;
+  size_t n = json_size(events);
+  for (size_t i = 0; i < n; i++) {
+    json_value_t* rec = json_at(events, i);
+    if (rec == NULL) continue;
+    json_value_t* type_v = json_get(rec, "type");
+    json_value_t* payload = json_get(rec, "payload");
+    const char* type_name = (type_v != NULL) ? json_as_string(type_v) : "";
+    if (payload == NULL) continue;
+    if (strcmp(type_name, LIFE_EVENT_TURN_START) != 0 &&
+        strcmp(type_name, LIFE_EVENT_STEP_START) != 0 &&
+        strcmp(type_name, LIFE_EVENT_STEP_END) != 0 &&
+        strcmp(type_name, LIFE_EVENT_TURN_END) != 0) {
+      continue;   /* only the envelope's four numbered types carry turns */
+    }
+    json_value_t* turn_v = json_get(payload, "turn");
+    if (turn_v == NULL || json_type(turn_v) != JSON_INT ||
+        json_as_int(turn_v) < 0) {
+      continue;   /* malformed lifecycle payload: the fold's loud rule
+                     already rendered it; the restore skips it */
+    }
+    uint64_t t = (uint64_t)json_as_int(turn_v);
+    if (any != 0 && t > last && t - last > 1) {
+      log_error("loop: the turn counter restore at '%s' found a gap "
+                "(recorded turn %llu follows turn %llu) — continuing past "
+                "it loud, never inventing a smaller number", frame_sid(f),
+                (unsigned long long)t, (unsigned long long)last);
+    }
+    if (t > newest) newest = t;
+    last = t;
+    any = 1;
+  }
+  return (any != 0) ? newest + 1 : 1;
+}
+
+/* The turn-entry rider (Task 2 rider 1; spec §3): after the turn cap check
+   passed (it gates the FRM_TURN that posted this derive) and before the
+   model dispatch, the engine opens the turn — ONE turn.start record,
+   fire-and-post (the control events' discipline: a refusal logs loud and
+   the engine continues; the close still writes when it can, so the envelope
+   pairs in the log whenever the store accepts). Runs on EVERY cycle
+   including the first; a model-RETRY's re-derive finds the turn open and
+   skips the entry (the retry is the SAME turn, never a renumber). */
+static void _loop_turn_entry(frame_t* f, frame_engine_state_t* e) {
+  if (e->turn_open) return;
+  json_value_t* payload = lifecycle_turn_start_json(e->turn_counter);
+  if (_frame_event_post_fire(f, LIFE_EVENT_TURN_START, payload) != 0) {
+    log_error("loop: turn %llu's turn.start was refused by the store at "
+              "'%s' — continuing loud",
+              (unsigned long long)e->turn_counter, frame_sid(f));
+  }
+  e->turn_open = 1;
+  e->step_open = 0;
+}
+
+/* The failure-path turn close (Task 2 riders 3/4; spec §3's terminal
+   attribution): an ALIVE engine's open turn closes on EVERY exit — the
+   failure's own batch carries turn.end {reason error, text: the control
+   kind's wording verbatim} (a path with no control kind carries the plain
+   detail text), step.end riding BEFORE it when a step durably started (DSH's
+   order), all in ONE atomic fire-and-post batch with the control event when
+   one exists. Never blocks the terminate: a refusal logs loud and the
+   terminate still runs (never hang on a WAL failure). */
+static void _loop_turn_close_fail(frame_t* f, frame_engine_state_t* e,
+                                  const char* kind, const char* text) {
+  if (e == NULL || !e->turn_open) return;
+  const char* names[3];
+  json_value_t* payloads[3];
+  size_t n = 0;
+  if (kind != NULL) {
+    json_value_t* control = json_new_object();
+    json_object_set(control, "kind", json_new_string(kind));
+    json_object_set(control, "text",
+                    (text != NULL) ? json_new_string(text) : json_new_null());
+    names[n] = "control";
+    payloads[n++] = control;
+  }
+  if (e->step_open) {
+    names[n] = LIFE_EVENT_STEP_END;
+    payloads[n] = lifecycle_step_json(e->turn_counter, 1);
+    n++;
+  }
+  names[n] = LIFE_EVENT_TURN_END;
+  payloads[n++] = lifecycle_turn_end_json(
+      e->turn_counter, LIFE_REASON_ERROR, (kind != NULL) ? kind : text);
+  int rc = _frame_event_batch_post_fire(f, names, payloads, n);
+  if (rc != 0) {
+    log_error("loop: the failure close of turn %llu at '%s' was refused "
+              "pre-post — the terminate still runs, never hang",
+              (unsigned long long)e->turn_counter, frame_sid(f));
+  }
+  e->turn_open = 0;   /* the close ATTEMPTED — the fire-and-post refusal is
+                         the store's recorded loud gap, never a spin */
+  e->step_open = 0;
+}
+
 /* The terminal step (defined below the turn engine's handlers; declared
    early — the failure surfaces of this file run ahead of its definition). */
 static void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text);
@@ -501,7 +623,18 @@ static void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text);
    text NULL = the kind alone. Never silent. */
 static void _loop_fail(frame_t* f, frame_engine_state_t* e, const char* kind,
                        const char* text) {
-  if (kind != NULL) _loop_control(f, kind, text);
+  /* The finally-discipline rider (Task 2 riders 3/4): an ALIVE engine's open
+     turn closes error, riding the failure's OWN batch — the control event
+     and the envelope's closers in ONE atomic fire-and-post batch, BEFORE the
+     terminate (the store's FIFO commits the close ahead of a child's report
+     bind). No close, control event: the plain pre-entry failures' paths
+     (turn_open == 0 — the cap refusal NEVER opened the refused turn, so the
+     `turn-limit` reason is emitted by NO writer — spec §5's pin). */
+  if (e != NULL && e->turn_open) {
+    _loop_turn_close_fail(f, e, kind, text);
+  } else if (kind != NULL) {
+    _loop_control(f, kind, text);
+  }
   if (kind == NULL) {
     _frame_engine_terminate(f, 0,
                             (text != NULL) ? text : "engine failed");
@@ -552,6 +685,14 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
   e->store_corr = 0;
   e->turn_cell_corr = 0;
   e->model_retry_step = 0;
+  /* The envelope's compose-time facts die with the engine (the store's
+     records stay the truth): a DEAD engine never carries the counter or an
+     open-turn fact across a restart — the next run's first entry restores
+     the counter through the log (Task 2 rider 1's restore discipline). */
+  e->turn_counter = 0;
+  e->turn_known = 0;
+  e->turn_open = 0;
+  e->step_open = 0;
   if (e->turn_reply != NULL) {
     model_reply_destroy(e->turn_reply);
     e->turn_reply = NULL;
@@ -709,23 +850,38 @@ static void _loop_post_cell_run(frame_t* f, frame_engine_state_t* e,
   e->turn_cell_corr = corr;
   e->phase = FRAME_PHASE_STORE;
   e->store_kind = FRAME_STORE_CELL_RUN;
-  uint64_t seq = 0;
-  int rc = _frame_event_post(f, "cell.run", run_payload, e->store_corr,
-                             _frame_actor(f), &seq);   /* consumes the payload */
+  /* The turn envelope's step.start RIDES the audit batch (Task 2 rider 2):
+     [step.start, cell.run] as ONE atomic awaited batch — the envelope's
+     opener and the turn's first durable record commit together (the same
+     seq pre-allocation + refusal rollback discipline as the single record;
+     the payload compose order puts the envelope first). */
+  const char* names[2] = {LIFE_EVENT_STEP_START, "cell.run"};
+  json_value_t* payloads[2];
+  payloads[0] = lifecycle_step_json(e->turn_counter, 1);
+  payloads[1] = run_payload;   /* OWNED by the batch on every path */
+  uint64_t first_seq = 0;
+  int rc = _frame_event_batch_post(f, names, payloads, 2, e->store_corr,
+                                   _frame_actor(f), &first_seq);
   if (rc != 0) {
     /* The audit line was refused (e.g. a huge cell, logged loud pre-post) —
        fail loud rather than execute an untracked cell. */
+    if (first_seq != 0) {
+      for (size_t i = 2; i > 0; i--) _frame_seq_rollback(f, first_seq + i - 1);
+    }
     e->phase = FRAME_PHASE_NONE;
     e->store_kind = (frame_store_kind_e)0;
     e->store_corr = 0;
-    _frame_seq_rollback(f, seq);
     log_error("loop: cell.run event refused at '%s'", frame_sid(f));
     model_reply_destroy(reply);
+    /* The step.start never committed — step_open stays as the close's
+       compose-time truth (0); the fail closes the TURN (error). */
     _loop_fail(f, e, "audit-error", "cell.run event refused");
     return;
   }
-  /* The model reply rides the engine state to the CELL_RUN reply (which
-     dispatches the cell out of it and destroys it). */
+  /* The step STARTED durably (the audit batch committed it); the model
+     reply rides the engine state to the CELL_RUN reply (which dispatches the
+     cell out of it and destroys it). */
+  e->step_open = 1;
   e->turn_reply = reply;
 }
 
@@ -843,6 +999,31 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
     }
     json_array_append(events, rec);
   }
+
+  /* --- THE TURN ENTRY (Task 2 rider 1; spec §3) ---------------------------
+     After the turn cap check passed (it gates the FRM_TURN that posted this
+     derive — the check runs in _frame_engine_turn) and BEFORE the model
+     dispatch, the engine opens the turn: ONE turn.start record, fire-and-
+     post (the control events' discipline — a refusal logs loud and the
+     engine continues). The entry runs INSIDE this reply dispatch because
+     the counter's lazy restore READS the derive's scanned events (no extra
+     round trip): the FIRST entry of an engine run restores the counter
+     (newest recorded turn + 1 — the _frame_restore_seq discipline: gaps
+     loud, never a lock, never a second writer), later entries +1. A model-
+     RETRY's re-derive finds the turn open and skips the entry (the retry is
+     the SAME turn — never a renumber). A DEAD engine never carries the
+     counter across a restart (frame_start resets; the next run's first
+     entry re-restores through the log). */
+  if (!e->turn_open) {
+    if (!e->turn_known) {
+      e->turn_counter = _loop_turn_counter_restore(f, events);
+      e->turn_known = 1;
+    } else {
+      e->turn_counter += 1;
+    }
+    _loop_turn_entry(f, e);
+  }
+
   json_value_t* messages = _loop_project(f, events);   /* consumes the DOM */
   if (messages == NULL) {
     log_error("loop: the projection failed at '%s'", frame_sid(f));
@@ -917,6 +1098,8 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
       model_reply_destroy(e->turn_reply);
       e->turn_reply = NULL;
     }
+    e->step_open = 0;   /* the audit batch was refused — its step.start never
+                           committed (the store commits nothing half of) */
     log_error("loop: cell.run event refused at '%s'", frame_sid(f));
     _loop_fail(f, e, "audit-error", "cell.run event refused");
     return;
@@ -971,7 +1154,9 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
   /* A synchronous refusal (pending never set — a second in-flight cell,
      a pyrt boot/execute refusal, corr 0): the ENGINE writes the PAIRED
      status-1 cell.result right here (the audit-honesty fix — the refused
-     cell.run line's counterpart), then the next turn re-derives from it. */
+     cell.run line's counterpart) with the envelope riders riding the SAME
+     atomic batch (Task 2 rider 3 — the same composer the PYRT completion
+     uses), then the next turn re-derives from it. */
   json_value_t* result_payload = json_new_object();
   if (result_payload == NULL) {
     log_error("loop: out of memory building the refused cell's paired "
@@ -982,11 +1167,11 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
     json_object_set(result_payload, "status", json_new_int(1));
     json_object_set(result_payload, "text",
                     json_new_string("cell refused before execution"));
-    if (_frame_event_post_fire(f, "cell.result", result_payload) != 0) {
-      log_error("loop: the refused cell's paired cell.result (corr %llu) was "
-                "refused pre-post at '%s' (already logged)",
-                (unsigned long long)e->turn_cell_corr, frame_sid(f));
-    }
+    /* with_riders = the engine's compose-time facts: its open turn closes
+       completed with the refusal's result (the cycle answered, the engine
+       continues); the helper clears the flags when the batch posts. */
+    _frame_engine_result_close_post(f, result_payload,
+                                    (e->turn_open != 0) ? 1 : 0);
   }
   (void)_loop_post_turn(f);   /* resume */
 }
@@ -1043,9 +1228,17 @@ static void _loop_engine_on_finish(frame_t* f, frame_engine_state_t* e, int rc) 
   if (rc != 0) {
     log_error("loop: the turn finish batch was refused (%d) at '%s'",
               rc, frame_sid(f));
+    /* The batch was REFUSED — nothing committed (the store's atomic rule);
+       the turn is still open and the failure close below writes its
+       turn.end {error, commit-error}. */
     _loop_fail(f, e, "commit-error", "turn finish batch refused");
     return;
   }
+  /* The finish batch COMMITTED — with it the envelope's content-turn group
+     (step.start/step.end/turn.end {completed} when the turn was open): the
+     compose-time facts follow the store (the records are the truth). */
+  e->turn_open = 0;
+  e->step_open = 0;
   /* The turn's outcome text (consumed by every branch below). */
   char* text = e->finish_text;
   e->finish_text = NULL;
@@ -1103,6 +1296,14 @@ int _frame_engine_start(frame_t* f) {
   e->engine_failed = 0;
   e->live_children = 0;
   e->finish_text = NULL;
+  /* The lifecycle envelope's state starts UNKNOWN (the first entry restores
+     the counter through the log — the restore discipline; a DEAD engine
+     never carries it across a restart, and a restart of a failed engine on
+     the same record does not either). */
+  e->turn_counter = 0;
+  e->turn_known = 0;
+  e->turn_open = 0;
+  e->step_open = 0;
   e->phase = FRAME_PHASE_NONE;
   e->store_kind = (frame_store_kind_e)0;
   e->store_corr = 0;

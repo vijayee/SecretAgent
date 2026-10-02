@@ -206,6 +206,93 @@ static bool event_is(json_value_t* rec, const char* type_name) {
   return type_v != NULL && strcmp(json_as_string(type_v), type_name) == 0;
 }
 
+/* --- the turn-envelope tests' readers (the records are the frozen shape:
+       {"seq","type","frame","corr","at","cause","payload"}) --------------- */
+
+static long long rec_seq(json_value_t* rec) {
+  json_value_t* seq = json_get(rec, "seq");
+  return (seq != NULL) ? (long long)json_as_int(seq) : -1;
+}
+
+static json_value_t* payload_of(json_value_t* rec) {
+  return json_get(rec, "payload");
+}
+
+static size_t count_type(json_value_t* events, const char* type_name) {
+  size_t n = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), type_name)) n++;
+  }
+  return n;
+}
+
+static long long first_seq_of(json_value_t* events, const char* type_name) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, type_name)) return rec_seq(rec);
+  }
+  return -1;
+}
+
+/* The FIRST record of `type_name` whose payload `turn` matches (NULL when
+   absent — the callers assert on it). */
+static json_value_t* life_record_of_turn(json_value_t* events,
+                                         const char* type_name,
+                                         long long turn) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, type_name)) continue;
+    json_value_t* payload = payload_of(rec);
+    json_value_t* turn_v = (payload != NULL) ? json_get(payload, "turn") : NULL;
+    if (turn_v != NULL && (long long)json_as_int(turn_v) == turn) return rec;
+  }
+  return NULL;
+}
+
+/* Count the records of `type_name` whose payload `turn` matches. */
+static size_t count_turn(json_value_t* events, const char* type_name,
+                         long long turn) {
+  size_t n = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, type_name)) continue;
+    json_value_t* payload = payload_of(rec);
+    json_value_t* turn_v = (payload != NULL) ? json_get(payload, "turn") : NULL;
+    if (turn_v != NULL && (long long)json_as_int(turn_v) == turn) n++;
+  }
+  return n;
+}
+
+/* The FIRST msg.append record with the given role + content (NULL when
+   absent). */
+static json_value_t* find_msg_append(json_value_t* events, const char* role,
+                                     const char* content) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "msg.append")) continue;
+    json_value_t* payload = payload_of(rec);
+    json_value_t* role_v = (payload != NULL) ? json_get(payload, "role") : NULL;
+    json_value_t* content_v =
+        (payload != NULL) ? json_get(payload, "content") : NULL;
+    if (role_v != NULL && content_v != NULL &&
+        strcmp(json_as_string(role_v), role) == 0 &&
+        strcmp(json_as_string(content_v), content) == 0) {
+      return rec;
+    }
+  }
+  return NULL;
+}
+
+/* The turn.end's reason kind ("" when the record is malformed — the caller
+   asserts against a kind name; reading the kind directly pins "the reason
+   is never NULL" without an invented default). */
+static std::string turn_end_kind(json_value_t* rec) {
+  json_value_t* payload = payload_of(rec);
+  json_value_t* reason = (payload != NULL) ? json_get(payload, "reason") : NULL;
+  json_value_t* kind = (reason != NULL) ? json_get(reason, "kind") : NULL;
+  return (kind != NULL) ? std::string(json_as_string(kind)) : std::string();
+}
+
 TEST(TestLoop, TestScriptedLoopRunsCellAndCompletes) {
   py_agent_init();
   frame_config_t cfg = test_config();
@@ -255,17 +342,22 @@ TEST(TestLoop, TestScriptedLoopRunsCellAndCompletes) {
      semantics; see loop.c's REPORT SEMANTICS note). */
   EXPECT_EQ(frame_is_done(f), 1);
 
-  /* Audit trail: exactly four records — cell.run, state.remember (n = 7),
-     frame.report (the cell's own completion report), cell.result. */
+  /* Audit trail: the turn envelope rides the engine's existing batches —
+     turn.start (the turn entry) + step.start riding the cell.run audit
+     batch + the cell's own records + the cell.result batch carrying
+     step.end + turn.end. */
   json_value_t* events = load_events(f);
   ASSERT_NE(events, nullptr);
-  ASSERT_EQ(json_size(events), 4u);
-  ASSERT_TRUE(event_is(json_at(events, 0), "cell.run"));
-  ASSERT_TRUE(event_is(json_at(events, 1), "state.remember"));
-  ASSERT_TRUE(event_is(json_at(events, 2), "frame.report"));
-  ASSERT_TRUE(event_is(json_at(events, 3), "cell.result"));
+  static const char* expected_order[] = {
+      "turn.start", "step.start", "cell.run", "state.remember",
+      "frame.report", "cell.result", "step.end", "turn.end"};
+  ASSERT_EQ(json_size(events), 8u);
+  for (size_t i = 0; i < 8; i++) {
+    EXPECT_TRUE(event_is(json_at(events, i), expected_order[i]))
+        << "record " << i << " was not " << expected_order[i];
+  }
 
-  json_value_t* remember_payload = json_get(json_at(events, 1), "payload");
+  json_value_t* remember_payload = json_get(json_at(events, 3), "payload");
   ASSERT_NE(remember_payload, nullptr);
   EXPECT_STREQ(json_as_string(json_get(remember_payload, "key")), "n");
   EXPECT_EQ(json_as_int(json_get(remember_payload, "value")), 7);
@@ -554,6 +646,291 @@ TEST(TestLoop, TestSilentEmptyTurnLeavesControlTrail) {
   EXPECT_EQ(frame_is_done(f), 1) << "the model chose to stop — the frame ends done";
   json_value_destroy(events);
 
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestEngineRunWritesTheTurnEnvelopeInOrder) {
+  /* A full scripted cycle's log shows the envelope in seq order (the plan's
+     Task-2 step 1): turn.start → step.start (riding the turn's first durable
+     record batch, the cell.run audit) → the turn's records → [cell.result +
+     step.end + turn.end completed] — ONE atomic batch per record group, the
+     payload fields correct (turns count +1 from 1; step 1 within the turn). */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "envelope cycle", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* ONE cycle: the cell remembers + reports — the report ends the frame at
+     turn 1, so the whole run is one turn's envelope. */
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('k', 5)\\nactor.report('done: ' + str(5))\"}"}}]}}]})json";
+  std::vector<std::string> replies = {turn1};
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  /* The log's FIRST record is turn 1's turn.start (the envelope opens the
+     log — nothing ran before the engine). */
+  json_value_t* ts = life_record_of_turn(events, "turn.start", 1);
+  ASSERT_NE(ts, nullptr);
+  EXPECT_EQ(rec_seq(ts), 1);
+
+  /* The envelope types in the frozen order, nothing else between groups
+     beyond the turn's own records. */
+  static const char* order[] = {"turn.start", "step.start", "step.end",
+                                "turn.end"};
+  long long seqs[4];
+  size_t found = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    for (size_t k = 0; k < 4; k++) {
+      if (event_is(rec, order[k])) {
+        seqs[k] = rec_seq(rec);
+        found++;
+      }
+    }
+  }
+  EXPECT_EQ(found, 4u) << "one envelope pair, exactly once";
+  EXPECT_LT(seqs[0], seqs[1]);
+  EXPECT_LT(seqs[1], seqs[2]);
+  EXPECT_LT(seqs[2], seqs[3]);
+
+  /* ONE atomic batch per group: step.start rides the cell.run audit batch;
+     step.end + turn.end ride the cell.result close batch. */
+  long long run_seq = first_seq_of(events, "cell.run");
+  long long res_seq = first_seq_of(events, "cell.result");
+  ASSERT_GT(run_seq, 0);
+  ASSERT_GT(res_seq, 0);
+  EXPECT_EQ(seqs[1], run_seq - 1) << "step.start rides the audit batch";
+  EXPECT_EQ(seqs[2], res_seq + 1) << "step.end rides the result batch";
+  EXPECT_EQ(seqs[3], res_seq + 2) << "turn.end rides the result batch";
+
+  /* The payload fields: turn 1 (+1 from 1), step 1 within the turn, the
+     content turn's close reason completed with NO invented text. */
+  json_value_t* ss = life_record_of_turn(events, "step.start", 1);
+  json_value_t* se = life_record_of_turn(events, "step.end", 1);
+  json_value_t* te = life_record_of_turn(events, "turn.end", 1);
+  ASSERT_NE(ss, nullptr);
+  ASSERT_NE(se, nullptr);
+  ASSERT_NE(te, nullptr);
+  EXPECT_EQ(json_as_int(json_get(payload_of(ss), "step")), 1);
+  EXPECT_EQ(json_as_int(json_get(payload_of(se), "step")), 1);
+  json_value_t* reason = json_get(payload_of(te), "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "completed");
+  EXPECT_EQ(json_get(reason, "text"), nullptr)
+      << "a completed close invents no text";
+
+  EXPECT_EQ(frame_is_done(f), 1);
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestMultiCycleTurnsEachClose) {
+  /* Multi-cycle (the plan's Task-2 step 1): two tool cycles + a final
+     content turn end the engine — turns 1..k each close: tool-path turns
+     via the cell.result batch's [step.end + turn.end {completed}]; the FINAL
+     turn via the finish batch's [step.end + turn.end {completed}] riding the
+     msg.append. Every turn.end's reason is never NULL. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "multi cycle", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"actor.remember('a', 11)\"}"}}]}}]})json";
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"actor.remember('b', 22)\"}"}}]}}]})json";
+  std::string turn3 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"both cells ran"}}]})json";
+  std::vector<std::string> replies = {turn1, turn2, turn3};
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  /* Each turn opens exactly once and closes exactly once, completed. */
+  for (long long k = 1; k <= 3; k++) {
+    json_value_t* ts = life_record_of_turn(events, "turn.start", k);
+    json_value_t* te = life_record_of_turn(events, "turn.end", k);
+    ASSERT_NE(ts, nullptr) << "turn " << k << " never opened";
+    ASSERT_NE(te, nullptr) << "turn " << k << " never closed";
+    /* Exactly one open + one close record carries this turn's number — the
+       envelope pairs once per turn (no double turn.end from a racy close). */
+    EXPECT_EQ(count_turn(events, "turn.start", k), 1u)
+        << "turn " << k << " opened twice";
+    EXPECT_EQ(count_turn(events, "turn.end", k), 1u)
+        << "turn " << k << " closed twice";
+    EXPECT_EQ(turn_end_kind(te), "completed")
+        << "turn " << k << "'s turn.end reason is never NULL";
+
+    json_value_t* ss = life_record_of_turn(events, "step.start", k);
+    json_value_t* se = life_record_of_turn(events, "step.end", k);
+    ASSERT_NE(ss, nullptr) << "turn " << k << "'s step never started";
+    ASSERT_NE(se, nullptr) << "turn " << k << "'s step never ended";
+    EXPECT_EQ(json_as_int(json_get(payload_of(ss), "step")), 1);
+    EXPECT_EQ(json_as_int(json_get(payload_of(se), "step")), 1);
+    EXPECT_LT(rec_seq(ts), rec_seq(ss));
+    EXPECT_LT(rec_seq(ss), rec_seq(se));
+    EXPECT_LT(rec_seq(se), rec_seq(te));
+  }
+
+  /* The tool turns' pairs ride the audit/result batches: step.start at
+     cell.run-1; step.end and turn.end at cell.result+1, +2. */
+  std::vector<long long> run_seqs, res_seqs;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "cell.run")) run_seqs.push_back(rec_seq(rec));
+    if (event_is(rec, "cell.result")) res_seqs.push_back(rec_seq(rec));
+  }
+  ASSERT_EQ(run_seqs.size(), 2u);
+  ASSERT_EQ(res_seqs.size(), 2u);
+  for (size_t k = 0; k < 2; k++) {
+    json_value_t* ss = life_record_of_turn(
+        events, "step.start", (long long)k + 1);
+    json_value_t* se = life_record_of_turn(events, "step.end", (long long)k + 1);
+    json_value_t* te =
+        life_record_of_turn(events, "turn.end", (long long)k + 1);
+    ASSERT_NE(ss, nullptr);
+    ASSERT_NE(se, nullptr);
+    ASSERT_NE(te, nullptr);
+    EXPECT_EQ(rec_seq(ss), run_seqs[k] - 1) << "step.start rides the audit";
+    EXPECT_EQ(rec_seq(se), res_seqs[k] + 1) << "step.end rides the result";
+    EXPECT_EQ(rec_seq(te), res_seqs[k] + 2) << "turn.end rides the result";
+  }
+
+  /* The FINAL content turn's finish batch is ONE atomic group:
+     [step.start, msg.append, step.end, turn.end] contiguous. */
+  json_value_t* m = find_msg_append(events, "assistant", "both cells ran");
+  ASSERT_NE(m, nullptr);
+  long long m_seq = rec_seq(m);
+  json_value_t* ss3 = life_record_of_turn(events, "step.start", 3);
+  json_value_t* se3 = life_record_of_turn(events, "step.end", 3);
+  json_value_t* te3 = life_record_of_turn(events, "turn.end", 3);
+  ASSERT_NE(ss3, nullptr);
+  ASSERT_NE(se3, nullptr);
+  ASSERT_NE(te3, nullptr);
+  EXPECT_EQ(rec_seq(ss3), m_seq - 1) << "step.start rides the finish batch";
+  EXPECT_EQ(rec_seq(se3), m_seq + 1) << "step.end rides the finish batch";
+  EXPECT_EQ(rec_seq(te3), m_seq + 2) << "turn.end rides the finish batch";
+
+  EXPECT_EQ(frame_is_done(f), 1);
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestTurnCapRefusesBeforeTurnEntry) {
+  /* The turn cap (the plan's Task-2 step 1): cap=1 — the second cycle's cap
+     check fails BEFORE turn entry: the refused turn's turn.start never
+     commits; the engine ends failed with the control "turn-limit" event;
+     the log's newest lifecycle record is still turn 1's turn.end
+     (balanced). `turn-limit` is emitted by NO writer (spec §5) — no
+     turn.end carries it. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "one turn only", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string fallback =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"pass\"}"}}]}}]})json";
+  std::vector<std::string> replies = {};
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = &fallback;
+  frame_set_loop_turn_cap(f, 1);
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_NE(frame_run_loop(f), 0) << "the cap is a failure, loud";
+  EXPECT_EQ(frame_is_done(f), 0) << "the cap refusal makes no status change";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  ASSERT_EQ(count_type(events, "turn.start"), 1u)
+      << "only the admitted turn opened";
+  EXPECT_EQ(json_as_int(json_get(payload_of(life_record_of_turn(
+                                     events, "turn.start", 1)), "turn")), 1);
+  ASSERT_EQ(count_type(events, "turn.end"), 1u)
+      << "only the admitted turn closed";
+  json_value_t* te = life_record_of_turn(events, "turn.end", 1);
+  ASSERT_NE(te, nullptr);
+  EXPECT_EQ(turn_end_kind(te), "completed");
+
+  ASSERT_EQ(count_type(events, "cell.run"), 1u);
+  ASSERT_EQ(count_type(events, "cell.result"), 1u);
+
+  /* The turn-limit control event committed AFTER turn 1's close — and no
+     turn.start for the refused turn anywhere. */
+  size_t n_limit = 0;
+  long long limit_seq = -1;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "control")) {
+      json_value_t* p = payload_of(rec);
+      json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+      if (k != NULL && strcmp(json_as_string(k), "turn-limit") == 0) {
+        n_limit++;
+        limit_seq = rec_seq(rec);
+      }
+    }
+  }
+  ASSERT_EQ(n_limit, 1u);
+  ASSERT_GT(limit_seq, 0);
+  EXPECT_EQ(limit_seq, rec_seq(te) + 1)
+      << "the cap refusal ran right after turn 1's close";
+
+  /* Balanced: turn 1's turn.end is the NEWEST lifecycle record. */
+  long long newest_life = -1;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "turn.start") || event_is(rec, "turn.end") ||
+        event_is(rec, "step.start") || event_is(rec, "step.end")) {
+      newest_life = rec_seq(rec);
+    }
+  }
+  EXPECT_EQ(newest_life, rec_seq(te));
+
+  json_value_destroy(events);
   frame_destroy(f);
   wave_db_close(db);
 }
@@ -889,6 +1266,234 @@ TEST(TestLoop, TestRestartReplayRestoresSeqAndContext) {
   json_value_destroy(events);
 
   frame_destroy(again2);
+  wave_db_close(db);
+  std::filesystem::remove_all(dir);
+}
+
+/* --- turn lifecycle envelope (the plan's Task-2 step 1; python-gated
+       siblings above; these two run WITHOUT a cell ever executing) -------- */
+
+/* Hand-composed event record for the lifecycle tests' seeds — the frozen
+   record shape frame.c composes: {"seq","type","frame","corr","at","cause",
+   "payload"}.  step < 0 renders the field absent; reason_kind NULL renders
+   no reason object. */
+static std::string make_record_json(long long seq,
+                                    const std::string& sid_path,
+                                    const char* type_name, long long turn,
+                                    long long step, const char* reason_kind) {
+  json_value_t* rec = json_new_object();
+  EXPECT_NE(rec, nullptr);
+  json_object_set(rec, "seq", json_new_int(seq));
+  json_object_set(rec, "type", json_new_string(type_name));
+  json_object_set(rec, "frame", json_new_string(sid_path.c_str()));
+  json_object_set(rec, "corr", json_new_null());
+  json_object_set(rec, "at", json_new_string("2026-10-01T00:00:00Z"));
+  json_object_set(rec, "cause",
+                  (seq > 1) ? json_new_int(seq - 1) : json_new_null());
+  json_value_t* payload = json_new_object();
+  json_object_set(payload, "turn", json_new_int(turn));
+  if (step >= 0) json_object_set(payload, "step", json_new_int(step));
+  if (reason_kind != NULL) {
+    json_value_t* reason = json_new_object();
+    json_object_set(reason, "kind", json_new_string(reason_kind));
+    json_object_set(payload, "reason", reason);
+  }
+  json_object_set(rec, "payload", payload);
+  char* text = json_serialize(rec);
+  json_value_destroy(rec);
+  EXPECT_NE(text, nullptr);
+  std::string out((text != nullptr) ? text : "");
+  free(text);
+  return out;
+}
+
+TEST(TestLoop, TestModelFailureClosesTheTurnWithError) {
+  /* The failure surface closes (the plan's Task-2 step 1 — the DSH
+     finally-discipline as a TESTED RULE): a scripted model error twice →
+     model-error-final — the turn's turn.end carries reason "error" + text
+     "model-error-final"; the failed turn still opened (turn.start committed
+     at entry) and gets its own turn.end — NO turn is ever left open by an
+     alive engine. Python-independent: the model never replies, no cell ever
+     runs. */
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "fail twice", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  recording_model_t rm = {};   /* the EMPTY queue errors on every call */
+  rm.base.complete = recording_complete;
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_NE(frame_run_loop(f), 0) << "the engine failed loud";
+  EXPECT_EQ(frame_is_done(f), 0) << "a failed TOP frame keeps its status";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  /* The turn OPENED at entry; the model-error retry re-derived the SAME
+     turn — one turn.start only. */
+  ASSERT_EQ(count_type(events, "turn.start"), 1u);
+  json_value_t* ts = life_record_of_turn(events, "turn.start", 1);
+  ASSERT_NE(ts, nullptr);
+  EXPECT_EQ((long long)json_as_int(json_get(payload_of(ts), "turn")), 1);
+
+  /* No step was ever entered — the model never replied. */
+  EXPECT_EQ(count_type(events, "step.start"), 0u);
+  EXPECT_EQ(count_type(events, "step.end"), 0u);
+
+  /* The controls: "model-error" (the retry's) then "model-error-final",
+     committed in that order (the store's FIFO). */
+  size_t n_error = 0;
+  long long final_seq = -1;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    if (k == NULL) continue;
+    if (strcmp(json_as_string(k), "model-error") == 0) n_error++;
+    if (strcmp(json_as_string(k), "model-error-final") == 0) {
+      final_seq = rec_seq(rec);
+    }
+  }
+  EXPECT_EQ(n_error, 1u);
+  ASSERT_GT(final_seq, 0);
+
+  /* THE CLOSE (the tested finally-rule): turn.end {turn 1, error, text
+     "model-error-final"} AFTER the final control — one close per failure. */
+  ASSERT_EQ(count_type(events, "turn.end"), 1u);
+  json_value_t* te = life_record_of_turn(events, "turn.end", 1);
+  ASSERT_NE(te, nullptr);
+  EXPECT_GT(rec_seq(te), rec_seq(ts));
+  EXPECT_GT(rec_seq(te), final_seq) << "the close rides the failure's batch";
+  EXPECT_EQ(turn_end_kind(te), "error");
+  json_value_t* reason = json_get(payload_of(te), "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reason, "text")), "model-error-final");
+
+  /* Balanced: the turn.end is the NEWEST lifecycle record in the log. */
+  long long newest_life = -1;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "turn.start") || event_is(rec, "turn.end") ||
+        event_is(rec, "step.start") || event_is(rec, "step.end")) {
+      newest_life = rec_seq(rec);
+    }
+  }
+  EXPECT_EQ(newest_life, rec_seq(te));
+
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestTurnNumbersRestoreFromTheLog) {
+  /* The turn-number restore (the plan's Task-2 step 1): seed a session with
+     lifecycle records (turn 3 committed pre-restart), then start the
+     engine — its first turn is 4 (restored from the log, never renumbered
+     from 1). A DEAD engine never carries the counter across a restart: this
+     runs a fully separate engine process-shape (destroyed frame, reopened
+     db). */
+  frame_config_t cfg = test_config();
+  std::string dir = temp_dir_mkdtemp_sa();
+  ASSERT_FALSE(dir.empty());
+  std::string loc = dir + "/db";
+
+  /* Session 1: create the frame and hand-seed turns 1..3, balanced
+     (turn.start/step.start/step.end/turn.end for each), seqs 1..12. */
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "turn restore", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+
+  static const char* per_turn_types[4] = {"turn.start", "step.start",
+                                          "step.end", "turn.end"};
+  frm_store_op_t* seed = (frm_store_op_t*)get_clear_memory(12 * sizeof(frm_store_op_t));
+  ASSERT_NE(seed, nullptr);
+  for (size_t i = 0; i < 12; i++) {
+    long long seq = (long long)i + 1;
+    long long turn = (long long)(i / 4) + 1;
+    const char* type = per_turn_types[i % 4];
+    std::string record =
+        make_record_json(seq, sid, type, turn, (i % 4 == 0) ? -1 : 1,
+                         (i % 4 == 3) ? "completed" : NULL);
+    char key[96];
+    snprintf(key, sizeof(key), "%s/events/%020lld", sid.c_str(),
+             (long long)seq);
+    seed[i].key = strdup(key);
+    seed[i].value = (uint8_t*)strdup(record.c_str());
+    seed[i].value_len = record.size();
+  }
+  EXPECT_EQ(_frame_sync_batch(f, seed, 12, "lifecycle seed"), 0);
+  json_value_t* seedy = load_events(f);
+  ASSERT_NE(seedy, nullptr);
+  EXPECT_EQ(json_size(seedy), 12u) << "the seed committed as normal events";
+  json_value_destroy(seedy);
+
+  frame_destroy(f);   /* durable close — the engine of session 1 is DEAD */
+  wave_db_close(db);
+
+  /* Session 2: a resumed frame runs ONE content turn — its engine has NO
+     in-memory counter to inherit; the first entry's restore reads the log. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* resumed = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr);
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"resumed past the seed"}}]})json");
+  frame_set_model_backend(resumed, &rm.base);
+  EXPECT_EQ(frame_run_loop(resumed), 0);
+  EXPECT_EQ(frame_is_done(resumed), 1);
+  frame_destroy(resumed);
+  wave_db_close(db);
+
+  /* Session 3: the reads (a write committed after a reopen is invisible to
+     the SAME session's scans — the recorded WaveDB defect; a fresh session
+     sees them). */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* handle = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(handle, nullptr);
+  json_value_t* events = load_events(handle);
+  ASSERT_NE(events, nullptr);
+
+  /* Exactly the seeded turns 1..3 + the engine's restored turn 4 — the
+     counter restored from the log, never renumbered from 1. */
+  for (long long k = 1; k <= 4; k++) {
+    EXPECT_EQ(count_turn(events, "turn.start", k), 1u)
+        << "turn " << k << "'s turn.start";
+    EXPECT_EQ(count_turn(events, "turn.end", k), 1u)
+        << "turn " << k << "'s turn.end";
+  }
+  EXPECT_EQ(count_type(events, "turn.start"), 4u) << "no extra turns written";
+  EXPECT_EQ(count_type(events, "turn.end"), 4u);
+
+  /* Turn 4's envelope rode its finish batch: [step.start, msg.append,
+     step.end, turn.end] contiguous, with turn.start earlier. */
+  json_value_t* m = find_msg_append(events, "assistant", "resumed past the seed");
+  ASSERT_NE(m, nullptr);
+  long long m_seq = rec_seq(m);
+  json_value_t* ss4 = life_record_of_turn(events, "step.start", 4);
+  json_value_t* se4 = life_record_of_turn(events, "step.end", 4);
+  json_value_t* te4 = life_record_of_turn(events, "turn.end", 4);
+  json_value_t* ts4 = life_record_of_turn(events, "turn.start", 4);
+  ASSERT_NE(ss4, nullptr);
+  ASSERT_NE(se4, nullptr);
+  ASSERT_NE(te4, nullptr);
+  ASSERT_NE(ts4, nullptr);
+  EXPECT_EQ(rec_seq(ss4), m_seq - 1);
+  EXPECT_EQ(rec_seq(se4), m_seq + 1);
+  EXPECT_EQ(rec_seq(te4), m_seq + 2);
+  EXPECT_LT(rec_seq(ts4), m_seq - 1);
+  EXPECT_EQ(turn_end_kind(te4), "completed");
+  EXPECT_EQ(json_as_int(json_get(payload_of(ss4), "step")), 1);
+
+  json_value_destroy(events);
+  frame_destroy(handle);
   wave_db_close(db);
   std::filesystem::remove_all(dir);
 }

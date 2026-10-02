@@ -1511,6 +1511,109 @@ TEST(TestFrame, TestInlineParentYieldsAwaitingChildren) {
   wave_db_close(db);
 }
 
+TEST(TestFrame, TestChildrenYieldTurnEndRidesTheFinishBatch) {
+  /* The children-yield shape (the plan's Task-2 step 1): a content turn with
+     live children pending yields at the finish reply (status stays running)
+     — the yield's turn.end {reason completed} rides the SAME batch as the
+     msg.append, and NO status put rides it. The yield batch's event record
+     group is contiguous by seq — one atomic commit, nothing half-committed
+     on the yield's seq boundary. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  frame_t* parent = frame_create(db, NULL, "inline yield batch", &cfg);
+  ASSERT_NE(parent, nullptr);
+  goal_keyed_model_t gk = {};   /* zero-init: the vtable's members set below */
+  gk.base.complete = goal_keyed_complete;
+  gk.queues["inline yield batch"].push_back(canned_cell_body(
+      "import actor\nactor.spawn('leaf goal', None)\nprint('spawned')"));
+  gk.queues["inline yield batch"].push_back(
+      canned_content_body("parent waits on the leaf"));
+  gk.queues["leaf goal"].push_back(canned_content_body("leaf done quietly"));
+  frame_set_model_backend(parent, &gk.base);
+
+  EXPECT_EQ(frame_run_loop(parent), 2) << "yielded awaiting children";
+  /* The driver drained the store before returning: the YIELD batch (with its
+     envelope riders) has committed — and no status put rode it. */
+  EXPECT_EQ(frame_is_done(parent), 0)
+      << "the yield batch leaves the frame running (the resuming turn's own "
+         "finish batch writes done)";
+
+  json_value_t* events = load_events(parent);
+  ASSERT_NE(events, nullptr);
+
+  /* Locate the yield's msg.append and read the batch around it by seq. */
+  json_value_t* m = nullptr;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "msg.append")) continue;
+    json_value_t* p = json_get(rec, "payload");
+    if (p != NULL && json_get(p, "role") != NULL &&
+        strcmp(json_as_string(json_get(p, "role")), "assistant") == 0 &&
+        json_get(p, "content") != NULL &&
+        strcmp(json_as_string(json_get(p, "content")),
+               "parent waits on the leaf") == 0) {
+      m = rec;
+      break;
+    }
+  }
+  ASSERT_NE(m, nullptr) << "the yield's msg.append committed";
+  long long m_seq = (long long)json_as_int(json_get(m, "seq"));
+
+  /* The record AT each adjacent seq (by binary position in the ascending
+     scan — the log's own seq order). */
+  json_value_t* ss = nullptr;
+  json_value_t* se = nullptr;
+  json_value_t* te = nullptr;
+  json_value_t* ts2 = nullptr;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    long long s = (long long)json_as_int(json_get(rec, "seq"));
+    if (s == m_seq - 1) ss = rec;
+    if (s == m_seq + 1) se = rec;
+    if (s == m_seq + 2) te = rec;
+    if (event_is(rec, "turn.start")) {
+      json_value_t* p = json_get(rec, "payload");
+      if (p != NULL && json_get(p, "turn") != NULL &&
+          (long long)json_as_int(json_get(p, "turn")) == 2) {
+        ts2 = rec;
+      }
+    }
+  }
+  ASSERT_NE(ss, nullptr) << "the yield batch's step.start (m_seq-1)";
+  ASSERT_NE(se, nullptr) << "the yield batch's step.end (m_seq+1)";
+  ASSERT_NE(te, nullptr) << "the yield batch's turn.end (m_seq+2)";
+  ASSERT_NE(ts2, nullptr) << "turn 2 opened before the batch";
+
+  EXPECT_TRUE(event_is(ss, "step.start"));
+  EXPECT_TRUE(event_is(se, "step.end"));
+  EXPECT_TRUE(event_is(te, "turn.end"));
+
+  /* Contiguity IS the atomicity: the four records of the yield batch carry
+     seqs m-1..m+2 — nothing interleaved, nothing half-committed, no gap. */
+  json_value_t* pss = json_get(ss, "payload");
+  json_value_t* pse = json_get(se, "payload");
+  json_value_t* pte = json_get(te, "payload");
+  ASSERT_NE(pss, nullptr);
+  ASSERT_NE(pse, nullptr);
+  ASSERT_NE(pte, nullptr);
+  EXPECT_EQ((long long)json_as_int(json_get(pss, "turn")), 2);
+  EXPECT_EQ((long long)json_as_int(json_get(pss, "step")), 1);
+  EXPECT_EQ((long long)json_as_int(json_get(pse, "turn")), 2);
+  EXPECT_EQ((long long)json_as_int(json_get(pse, "step")), 1);
+  EXPECT_EQ((long long)json_as_int(json_get(pte, "turn")), 2);
+  json_value_t* reason = json_get(pte, "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "completed")
+      << "the yield's turn ends completed (spec §4.6's pin)";
+  EXPECT_LT((long long)json_as_int(json_get(ts2, "seq")), m_seq - 1);
+
+  json_value_destroy(events);
+  frame_destroy(parent);   /* the CHILD's record dies with the parent's
+                              teardown list (the engine-less caller's shape) */
+  wave_db_close(db);
+}
+
 #endif /* python gate */
 
 #endif /* SA_HAS_WDB */

@@ -6,6 +6,7 @@
 #include "frame_internal.h"
 #include "frame_messages.h"
 #include "frame_bridge.h"
+#include "lifecycle.h"
 #include "../Util/allocator.h"
 #include "../Util/json.h"
 #include "../Util/log.h"
@@ -770,12 +771,17 @@ frame_engine_state_t* _frame_engine_state(frame_t* f) {
 }
 
 /* The content path's ONE atomic turn-end batch (frame_internal.h's
-   contract): the assistant msg.append — or, on an empty assistant turn, the
-   empty-turn control event (the exact payload _loop_control composes) — at
-   the frame's PRE-ALLOCATED seq, plus the meta/status=done put for a TOP
-   engine, in ONE root batch. The old loop wrote msg.append and the status as
-   two separate awaited writes; one atomic batch keeps the turn's message +
-   its completion from ever half-applying. */
+   contract): the envelope riders + the assistant msg.append — or, on an
+   empty assistant turn, the empty-turn control event (the exact payload
+   _loop_control composes) — plus the meta/status=done put for a TOP engine,
+   in ONE root batch. The rider group (Task 2; spec §3): a content turn whose
+   engine state has the turn open composes step.start, step.end AND
+   turn.end {reason completed} in THIS batch — the batch is the turn's first
+   durable record (it is the content turn's whole cycle), so the step opens
+   and closes with its records, and the turn closes with the TERMINAL
+   attribution (the children-yield case ends the turn completed too — the
+   completion rides the batch; resuming turns later never re-close it). A
+   refused compose rolls the whole pre-allocated seq range back. */
 int _frame_engine_finish_post(frame_t* f, const char* append_text,
                               int write_status, uint64_t corr,
                               actor_t* reply_to) {
@@ -783,10 +789,29 @@ int _frame_engine_finish_post(frame_t* f, const char* append_text,
     log_error("frame: finish batch on a dead frame");
     return -1;
   }
+  /* The envelope riders (the compose-time facts on the engine state; the
+     store's records stay the truth). */
+  uint8_t ride = (f->engine.engine_live != 0 && f->engine.turn_open != 0 &&
+                  f->engine.step_open == 0)
+                     ? 1 : 0;
+  json_value_t* rider[3];   /* step.start, step.end, turn.end */
+  rider[0] = NULL;
+  rider[1] = NULL;
+  rider[2] = NULL;
+  if (ride != 0) {
+    rider[0] = lifecycle_step_json(f->engine.turn_counter, 1);
+    rider[1] = lifecycle_step_json(f->engine.turn_counter, 1);
+    rider[2] = lifecycle_turn_end_json(f->engine.turn_counter,
+                                       LIFE_REASON_COMPLETED, NULL);
+  }
+
   json_value_t* payload = json_new_object();
   const char* type_name = (append_text != NULL) ? "msg.append" : "control";
   if (payload == NULL) {
     log_error("frame: out of memory building the finish payload");
+    if (rider[0] != NULL) json_value_destroy(rider[0]);
+    if (rider[1] != NULL) json_value_destroy(rider[1]);
+    if (rider[2] != NULL) json_value_destroy(rider[2]);
     return -1;
   }
   if (append_text != NULL) {
@@ -797,21 +822,61 @@ int _frame_engine_finish_post(frame_t* f, const char* append_text,
     json_object_set(payload, "text", json_new_null());
   }
 
-  uint64_t seq = _frame_seq_alloc(f);
-  char* text = _frame_event_json(f, seq, type_name, payload);  /* consumes payload */
-  char* evkey = (text != NULL) ? _frame_event_key(f->sid_path, seq) : NULL;
+  /* This batch is the turn's FIRST durable record batch: allocate the seqs
+     for the whole record group up front (the single-flight compose). */
+  size_t nev = (ride != 0) ? 4 : 1;   /* step.start, main, step.end, turn.end */
+  uint64_t seq = 0;
+  for (size_t i = 0; i < nev; i++) {
+    uint64_t s = _frame_seq_alloc(f);
+    if (i == 0) seq = s;
+  }
+  char* evtexts[4];
+  char* evkeys[4];
+  memset(evtexts, 0, sizeof(evtexts));
+  memset(evkeys, 0, sizeof(evkeys));
+  const char* evtypes[4];
+  evtypes[0] = (ride != 0) ? LIFE_EVENT_STEP_START : type_name;
+  evtypes[1] = type_name;
+  evtypes[2] = (ride != 0) ? LIFE_EVENT_STEP_END : NULL;
+  evtypes[3] = (ride != 0) ? LIFE_EVENT_TURN_END : NULL;
+  json_value_t* main_payloads[4];
+  main_payloads[0] = rider[0];
+  main_payloads[1] = payload;
+  main_payloads[2] = rider[1];
+  main_payloads[3] = rider[2];
+  int rc = 0;
+  size_t composed = 0;   /* records whose payload already consumed */
+  for (size_t i = 0; i < nev; i++) {
+    evtexts[i] = _frame_event_json(f, seq + i, evtypes[i], main_payloads[i]);
+    composed = i + 1;
+    if (evtexts[i] == NULL) {
+      rc = -1;
+      break;
+    }
+  }
+  if (rc == 0) {
+    for (size_t i = 0; i < nev; i++) {
+      evkeys[i] = _frame_event_key(f->sid_path, seq + i);
+      if (evkeys[i] == NULL) {
+        rc = -1;
+        break;
+      }
+    }
+  }
   char* status_val = (write_status != 0)
       ? (char*)get_memory(strlen(SA_FRAME_STATUS_DONE) + 1) : NULL;
   if (status_val != NULL) {
     memcpy(status_val, SA_FRAME_STATUS_DONE, strlen(SA_FRAME_STATUS_DONE) + 1);
   }
-  frm_store_op_t put_ops[2];   /* zeroed: is_delete is not a composer's field */
+  frm_store_op_t put_ops[5];   /* zeroed: is_delete is not a composer's field */
   memset(put_ops, 0, sizeof(put_ops));
   size_t nops = 0;
-  put_ops[nops].key = evkey;                    /* OWNED by the round trip */
-  put_ops[nops].value = (uint8_t*)text;         /* OWNED */
-  put_ops[nops].value_len = (text != NULL) ? strlen(text) : 0;
-  nops++;
+  for (size_t i = 0; i < nev; i++) {
+    put_ops[nops].key = evkeys[i];              /* OWNED by the round trip */
+    put_ops[nops].value = (uint8_t*)evtexts[i]; /* OWNED */
+    put_ops[nops].value_len = (evtexts[i] != NULL) ? strlen(evtexts[i]) : 0;
+    nops++;
+  }
   if (status_val != NULL) {
     char* k_status = _frame_subkey(f->sid_path, "meta/status");
     put_ops[nops].key = k_status;               /* OWNED */
@@ -827,38 +892,31 @@ int _frame_engine_finish_post(frame_t* f, const char* append_text,
     if (put_ops[i].key == NULL || put_ops[i].value == NULL) {
       log_error("frame: out of memory composing the finish batch at '%s'",
                 f->sid_path);
-      for (size_t j = 0; j < nops; j++) {
-        free((void*)put_ops[j].key);
-        free((void*)put_ops[j].value);
-      }
-      _frame_seq_rollback(f, seq);
-      return -1;
+      rc = -1;
+      break;
     }
     total += strlen(put_ops[i].key) + put_ops[i].value_len;
   }
-  if (total > SA_FRAME_MAX_BATCH_BYTES) {
+  if (rc == 0 && total > SA_FRAME_MAX_BATCH_BYTES) {
     log_error("frame: the finish batch at '%s' is %zu bytes, exceeding the "
               "%d-byte WAL batch cap — refusing, never truncating",
               f->sid_path, total, (int)SA_FRAME_MAX_BATCH_BYTES);
+    rc = -3;
+  }
+  if (rc != 0) {
     for (size_t i = 0; i < nops; i++) {
       free((void*)put_ops[i].key);
       free((void*)put_ops[i].value);
     }
-    _frame_seq_rollback(f, seq);
-    return -1;
+    for (size_t j = composed; j < nev; j++) {
+      json_value_destroy(main_payloads[j]);
+    }
+    for (size_t i = nev; i > 0; i--) _frame_seq_rollback(f, seq + i - 1);
+    return rc;
   }
 
   frm_store_batch_payload_t* bp =
       (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
-  if (bp == NULL) {
-    log_error("frame: out of memory building the finish batch");
-    for (size_t i = 0; i < nops; i++) {
-      free((void*)put_ops[i].key);
-      free((void*)put_ops[i].value);
-    }
-    _frame_seq_rollback(f, seq);
-    return -1;
-  }
   bp->ops = (frm_store_op_t*)get_clear_memory(nops * sizeof(frm_store_op_t));
   if (bp->ops == NULL) {
     log_error("frame: out of memory building the finish batch");
@@ -866,7 +924,7 @@ int _frame_engine_finish_post(frame_t* f, const char* append_text,
       free((void*)put_ops[i].key);
       free((void*)put_ops[i].value);
     }
-    _frame_seq_rollback(f, seq);
+    for (size_t i = nev; i > 0; i--) _frame_seq_rollback(f, seq + i - 1);
     free(bp);
     return -1;
   }
@@ -1230,6 +1288,177 @@ int _frame_event_post_fire(frame_t* f, const char* type_name,
   uint64_t seq = 0;
   int rc = _frame_event_post(f, type_name, payload, 0, NULL, &seq);
   if (rc != 0) _frame_seq_rollback(f, seq);
+  return rc;
+}
+
+/* ONE ATOMIC multi-record EVENT batch (frame_internal.h's contract): every
+   op is an event record at the frame's pre-allocated seqs, composed per seq,
+   posted as ONE FRM_STORE_BATCH. CONSUMES every payload on every path. */
+int _frame_event_batch_post(frame_t* f, const char** type_names,
+                            json_value_t** payloads, size_t nops,
+                            uint64_t corr, actor_t* reply_to,
+                            uint64_t* first_seq_out) {
+  if (first_seq_out != NULL) *first_seq_out = 0;
+  if (nops == 0) return 0;   /* nothing to post — a posted nothing */
+  if (type_names == NULL || payloads == NULL) {
+    log_error("frame: event batch needs type names and payloads");
+    for (size_t i = 0; i < nops; i++) json_value_destroy(payloads[i]);
+    return -1;
+  }
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: event batch on a dead frame");
+    for (size_t i = 0; i < nops; i++) json_value_destroy(payloads[i]);
+    return -1;
+  }
+  /* The seqs pre-allocate CONTIGUOUSLY in one stretch (the compose is
+     single-flight — the frame's ONE dispatch thread composes and posts
+     without another allocation in between), so the record group's keys are
+     first..first+n-1 and the rollback runs in reverse order. */
+  uint64_t first = 0;
+  for (size_t i = 0; i < nops; i++) {
+    uint64_t s = _frame_seq_alloc(f);
+    if (i == 0) first = s;
+  }
+  if (first_seq_out != NULL) *first_seq_out = first;
+
+  char** texts = (char**)get_clear_memory(nops * sizeof(char*));
+  char** keys = (char**)get_clear_memory(nops * sizeof(char*));
+  if (texts == NULL || keys == NULL) {
+    log_error("frame: out of memory composing the event batch");
+    for (size_t i = 0; i < nops; i++) {
+      free(texts != NULL ? texts[i] : NULL);
+      free(keys != NULL ? keys[i] : NULL);
+    }
+    free(texts);
+    free(keys);
+    return -1;
+  }
+  size_t composed = nops;
+  size_t total = 0;
+  int rc = 0;
+  for (size_t i = 0; i < nops; i++) {
+    texts[i] = _frame_event_json(f, first + i, type_names[i], payloads[i]);
+    /* _frame_event_json CONSUMES the payload (on failure too). */
+    if (texts[i] == NULL) {
+      composed = i + 1;
+      rc = -1;
+      break;
+    }
+  }
+  if (rc == 0) {
+    for (size_t j = 0; j < nops; j++) {
+      if (strlen(texts[j]) > SA_FRAME_MAX_BATCH_BYTES) {
+        log_error("frame: event record %zu bytes exceeds the %d-byte WAL "
+                  "batch cap — refusing, never truncating",
+                  strlen(texts[j]), (int)SA_FRAME_MAX_BATCH_BYTES);
+        rc = -3;
+        break;
+      }
+      total += strlen(texts[j]);
+    }
+  }
+  if (rc == 0) {
+    for (size_t j = 0; j < nops; j++) {
+      keys[j] = _frame_event_key(f->sid_path, first + j);
+      if (keys[j] == NULL) {
+        rc = -1;
+        break;
+      }
+      total += strlen(keys[j]);
+    }
+    if (rc == 0 && total > SA_FRAME_MAX_BATCH_BYTES) {
+      log_error("frame: the event batch at '%s' is %zu bytes, exceeding the "
+                "%d-byte WAL batch cap — refusing, never truncating",
+                f->sid_path, total, (int)SA_FRAME_MAX_BATCH_BYTES);
+      rc = -3;
+    }
+  }
+  if (rc != 0) {
+    for (size_t j = 0; j < nops; j++) {
+      free(texts[j]);
+      free(keys[j]);
+    }
+    free(texts);
+    free(keys);
+    for (size_t j = composed; j < nops; j++) json_value_destroy(payloads[j]);
+    return rc;
+  }
+
+  frm_store_batch_payload_t* bp =
+      get_clear_memory(sizeof(frm_store_batch_payload_t));
+  bp->ops = get_clear_memory(nops * sizeof(frm_store_op_t));
+  if (bp->ops == NULL) {
+    log_error("frame: out of memory building the event batch");
+    for (size_t j = 0; j < nops; j++) {
+      free(texts[j]);
+      free(keys[j]);
+    }
+    free(texts);
+    free(keys);
+    return -1;
+  }
+  for (size_t j = 0; j < nops; j++) {
+    bp->ops[j].key = keys[j];              /* OWNED: the store behavior frees */
+    bp->ops[j].value = (uint8_t*)texts[j]; /* OWNED */
+    bp->ops[j].value_len = strlen(texts[j]);
+  }
+  bp->nops = nops;
+  bp->op_name = (type_names[0] != NULL) ? type_names[0] : "event batch";
+  bp->reply_to = reply_to;
+  bp->corr = corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
+              frm_store_batch_payload_destroy, "event batch");
+  free(texts);   /* the arrays only; the strings moved into the ops */
+  free(keys);
+  return 0;
+}
+
+/* The fire-and-post shape; a pre-post refusal rolls the whole pre-allocated
+   seq range back (reverse order keeps each rollback single-flight). */
+int _frame_event_batch_post_fire(frame_t* f, const char** type_names,
+                                 json_value_t** payloads, size_t nops) {
+  uint64_t first = 0;
+  int rc = _frame_event_batch_post(f, type_names, payloads, nops, 0, NULL,
+                                   &first);
+  if (rc != 0 && first != 0) {
+    for (size_t i = nops; i > 0; i--) _frame_seq_rollback(f, first + i - 1);
+  }
+  return rc;
+}
+
+/* The tool path's PAIRED cell.result close (frame_internal.h's contract):
+   the audit's answer and the envelope's closers ride ONE atomic
+   fire-and-post batch (Task 2 rider 3 — the single-record fire cannot carry
+   the three records). */
+int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
+                                    uint8_t with_riders) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: the paired cell.result close on a dead frame");
+    json_value_destroy(result_payload);
+    return -1;
+  }
+  const char* names[3] = {"cell.result", LIFE_EVENT_STEP_END,
+                          LIFE_EVENT_TURN_END};
+  json_value_t* payloads[3];
+  size_t n = 1;
+  payloads[0] = result_payload;
+  if (with_riders != 0) {
+    payloads[n++] = lifecycle_step_json(f->engine.turn_counter, 1);
+    payloads[n++] = lifecycle_turn_end_json(f->engine.turn_counter,
+                                            LIFE_REASON_COMPLETED, NULL);
+  }
+  int rc = _frame_event_batch_post_fire(f, names, payloads, n);
+  if (rc != 0) {
+    log_error("frame: the paired cell.result close at '%s' was refused "
+              "pre-post", f->sid_path);
+  }
+  if (with_riders != 0 && rc == 0) {
+    /* The close POSTED — the engine's compose-time facts follow (the
+       store's records stay the truth; a store-stage refusal left the open
+       tail, the driver's loud stall or the resume repair's business). */
+    f->engine.turn_open = 0;
+    f->engine.step_open = 0;
+  }
   return rc;
 }
 
@@ -1946,8 +2175,18 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
           /* FIRE-AND-POST (corr 0, reply_to NULL): the slot completes in
              this same dispatch exactly as today, and the event's commitment
              is FIFO-ahead of anything the frame posts after it (the next
-             derive's scan). */
-          if (_frame_event_post_fire(f, "cell.result", result_payload) != 0) {
+             derive's scan). The TURN-LIFECYCLE riders (Task 2 rider 3): a
+             live engine whose turn is open and whose awaited cell this IS
+             (phase CELL) closes the turn right here — step.end +
+             turn.end {completed} ride the SAME atomic batch, so the audit's
+             answer and its envelope closers can never split. */
+          uint8_t with_riders =
+              (f->engine.engine_live != 0 &&
+               f->engine.phase == FRAME_PHASE_CELL &&
+               f->engine.turn_open != 0)
+                  ? 1 : 0;
+          if (_frame_engine_result_close_post(f, result_payload,
+                                              with_riders) != 0) {
             log_error("frame: the cell.result event for corr %llu was refused "
                       "pre-post at '%s' (already logged)",
                       (unsigned long long)f->cell_corr, f->sid_path);

@@ -193,6 +193,7 @@ if (BUILD_TESTING)
            _test_name MATCHES "^TestLiveLoop" OR _test_name MATCHES "^TestPyAgent" OR
            _test_name MATCHES "^TestFrameTree" OR
            _test_name MATCHES "^TestFrame.TestInlineParentYieldsAwaitingChildren$" OR
+           _test_name MATCHES "^TestFrame.TestChildrenYieldTurnEndRidesTheFinishBatch$" OR
            _test_name MATCHES "^TestRefine.TestRefineLiveRefineAgainstRealModel$")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()

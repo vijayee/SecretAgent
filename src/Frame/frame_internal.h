@@ -127,6 +127,25 @@ typedef struct frame_engine_state_t {
                                   child's quiet-completion report bind, or
                                   the top end consume/free it there */
 
+  /* --- the turn-lifecycle envelope's bookkeeping (the turn-lifecycle
+     slice's Task 2; spec §3) ------------------------------------------
+
+     turn_counter: the number of the turn being COMPOSED. Restored ONCE per
+     engine run from the derive's scanned events (the newest recorded turn
+     number + 1; the _frame_restore_seq discipline — gaps logged loud and
+     continued, never a lock, never a second writer), then +1 per entry. A
+     DEAD engine never carries it across a restart: the restore reads the
+     log again on the next run's first entry.
+
+     turn_open / step_open: compose-time FACTS mirrored in memory (1 = the
+     envelope's opener posted, its closer not yet) so the finish / failure /
+     result paths know what their batch must carry. The store's records stay
+     the truth; the flags drive only the riders' composition. */
+  uint64_t turn_counter;       /* the current turn's number (restored +1'd) */
+  uint8_t turn_known;          /* 0 until the run's first restore */
+  uint8_t turn_open;           /* 1 = turn.start posted, no turn.end yet */
+  uint8_t step_open;           /* 1 = step.start posted, no step.end yet */
+
   /* --- the async submit's LIFETIME HANDOFF (lock-free; atomics are
      house-legal — the frame layer stays lock-free post store-actor) ------
 
@@ -402,6 +421,42 @@ int _frame_event_post(frame_t* f, const char* type_name, json_value_t* payload,
    the store worker logs it). */
 int _frame_event_post_fire(frame_t* f, const char* type_name,
                            json_value_t* payload);
+
+/* ONE ATOMIC multi-record EVENT batch (the turn envelope's batch riders;
+   Task 2): every op is an event record at the frame's pre-allocated seqs —
+   allocated CONTIGUOUSLY in one stretch at compose time (no interleaved
+   allocation between them), composed per seq, and posted as ONE
+   FRM_STORE_BATCH: `corr`/`reply_to` route an awaited reply (the engine's
+   round-trip riders), corr 0 / reply NULL = fire-and-post (the control
+   events' discipline). The store's ONE-atomic-batch rule keeps the record
+   group from ever half-applying. CONSUMES every payload on every path.
+   first_seq_out carries the batch's FIRST pre-allocated seq (also on the
+   refusal paths, for a best-effort rollback of the whole range — reverse
+   order keeps each rollback single-flight). Returns 0 once POSTED; -1 on
+   the compose/dead-frame refusals, -3 on the WAL batch cap (loud, never
+   truncating). */
+int _frame_event_batch_post(frame_t* f, const char** type_names,
+                            json_value_t** payloads, size_t nops,
+                            uint64_t corr, actor_t* reply_to,
+                            uint64_t* first_seq_out);
+
+/* The fire-and-post shape of the multi-record event batch (corr 0,
+   reply NULL); on a pre-post refusal the whole pre-allocated seq range rolls
+   back. Returns the pre-post rc (0 = posted). */
+int _frame_event_batch_post_fire(frame_t* f, const char** type_names,
+                                 json_value_t** payloads, size_t nops);
+
+/* The tool path's PAIRED cell.result close (Task 2 rider 3; BOTH compose
+   sites — frame.c's PYRT_RESULT completion and the engine's synchronous
+   refusal pair in loop.c — post through it): the cell.result record and —
+   when `with_riders` — the envelope's closers step.end + turn.end
+   {reason completed} in ONE atomic fire-and-post batch, so the audit's
+   answer and its envelope closers can never split across a crash boundary
+   (DSH's finally-discipline). Riders clear the engine's turn_open/step_open
+   when the batch POSTS. CONSUMES the payload on every path. Returns the
+   pre-post rc (0 = posted). */
+int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
+                                    uint8_t with_riders);
 
 /* Best-effort seq roll-back of an abandoned pre-allocation (§5). */
 void _frame_seq_rollback(frame_t* f, uint64_t abandoned);
