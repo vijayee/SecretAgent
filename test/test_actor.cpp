@@ -35,7 +35,7 @@ TEST(TestActor, TestInitDestroy) {
   actor_destroy(&actor);
 }
 
-TEST(TestActor, TestSendReturnsEmpty) {
+TEST(TestActor, TestSendDeliveredAnswersTrue) {
   int count = 0;
   actor_t actor;
   actor_init(&actor, &count, test_dispatch, NULL);
@@ -51,7 +51,7 @@ TEST(TestActor, TestSendReturnsEmpty) {
   actor_destroy(&actor);
 }
 
-TEST(TestActor, TestSendReturnsNotEmpty) {
+TEST(TestActor, TestSendBusyMailboxStillDelivered) {
   int count = 0;
   actor_t actor;
   actor_init(&actor, &count, test_dispatch, NULL);
@@ -69,8 +69,14 @@ TEST(TestActor, TestSendReturnsNotEmpty) {
   msg2.payload = NULL;
   msg2.payload_destroy = NULL;
 
+  /* DELIVERY contract (actor.h): a busy mailbox is still a delivered
+     message — the send that follows another returns true; only a refusal
+     (owner destroyed / queue torn down) answers false. The old was_empty
+     return misread a delivered send as refusal and broke py_agent's
+     bridge round trip whenever another post (a truncation announce) had
+     occupied the mailbox. */
   was_empty = actor_send(&actor, &msg2);
-  EXPECT_FALSE(was_empty);
+  EXPECT_TRUE(was_empty);
 
   actor_destroy(&actor);
 }

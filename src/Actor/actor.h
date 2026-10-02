@@ -72,6 +72,10 @@ void actor_destroy(actor_t* actor);
    dereference freed memory. Idempotent: nulls actor->pool, so a later call (or
    actor_destroy / the pool-destroy detach loop having nulled pool) is a no-op. */
 void actor_detach_pool(actor_t* actor);
+/* DELIVERY contract: true = the message was enqueued and WILL be dispatched
+   (a busy mailbox is still a delivered message — the scheduling side effects
+   live inside); false = refusal, the payload was FREED here (owner being
+   destroyed or the queue torn down) and no dispatch will ever run. */
 bool actor_send(actor_t* actor, message_t* msg);
 bool actor_run(actor_t* actor, size_t batch_size);
 void backpressure_apply(actor_t* actor);

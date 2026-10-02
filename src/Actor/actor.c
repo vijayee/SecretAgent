@@ -226,7 +226,15 @@ bool actor_send(actor_t* actor, message_t* msg) {
       scheduler_inject(actor->pool, actor);
     }
   }
-  return was_empty;
+  /* DELIVERED (not was_empty): the message is enqueued and will be
+     dispatched, whether or not the mailbox was busy — a busy mailbox is
+     still a delivered message (frame_internal.h's contract line). The old
+     was_empty return made a delivered send into a busy mailbox read as a
+     refusal by the one caller that trusts the return (py_agent's bridge
+     round trip), answering waiting verbs as send-failure whenever another
+     post (a truncation announce, a log line) occupied the mailbox — the
+     message then still ran and its reply had no waiter to wake. */
+  return true;
 }
 
 bool actor_run(actor_t* actor, size_t batch_size) {
