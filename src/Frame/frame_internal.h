@@ -438,13 +438,16 @@ int _frame_event_post_fire(frame_t* f, const char* type_name,
 int _frame_event_batch_post(frame_t* f, const char** type_names,
                             json_value_t** payloads, size_t nops,
                             uint64_t corr, actor_t* reply_to,
-                            uint64_t* first_seq_out);
+                            uint64_t* first_seq_out, const char* op_name);
 
 /* The fire-and-post shape of the multi-record event batch (corr 0,
    reply NULL); on a pre-post refusal the whole pre-allocated seq range rolls
-   back. Returns the pre-post rc (0 = posted). */
+   back. `op_name` is BORROWED (a literal the round trip only logs — the
+   batch's store log lines name the semantic action, not the first record).
+   Returns the pre-post rc (0 = posted). */
 int _frame_event_batch_post_fire(frame_t* f, const char** type_names,
-                                 json_value_t** payloads, size_t nops);
+                                 json_value_t** payloads, size_t nops,
+                                 const char* op_name);
 
 /* The tool path's PAIRED cell.result close (Task 2 rider 3; BOTH compose
    sites — frame.c's PYRT_RESULT completion and the engine's synchronous

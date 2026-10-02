@@ -918,16 +918,6 @@ int _frame_engine_finish_post(frame_t* f, const char* append_text,
   frm_store_batch_payload_t* bp =
       (frm_store_batch_payload_t*)get_clear_memory(sizeof(frm_store_batch_payload_t));
   bp->ops = (frm_store_op_t*)get_clear_memory(nops * sizeof(frm_store_op_t));
-  if (bp->ops == NULL) {
-    log_error("frame: out of memory building the finish batch");
-    for (size_t i = 0; i < nops; i++) {
-      free((void*)put_ops[i].key);
-      free((void*)put_ops[i].value);
-    }
-    for (size_t i = nev; i > 0; i--) _frame_seq_rollback(f, seq + i - 1);
-    free(bp);
-    return -1;
-  }
   memcpy(bp->ops, put_ops, nops * sizeof(frm_store_op_t));
   bp->nops = nops;
   bp->op_name = "turn finish";                  /* BORROWED literal */
@@ -1297,7 +1287,7 @@ int _frame_event_post_fire(frame_t* f, const char* type_name,
 int _frame_event_batch_post(frame_t* f, const char** type_names,
                             json_value_t** payloads, size_t nops,
                             uint64_t corr, actor_t* reply_to,
-                            uint64_t* first_seq_out) {
+                            uint64_t* first_seq_out, const char* op_name) {
   if (first_seq_out != NULL) *first_seq_out = 0;
   if (nops == 0) return 0;   /* nothing to post — a posted nothing */
   if (type_names == NULL || payloads == NULL) {
@@ -1383,7 +1373,7 @@ int _frame_event_batch_post(frame_t* f, const char** type_names,
     bp->ops[j].value_len = strlen(texts[j]);
   }
   bp->nops = nops;
-  bp->op_name = (type_names[0] != NULL) ? type_names[0] : "event batch";
+  bp->op_name = (op_name != NULL) ? op_name : "event batch";
   bp->reply_to = reply_to;
   bp->corr = corr;
   _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
@@ -1396,10 +1386,11 @@ int _frame_event_batch_post(frame_t* f, const char** type_names,
 /* The fire-and-post shape; a pre-post refusal rolls the whole pre-allocated
    seq range back (reverse order keeps each rollback single-flight). */
 int _frame_event_batch_post_fire(frame_t* f, const char** type_names,
-                                 json_value_t** payloads, size_t nops) {
+                                 json_value_t** payloads, size_t nops,
+                                 const char* op_name) {
   uint64_t first = 0;
   int rc = _frame_event_batch_post(f, type_names, payloads, nops, 0, NULL,
-                                   &first);
+                                   &first, op_name);
   if (rc != 0 && first != 0) {
     for (size_t i = nops; i > 0; i--) _frame_seq_rollback(f, first + i - 1);
   }
@@ -1427,7 +1418,8 @@ int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
     payloads[n++] = lifecycle_turn_end_json(f->engine.turn_counter,
                                             LIFE_REASON_COMPLETED, NULL);
   }
-  int rc = _frame_event_batch_post_fire(f, names, payloads, n);
+  int rc = _frame_event_batch_post_fire(f, names, payloads, n,
+                                        "cell.result close");
   if (rc != 0) {
     log_error("frame: the paired cell.result close at '%s' was refused "
               "pre-post", f->sid_path);

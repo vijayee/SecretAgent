@@ -596,7 +596,8 @@ static void _loop_turn_close_fail(frame_t* f, frame_engine_state_t* e,
   names[n] = LIFE_EVENT_TURN_END;
   payloads[n++] = lifecycle_turn_end_json(
       e->turn_counter, LIFE_REASON_ERROR, (kind != NULL) ? kind : text);
-  int rc = _frame_event_batch_post_fire(f, names, payloads, n);
+  int rc = _frame_event_batch_post_fire(f, names, payloads, n,
+                                        "failure close");
   if (rc != 0) {
     log_error("loop: the failure close of turn %llu at '%s' was refused "
               "pre-post — the terminate still runs, never hang",
@@ -861,7 +862,8 @@ static void _loop_post_cell_run(frame_t* f, frame_engine_state_t* e,
   payloads[1] = run_payload;   /* OWNED by the batch on every path */
   uint64_t first_seq = 0;
   int rc = _frame_event_batch_post(f, names, payloads, 2, e->store_corr,
-                                   _frame_actor(f), &first_seq);
+                                   _frame_actor(f), &first_seq,
+                                   "cell.run audit");
   if (rc != 0) {
     /* The audit line was refused (e.g. a huge cell, logged loud pre-post) —
        fail loud rather than execute an untracked cell. */
@@ -878,9 +880,10 @@ static void _loop_post_cell_run(frame_t* f, frame_engine_state_t* e,
     _loop_fail(f, e, "audit-error", "cell.run event refused");
     return;
   }
-  /* The step STARTED durably (the audit batch committed it); the model
-     reply rides the engine state to the CELL_RUN reply (which dispatches the
-     cell out of it and destroys it). */
+  /* The step was POSTED (the audit batch's commit is confirmed by the
+     CELL_RUN reply — a store-stage refusal reverts step_open there); the
+     model reply rides the engine state to the CELL_RUN reply (which
+     dispatches the cell out of it and destroys it). */
   e->step_open = 1;
   e->turn_reply = reply;
 }
