@@ -514,6 +514,84 @@ TEST(TestLoop, TestEmitIsDurableAndProjected) {
   wave_db_close(db);
 }
 
+/* agent.keys(scope) (spec §3): the pulled-forward inspect member. A cell's
+   keys('local') / keys('ctx') list ONLY the frame's own subtree keys —
+   ascending names, never values — and an unknown scope is the fail-loud
+   corr-matched refusal whose model-visible shape is None.
+
+   Shape note (report ends the top frame's loop, so the listing turn cannot
+   report): turn 1 computes the three listing texts as assignments; turn 2
+   reports all three — the loop completes on THAT report. */
+TEST(TestLoop, TestKeysListsOwnStateKeysOnly) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "list my keys", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* The keys the turn will list, seeded through the direct sync store API
+     BEFORE the scripted turn; the writes land out of order on purpose —
+     the listing must come back sorted. */
+  ASSERT_EQ(frame_remember_local(f, "gamma", "\"g\""), 0);
+  ASSERT_EQ(frame_remember_local(f, "alpha", "\"a\""), 0);
+  ASSERT_EQ(frame_remember_ctx(f, "ctx-two", "\"2\""), 0);
+  ASSERT_EQ(frame_remember_ctx(f, "ctx-one", "\"1\""), 0);
+
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nls = 'local: ' + str(actor.keys('local'))\\ncs = 'ctx: ' + str(actor.keys('ctx'))\\nbs = 'bogus: ' + str(actor.keys('bogus'))\"}"}}]}}]})json";
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"actor.report(ls + ', ' + cs + ', ' + bs)\"}"}}]}}]})json";
+  std::vector<std::string> replies = {turn1, turn2};
+
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+
+  frame_set_model_backend(f, &sm.base);
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(replies.size(), 0u) << "both turns were consumed";
+
+  /* THE assertion surface: the report event's text pins the sorted local and
+     ctx listings (own-subtree keys only) AND the refusal's model-visible
+     shape (None) in one place. */
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(count_type(events, "frame.report"), 1u);
+  json_value_t* report_rec = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "frame.report")) {
+      report_rec = json_at(events, i);
+      break;
+    }
+  }
+  ASSERT_NE(report_rec, nullptr);
+  json_value_t* report_payload = payload_of(report_rec);
+  ASSERT_NE(report_payload, nullptr);
+  json_value_t* report_text = json_get(report_payload, "text");
+  ASSERT_NE(report_text, nullptr);
+  std::string text(json_as_string(report_text));
+  EXPECT_NE(text.find("local: ['alpha', 'gamma']"), std::string::npos)
+      << "report text: " << text;
+  EXPECT_NE(text.find("ctx: ['ctx-one', 'ctx-two']"), std::string::npos)
+      << "report text: " << text;
+  EXPECT_NE(text.find("bogus: None"), std::string::npos)
+      << "the unknown scope's refusal answers None to the model; report text: "
+      << text;
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestLoop, TestTurnLimitFailsLoud) {
   py_agent_init();
   frame_config_t cfg = test_config();

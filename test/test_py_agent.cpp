@@ -101,6 +101,25 @@ static void bridge_frame_dispatch(void* state, message_t* msg) {
       }
       break;
     }
+    case FRM_KEYS: {
+      /* The pulled-forward inspect member (spec §3): the request's scope
+         rides frm_remember_payload_t's key field, exactly the recall shape.
+         Only the closed-set scopes get pre-answered; a bogus scope mirrors
+         the frame dispatch's fail-loud refusal (status 1, no text). */
+      frm_remember_payload_t* rp = (frm_remember_payload_t*)msg->payload;
+      self->req_types.push_back(msg->type);
+      self->req_corrs.push_back(rp ? rp->corr : 0);
+      self->req_a.push_back(rp && rp->key ? rp->key : "");
+      if (self->answer && rp != NULL) {
+        std::string scope(rp->key ? rp->key : "");
+        if (scope == "local" || scope == "ctx") {
+          py_agent_note_reply(rp->corr, 0, "[\"n\"]");
+        } else {
+          py_agent_note_reply(rp->corr, 1, NULL);
+        }
+      }
+      break;
+    }
     case FRM_SPAWN: {
       frm_spawn_payload_t* sp = (frm_spawn_payload_t*)msg->payload;
       self->req_types.push_back(msg->type);
@@ -246,6 +265,29 @@ TEST(TestPyAgent, TestRememberRecallCorrMatched) {
   EXPECT_STREQ(self->req_a[1].c_str(), "mode");
   EXPECT_EQ(self->req_types[2], (uint32_t)FRM_RECALL);
   EXPECT_NE(self->req_corrs[2], self->req_corrs[1]);
+
+  bridge_frame_free(self);
+}
+
+/* keys(scope): the pulled-forward inspect member (spec §3). The bridge test
+   stays minimal — one keys call whose pinned literal array answer round-trips
+   as a python list (the real frame's listing/refusal behavior is pinned in
+   test_loop.cpp's TestKeysListsOwnStateKeysOnly). */
+TEST(TestPyAgent, TestKeysVerbResolvesThroughTheBridge) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(1, NULL);
+
+  bridge_run_setup_and_probe(
+      self,
+      "import actor\n"
+      "ks = actor.keys('local')\n",
+      "(ks)");
+
+  EXPECT_STREQ(self->results[1]->text, "['n']");
+  ASSERT_EQ(self->req_types.size(), 1u);
+  EXPECT_EQ(self->req_types[0], (uint32_t)FRM_KEYS);
+  EXPECT_NE(self->req_corrs[0], 0u);
+  EXPECT_STREQ(self->req_a[0].c_str(), "local");
 
   bridge_frame_free(self);
 }

@@ -46,6 +46,10 @@ typedef enum frame_message_type_e {
                              trip */
   FRM_STORE_RECALL,       /* -> store actor: the lineage resolve walk
                              (frm_store_recall_payload_t) */
+  FRM_STORE_KEYS,         /* -> store actor: the keys verb's bounded OWN-
+                             subtree scan (frm_store_keys_payload_t) — the
+                             reply carries KEY NAME tail segments, never a
+                             value; see the surface-completion spec §3 */
   FRM_STORE_REPLY,        /* store actor -> requester: corr-matched result
                              (frm_store_reply_payload_t) */
   FRM_REPORT_BIND,        /* child frame actor -> parent frame actor: compose
@@ -56,6 +60,10 @@ typedef enum frame_message_type_e {
                              the pending cell + close an open turn aborted —
                              the reason union's RESERVED `aborted` first
                              writer. No payload. */
+  FRM_KEYS,               /* cell -> frame: the keys verb's OWN-subtree key
+                             listing (frm_remember_payload_t; `key` carries
+                             the CLOSED-SET scope "local" | "ctx" — anything
+                             else is the fail-loud refusal before any post) */
   FRM_CELL_WATCHDOG       /* the POOLED cell's deadline fired: the SAME
                              interrupt synthesis runs under the watchdog
                              wording (arm_cut = 0 — a deadline never arms a
@@ -163,6 +171,21 @@ typedef struct frm_store_recall_payload_t {
   uint64_t corr;
 } frm_store_recall_payload_t;
 
+/* The keys verb's bounded scan (surface-completion spec §3): the reverse
+   range read over OWN sid_path/state/<scope> (absolute composed bounds —
+   the root-level discipline); the reply's records[] carry the scanned keys'
+   NAME tail segments — never a value crosses back (recall resolves values;
+   keys never mixes them). A child lists its own keys only: the scan bounds
+   carry the requesting frame's OWN sid_path, so the no-third-path rule
+   needs no extra code. */
+typedef struct frm_store_keys_payload_t {
+  char* sid_path;     /* OWNED; the requesting frame's own subtree */
+  char* scope;        /* OWNED; "local" or "ctx" (the closed set, re-validated
+                         here — the frame dispatch checked it first) */
+  actor_t* reply_to;  /* BORROWED */
+  uint64_t corr;
+} frm_store_keys_payload_t;
+
 /* The round-trip result. rc = 0 committed / the store's refusal code.
    `records` = the MATERIALIZED RAW record texts (heap, ascending order,
    OWNED) for scans; the recall's resolution is records[0] or rc != 0; batch
@@ -198,6 +221,7 @@ typedef struct frm_report_bind_payload_t {
 void frm_store_batch_payload_destroy(void* p);
 void frm_store_scan_payload_destroy(void* p);
 void frm_store_recall_payload_destroy(void* p);
+void frm_store_keys_payload_destroy(void* p);
 void frm_store_reply_payload_destroy(void* p);
 void frm_report_bind_payload_destroy(void* p);
 

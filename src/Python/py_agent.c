@@ -423,6 +423,51 @@ static PyObject* _py_agent_recall(PyObject* self, PyObject* args) {
   Py_RETURN_NONE;
 }
 
+/* keys(scope) -> list | None.
+
+   Bridges to FRM_KEYS (the pulled-forward inspect member, spec §3): the
+   frame's dispatch validates the CLOSED-SET scope ('local'/'ctx') and
+   composes the bounded OWN-subtree listing in the store actor, answering a
+   JSON array of KEY NAMES ONLY through the same bridge machinery (never a
+   value — recall resolves values; keys never mixes them). The array decodes
+   back to the python list it models; the empty subtree answers []
+   (a real empty list, not None). A refusal (unknown scope), send failure,
+   and the bounded-wait timeout all answer None — recall's documented
+   failure shape, mirrored exactly. */
+static PyObject* _py_agent_keys(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* scope_o = NULL;
+  if (!PyArg_ParseTuple(args, "O:keys", &scope_o)) {
+    return NULL;
+  }
+  char* scope = _py_agent_text_of(scope_o);
+  if (scope == NULL) return NULL;
+
+  frm_remember_payload_t* rp = get_clear_memory(sizeof(frm_remember_payload_t));
+  if (rp == NULL) {
+    free(scope);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  rp->key = scope;         /* the frame dispatch reads the scope from here */
+  rp->json_value = NULL;   /* FRM_KEYS carries no value */
+
+  uint8_t status = 0;
+  char* text = NULL;
+  uint64_t corr = _py_agent_next_corr();
+  rp->corr = corr;
+  py_agent_wait_rc_e rc =
+      _py_agent_request((uint32_t)FRM_KEYS, rp, frm_remember_payload_destroy,
+                        corr, &status, &text);
+  if (rc == PY_AGENT_OK && status == 0 && text != NULL) {
+    PyObject* out = _py_agent_json_load(text);
+    free(text);
+    return out;   /* NULL (exception set) propagates the OOM verbatim */
+  }
+  free(text);
+  Py_RETURN_NONE;
+}
+
 /* spawn(goal, context=None) -> str | None.
 
    Bridges to FRM_SPAWN (admission-only child spawn on the frame); a
@@ -575,6 +620,7 @@ static PyMethodDef _py_agent_base_methods[] = {
 static PyMethodDef _py_agent_verb_methods[] = {
     {"remember", _py_agent_remember, METH_VARARGS, "Durable shared state write; returns True or False."},
     {"recall", _py_agent_recall, METH_VARARGS, "Resolve a key up the frame lineage; returns the JSON text or None."},
+    {"keys", _py_agent_keys, METH_VARARGS, "List this frame's OWN state keys (local|ctx); returns a list or None."},
     {"spawn", _py_agent_spawn, METH_VARARGS, "Admission-only child spawn; returns the child sid or None."},
     {"report", _py_agent_report, METH_VARARGS, "End this frame with a report; returns True or False."},
     {NULL, NULL, 0, NULL}};

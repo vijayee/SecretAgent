@@ -95,6 +95,14 @@ void frm_store_recall_payload_destroy(void* p) {
   free(rp);
 }
 
+void frm_store_keys_payload_destroy(void* p) {
+  frm_store_keys_payload_t* kp = (frm_store_keys_payload_t*)p;
+  if (kp == NULL) return;
+  free(kp->sid_path);
+  free(kp->scope);
+  free(kp);
+}
+
 void frm_store_reply_payload_destroy(void* p) {
   frm_store_reply_payload_t* rp = (frm_store_reply_payload_t*)p;
   if (rp == NULL) return;
@@ -207,12 +215,22 @@ typedef struct frame_bind_slot_t {
 /* The behavior-posted store round trips' registered corr answers: the
    bridge corr of a cell verb waiting one store hop. Every mutation happens
    on the frame's OWN dispatch thread (actor single-runner discipline) — a
-   list, no lock. */
+   list, no lock. The KIND says what answer shape the reply router composes
+   from the store's raw records. */
+typedef enum frm_bridge_kind_e {
+  FRM_BRIDGE_TEXT = 0,    /* remember/spawn/report: the plain corr answer
+                             (the store commit/refusal, text unused today) */
+  FRM_BRIDGE_RECALL = 1,  /* the answer carries the resolved value text
+                             (records[0]) */
+  FRM_BRIDGE_KEYS = 2     /* the answer composes the sorted key-name array
+                             from the records (the keys verb; spec §3) */
+} frm_bridge_kind_e;
+
 typedef struct frm_bridge_pending_t {
   uint64_t corr;           /* the frame's OWN store round-trip corr */
   uint64_t answer_corr;    /* the corr the reply must be answered under (the
                               bridge verb's py-agent corr) */
-  uint8_t is_recall;       /* 1 = the answer carries the resolved text */
+  frm_bridge_kind_e kind;  /* the verb's answer shape (the router composes) */
   struct frm_bridge_pending_t* next;
 } frm_bridge_pending_t;
 
@@ -641,26 +659,28 @@ void _frame_seq_rollback(frame_t* f, uint64_t abandoned) {
    (the two counters are UNRELATED: one mapped registration per round trip
    keeps them from aliasing a slot's corr in the router). */
 static void _frame_bridge_pending_add(frame_t* f, uint64_t corr,
-                                      uint64_t answer_corr, uint8_t is_recall) {
+                                      uint64_t answer_corr,
+                                      frm_bridge_kind_e kind) {
   if (f == NULL || corr == 0) return;
   frm_bridge_pending_t* node = get_clear_memory(sizeof(frm_bridge_pending_t));
   node->corr = corr;
   node->answer_corr = answer_corr;
-  node->is_recall = is_recall;
+  node->kind = kind;
   node->next = f->bridge_pending;
   f->bridge_pending = node;
 }
 
 /* 1 when `corr` was registered (and unlinks it: *answer_out carries the corr
-   to answer under, *is_recall_out the verb's answer shape). */
+   to answer under, *kind_out the verb's answer shape). */
 static int _frame_bridge_pending_take(frame_t* f, uint64_t corr,
-                                      uint64_t* answer_out, uint8_t* is_recall_out) {
+                                      uint64_t* answer_out,
+                                      frm_bridge_kind_e* kind_out) {
   frm_bridge_pending_t** p = &f->bridge_pending;
   while (*p != NULL) {
     if ((*p)->corr == corr) {
       frm_bridge_pending_t* hit = *p;
       if (answer_out != NULL) *answer_out = hit->answer_corr;
-      if (is_recall_out != NULL) *is_recall_out = hit->is_recall;
+      if (kind_out != NULL) *kind_out = hit->kind;
       *p = hit->next;
       free(hit);
       return 1;
@@ -846,6 +866,19 @@ static void _frame_cell_watchdog_arm(frame_t* f) {
 /* The store's outgoing reply: corr-matched to the requester's actor. records
    ownership transfers (the payload destroyer frees them; on a refused send
    the local destroy frees them here). */
+
+/* The keys scan's materialization bound: SA_BUDGET_KEYS_MAX + 1 (one record
+   PAST the cap — the truncation tell the reply router reads), clamped down
+   to the shared events window when that window is smaller. The clamp is
+   HONEST and changes the clipped detection: with SA_FRAME_DEBUG_MAX_EVENTS
+   below KEYS_MAX + 1 a fully-materialized clamped scan can no longer prove
+   truncation by count alone, so the marker then depends on the window —
+   never silently widened here. */
+#define _FRAME_KEYS_SCAN_CAP                                              \
+  ((SA_BUDGET_KEYS_MAX + 1 > SA_FRAME_DEBUG_MAX_EVENTS)                   \
+       ? (size_t)SA_FRAME_DEBUG_MAX_EVENTS                                \
+       : (size_t)(SA_BUDGET_KEYS_MAX + 1))
+
 static void _store_reply_send(actor_t* reply_to, uint64_t corr, int rc,
                               char** records, size_t n) {
   if (reply_to == NULL) {
@@ -1370,6 +1403,137 @@ static void _store_behavior(void* state, message_t* msg) {
       _store_reply_send(rp->reply_to, rp->corr, rc, records, rc == 0 ? 1 : 0);
       if (rc != 0 && records != NULL) free(records);
       frm_store_recall_payload_destroy(rp);
+      break;
+    }
+    case FRM_STORE_KEYS: {
+      /* The keys verb's bounded scan (spec §3), run INSIDE this dispatch =
+         one serialized read (the frame's behavior stays lock-free). The
+         reverse range read over the frame's OWN state/<scope> subtree —
+         ABSOLUTE composed bounds (WaveDB's subtree bounded scans are broken
+         in both directions: the root-level discipline, unchanged) —
+         materializes the scanned keys' NAME tail segments as the reply's
+         records[]; a VALUE never crosses back. One record PAST
+         SA_BUDGET_KEYS_MAX rides the reply: the requester's router reads the
+         over-cap count as the truncation tell, clips, and appends the
+         marker. An empty subtree sends rc 0 with NO records — the empty
+         array "[]" answer, not an error. */
+      frm_store_keys_payload_t* kp = (frm_store_keys_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (kp == NULL) {
+        log_error("store: FRM_STORE_KEYS with no payload — dropping loud");
+        break;
+      }
+      int rc = 0;
+      size_t n = 0;
+      char** records = NULL;
+      if (kp->sid_path == NULL || kp->scope == NULL ||
+          (strcmp(kp->scope, "local") != 0 && strcmp(kp->scope, "ctx") != 0)) {
+        log_error("store: keys request needs a sid path and the scope "
+                  "'local' or 'ctx' — refused loud");
+        rc = -1;
+      } else {
+        /* The bounds: <sid_path>/state/<scope> .. <that>0 ("0" sorts past
+           every '/'-separated name beneath it — the derive's events-scan
+           bound shape, composed root-level). */
+        size_t base_len =
+            strlen(kp->sid_path) + strlen("/state/") + strlen(kp->scope);
+        char* lo = get_memory(base_len + 1);
+        char* hi = get_memory(base_len + 2);
+        if (lo == NULL || hi == NULL) {
+          log_error("store: out of memory composing the keys scan bounds");
+          free(lo);
+          free(hi);
+          rc = -1;
+        } else {
+          snprintf(lo, base_len + 1, "%s/state/%s", kp->sid_path, kp->scope);
+          snprintf(hi, base_len + 2, "%s0", lo);
+          path_t* start = path_create_from_raw(lo, strlen(lo), '/', 0);
+          path_t* end = path_create_from_raw(hi, strlen(hi), '/', 0);
+          free(lo);   /* the bounds' TEXT dies here; the paths ride the scan */
+          free(hi);
+          if (start == NULL || end == NULL) {
+            log_error("store: keys scan '%s/state/%s' — bound composition "
+                      "failed", kp->sid_path, kp->scope);
+            if (start != NULL) path_destroy(start);
+            if (end != NULL) path_destroy(end);
+            rc = -1;
+          } else {
+            database_iterator_t* iter =
+                database_scan_start_reverse(root->db, start, end);
+            if (iter == NULL) {
+              log_error("store: keys reverse scan failed — refusing the "
+                        "scan reply");
+              rc = -1;
+            } else {
+              /* The scan honors the clamped cap (_FRAME_KEYS_SCAN_CAP,
+                 compile-time: KEYS_MAX + 1 clamped to the shared events
+                 window — see the macro's honest-clamp note). */
+              char* names[_FRAME_KEYS_SCAN_CAP];   /* scan order (descending) */
+              n = 0;
+              int oom = 0;
+              while (n < _FRAME_KEYS_SCAN_CAP) {
+                path_t* k = NULL;
+                identifier_t* v = NULL;
+                int src = database_scan_prev(iter, &k, &v);
+                if (src != 0) break;             /* -1: out of records */
+                if (k != NULL && path_length(k) >= 1) {
+                  /* The KEY NAME tail segment (the values are never read):
+                     the _frame_restore_seq extraction idiom, unchanged. */
+                  identifier_t* last = path_get(k, path_length(k) - 1);
+                  size_t len = 0;
+                  uint8_t* data = identifier_get_data_copy(last, &len);
+                  if (data != NULL) {
+                    char* name = (char*)get_memory(len + 1);
+                    if (name == NULL) {
+                      oom = 1;
+                    } else {
+                      memcpy(name, data, len);
+                      name[len] = '\0';
+                      names[n++] = name;
+                    }
+                    free(data);
+                  } else {
+                    log_error("store: keys scan record name copy failed");
+                    oom = 1;
+                  }
+                } else {
+                  log_error("store: keys scan record lost its key");
+                  oom = 1;
+                }
+                path_destroy(k);
+                identifier_destroy(v);
+              }
+              database_scan_end(iter);
+              /* The scan consumed the bounds' lifetime (they are not
+                 destroyed again on this path). */
+              if (oom) {
+                log_error("store: keys scan materialization hit a bound — "
+                          "the reply carries the %zu names it got", n);
+              }
+              if (n > 0) {
+                records = (char**)get_clear_memory(n * sizeof(char*));
+                if (records == NULL) {
+                  /* The array failed: the materialized names have no reply
+                     to ride — freed here, same discipline as the refusal
+                     path. */
+                  for (size_t i = 0; i < n; i++) free(names[i]);
+                  n = 0;
+                  rc = -1;
+                } else {
+                  for (size_t i = 0; i < n; i++) records[i] = names[i];
+                }
+              }
+            }
+          }
+        }
+      }
+      _store_reply_send(kp->reply_to, kp->corr, rc, records,
+                        records != NULL ? n : 0);
+      if (rc != 0 && records != NULL) {
+        for (size_t i = 0; i < n; i++) free(records[i]);
+        free(records);
+      }
+      frm_store_keys_payload_destroy(kp);
       break;
     }
     case FRM_STORE_REPLY:   /* replies LEAVE the store; arriving = routing bug */
@@ -2036,7 +2200,8 @@ static void _frame_report_top_post(frame_t* f, uint64_t bridge_corr,
   bp->op_name = "frame.report (top)";       /* BORROWED literal */
   bp->reply_to = &f->actor;                 /* the reply routes to the bridge corr */
   bp->corr = ++f->store_corr_seq;
-  _frame_bridge_pending_add(f, bp->corr, bridge_corr, 0);   /* BEFORE the post */
+  _frame_bridge_pending_add(f, bp->corr, bridge_corr,
+                            FRM_BRIDGE_TEXT);   /* BEFORE the post */
   _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_BATCH, bp,
               frm_store_batch_payload_destroy, "top report batch");
 }
@@ -2065,6 +2230,8 @@ static void _frame_report_top_post(frame_t* f, uint64_t bridge_corr,
    the behaviors compose + post them. */
 static int _frame_recall_post(frame_t* f, const char* key, uint64_t corr,
                               actor_t* reply_to);
+static int _frame_keys_post(frame_t* f, const char* scope, uint64_t corr,
+                            actor_t* reply_to);
 static frame_t* _frame_spawn_post(frame_t* parent, const char* goal,
                                   const char* context_json,
                                   uint64_t bridge_corr, uint64_t corr);
@@ -2072,6 +2239,61 @@ static frame_t* _frame_spawn_post(frame_t* parent, const char* goal,
    terminal step is one of its callers; loop.c runs the engine). */
 static void _frame_report_bind_compose(frame_t* parent,
                                        frm_report_bind_payload_t* b);
+
+/* --- the keys verb's reply composition (surface-completion spec §3) ------- */
+
+/* The qsort comparator: the scanned key names ascending by strcmp. */
+static int _frame_keys_cmp(const void* a, const void* b) {
+  const char* const* sa = (const char* const*)a;
+  const char* const* sb = (const char* const*)b;
+  return strcmp(*sa, *sb);
+}
+
+/* The keys verb's reply text: sort ALL the scanned names ascending (the
+   records are the store reply payload's — reordered IN PLACE, never freed
+   here), keep the lexicographic FIRST SA_BUDGET_KEYS_MAX, and — ONLY when
+   the scan carried more than the cap — close with the marker. An empty scan
+   composes "[]". Returns a heap text the caller frees, or NULL loud on an
+   OOM refusal. */
+static char* _frame_keys_reply_text(char** records, size_t n) {
+  size_t listed = (n > SA_BUDGET_KEYS_MAX) ? SA_BUDGET_KEYS_MAX : n;
+  if (records != NULL && n > 0) {
+    qsort(records, n, sizeof(char*), _frame_keys_cmp);
+  }
+  json_value_t* arr = json_new_array();
+  if (arr == NULL) {
+    log_error("frame: out of memory composing the keys reply array");
+    return NULL;
+  }
+  if (records != NULL) {
+    for (size_t i = 0; i < listed; i++) {
+      json_value_t* name = json_new_string(records[i] != NULL ? records[i] : "");
+      /* json_array_append returns 1 = the value was consumed; 0 = refused
+         WITHOUT taking it (the string is still ours to destroy). */
+      if (name == NULL || json_array_append(arr, name) != 1) {
+        json_value_destroy(name);
+        json_value_destroy(arr);
+        log_error("frame: out of memory composing the keys reply array");
+        return NULL;
+      }
+    }
+  }
+  if (n > SA_BUDGET_KEYS_MAX) {
+    json_value_t* marker = json_new_string("[budget: keys truncated]");
+    if (marker == NULL || json_array_append(arr, marker) != 1) {
+      json_value_destroy(marker);
+      json_value_destroy(arr);
+      log_error("frame: out of memory composing the keys truncation marker");
+      return NULL;
+    }
+  }
+  char* text = json_serialize(arr);
+  json_value_destroy(arr);
+  if (text == NULL) {
+    log_error("frame: out of memory serializing the keys reply");
+  }
+  return text;
+}
 
 /* The FRM_STORE_REPLY router (the frame's OWN reply path; consumes the
    payload on every path). Priority order:
@@ -2244,15 +2466,22 @@ static void _frame_store_reply_route(frame_t* f, frm_store_reply_payload_t* r) {
 
   /* 5. The registered cell-verb bridge corrs. */
   {
-    uint8_t is_recall = 0;
+    frm_bridge_kind_e kind = FRM_BRIDGE_TEXT;
     uint64_t answer_corr = 0;
-    if (_frame_bridge_pending_take(f, r->corr, &answer_corr, &is_recall)) {
+    if (_frame_bridge_pending_take(f, r->corr, &answer_corr, &kind)) {
       uint8_t status = (r->rc == 0) ? 0 : 1;
       char* text = NULL;
-      if (is_recall && status == 0 && r->n >= 1 && r->records != NULL &&
-          r->records[0] != NULL) {
-        text = strdup(r->records[0]);
-        if (text == NULL) status = 1;
+      if (kind == FRM_BRIDGE_RECALL) {
+        if (status == 0 && r->n >= 1 && r->records != NULL &&
+            r->records[0] != NULL) {
+          text = strdup(r->records[0]);
+          if (text == NULL) status = 1;
+        }
+      } else if (kind == FRM_BRIDGE_KEYS) {
+        if (status == 0) {
+          text = _frame_keys_reply_text(r->records, r->n);
+          if (text == NULL) status = 1;
+        }
       }
       _frame_bridge_reply(answer_corr, status, text);
       free(text);
@@ -2291,7 +2520,7 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
            durable, shared-by-default write (state/ctx/); cells use the
            ctx/local split only through the store API directly. */
         uint64_t store_corr = ++f->store_corr_seq;
-        _frame_bridge_pending_add(f, store_corr, corr, 0);
+        _frame_bridge_pending_add(f, store_corr, corr, FRM_BRIDGE_TEXT);
         if (_frame_remember_post(f, rp->key, rp->json_value, "state/ctx/",
                                  store_corr, &f->actor, NULL) != 0) {
           /* The compose refused loud (validation/cap) — nothing was posted,
@@ -2324,13 +2553,53 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
                   f->sid_path);
       } else {
         uint64_t store_corr = ++f->store_corr_seq;
-        _frame_bridge_pending_add(f, store_corr, corr, 1);
+        _frame_bridge_pending_add(f, store_corr, corr, FRM_BRIDGE_RECALL);
         if (_frame_recall_post(f, rp->key, store_corr, &f->actor) != 0) {
           (void)_frame_bridge_pending_take(f, store_corr, NULL, NULL);
           status = 1;
           log_error("frame: FRM_RECALL '%s' refused at '%s' (corr %llu)",
                     rp->key ? rp->key : "(null)", f->sid_path,
                     (unsigned long long)corr);
+          _frame_bridge_reply(corr, status, NULL);
+        }
+      }
+      frm_remember_payload_destroy(rp);
+      break;
+    }
+    case FRM_KEYS: {
+      /* The pulled-forward inspect member (spec §3): the listing is a
+         bounded scan of the frame's OWN state/<scope> subtree — KEY NAMES
+         ONLY — and the scope is a CLOSED set validated HERE, before any
+         post: anything else is the standard fail-loud corr-matched
+         refusal. The store compose + post mirrors FRM_RECALL exactly; the
+         router answers the sorted key-name array at the reply. */
+      frm_remember_payload_t* rp = (frm_remember_payload_t*)msg->payload;
+      msg->payload = NULL;
+      uint64_t corr = 0;
+      uint8_t status;
+      if (rp == NULL) {
+        status = 1;
+        log_error("frame: FRM_KEYS with no payload at '%s'", f->sid_path);
+      } else if ((corr = rp->corr) == 0) {
+        status = 1;
+        log_error("frame: FRM_KEYS with corr 0 at '%s' — nothing to match",
+                  f->sid_path);
+      } else if (rp->key == NULL ||
+                 (strcmp(rp->key, "local") != 0 && strcmp(rp->key, "ctx") != 0)) {
+        status = 1;
+        log_error("agent.keys: unknown scope '%s' at '%s' (corr %llu) — the "
+                  "scope is 'local' or 'ctx'",
+                  rp->key ? rp->key : "(null)", f->sid_path,
+                  (unsigned long long)corr);
+        _frame_bridge_reply(corr, status, NULL);
+      } else {
+        uint64_t store_corr = ++f->store_corr_seq;
+        _frame_bridge_pending_add(f, store_corr, corr, FRM_BRIDGE_KEYS);
+        if (_frame_keys_post(f, rp->key, store_corr, &f->actor) != 0) {
+          (void)_frame_bridge_pending_take(f, store_corr, NULL, NULL);
+          status = 1;
+          log_error("frame: FRM_KEYS '%s' refused at '%s' (corr %llu)",
+                    rp->key, f->sid_path, (unsigned long long)corr);
           _frame_bridge_reply(corr, status, NULL);
         }
       }
@@ -2663,6 +2932,7 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
     case FRM_STORE_BATCH:
     case FRM_STORE_SCAN:
     case FRM_STORE_RECALL:
+    case FRM_STORE_KEYS:
       /* Store OPERATIONS at a frame actor: a routing bug (they belong at the
          root's store actor). Loud drop; the payload retires here. */
       log_error("frame: a store operation arrived at the FRAME actor of '%s' "
@@ -4066,6 +4336,31 @@ static int _frame_recall_post(frame_t* f, const char* key, uint64_t corr,
   rp->corr = corr;
   _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_RECALL, rp,
               frm_store_recall_payload_destroy, "recall walk");
+  return 0;
+}
+
+/* Compose + post FRM_STORE_KEYS (spec §3): the bounded OWN-subtree scan
+   runs inside the store actor's dispatch (serialized with every write).
+   0 = posted; -1 = refused before any post (the reply never comes — the
+   caller must answer its corr). */
+static int _frame_keys_post(frame_t* f, const char* scope, uint64_t corr,
+                            actor_t* reply_to) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: keys on a dead frame");
+    return -1;
+  }
+  frm_store_keys_payload_t* kp =
+      (frm_store_keys_payload_t*)get_clear_memory(sizeof(frm_store_keys_payload_t));
+  kp->sid_path = strdup(f->sid_path);
+  kp->scope = strdup(scope);
+  if (kp->sid_path == NULL || kp->scope == NULL) {
+    frm_store_keys_payload_destroy(kp);
+    return -1;
+  }
+  kp->reply_to = reply_to;
+  kp->corr = corr;
+  _frame_post(&f->root->store_actor, (uint32_t)FRM_STORE_KEYS, kp,
+              frm_store_keys_payload_destroy, "keys scan");
   return 0;
 }
 
