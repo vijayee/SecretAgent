@@ -48,10 +48,14 @@ typedef enum frame_message_type_e {
                              (frm_store_recall_payload_t) */
   FRM_STORE_REPLY,        /* store actor -> requester: corr-matched result
                              (frm_store_reply_payload_t) */
-  FRM_REPORT_BIND         /* child frame actor -> parent frame actor: compose
+  FRM_REPORT_BIND,        /* child frame actor -> parent frame actor: compose
                              the cross-subtree report batch THERE (the
                              parent's actor pre-allocates the parent's seq;
                              frm_report_bind_payload_t) */
+  FRM_INT                 /* interrupt (owner -> the frame's own mailbox): cut
+                             the pending cell + close an open turn aborted —
+                             the reason union's RESERVED `aborted` first
+                             writer. No payload. */
 } frame_message_type_e;
 
 /* Event types (stored at sessions/<sid>/events/<seq>, JSON, %020d seq). ONLY

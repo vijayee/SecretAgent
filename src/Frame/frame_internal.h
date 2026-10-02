@@ -180,6 +180,22 @@ typedef struct frame_engine_state_t {
 /* The engine state's accessor (NULL on a dead/unknown frame). */
 frame_engine_state_t* _frame_engine_state(frame_t* f);
 
+/* The interrupt synthesis (frame.c; surface-completion spec §2): the
+   corr-matched close + the runtime poison + the boundary cut, under the
+   caller's reason wording. arm_cut = 1 means a TRUE interrupt (the boundary
+   cut arms); 0 = a deadline (never arms). FRM_INT's dispatch, the inline
+   driver's cell deadline, and the pooled watchdog's dispatch (Task 6) are
+   its callers. */
+void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut, const char* reason_text);
+
+/* The synchronous cell refusal's PAIRED cell.result text (frame.c's poison
+   knowledge; the ENGINE's refusal composer in loop.c reads it): NULL = the
+   generic refusal wording applies; the poisoned runtime's own wording
+   otherwise — the refusal is CORR-MATCHED failure data the model reads
+   (surface-completion spec §2's poison contract, quiet late drop + loud
+   future-cell refusal). */
+const char* _frame_cell_refusal_text(const frame_t* f);
+
 /* The die-requested flag's atomic read (loop.c's model sink + completion
    handler gate against a dying frame): 0 = clear, 1 = a frame_destroy ran
    (or defers) mid-turn. 0 for a NULL frame. */
@@ -217,6 +233,15 @@ void _frame_engine_model_arrived(frame_t* f, frm_model_payload_t* payload);
    (Synchronous cell refusals — pending never set — let the FRM_CELL_RUN reply
    step resume; see _frame_engine_store_reply's CELL_RUN path.) */
 void _frame_engine_cell_done(frame_t* f);
+
+/* End the live engine (loop.c implements; the failure surfaces AND
+   frame.c's interrupt synthesis call it): ok=0 → engine_failed + a CHILD's
+   failure report bind (the parent's derive shows it; a TOP frame just
+   ends — no status change), ok=1 → the clean terminal. Re-entered on an
+   already-ended engine: a loud no-op. Frame.c's interrupt synthesis calls
+   this AFTER its synthesized close POSTED — the store's FIFO commits the
+   close ahead of the terminate's bind. */
+void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text);
 
 /* The FRM_CHILD_REPORT behavior (the parent's resume, spec §4): decrement the
    engine's live_children liveness counter (a zero-count delivery logs loud),

@@ -116,6 +116,16 @@ void frame_set_loop_turn_cap(frame_t* f, unsigned cap);
    top frame just ends — an ended frame re-runs nothing). */
 int frame_start(frame_t* f);
 
+/* Interrupt the frame: cut the pending cell (a corr-matched status-1 result
+   synthesizes immediately — the cooperative-only pyrt interrupt cannot
+   preempt the running interpreter, so the cell's REAL result lands later and
+   drops quietly) and close an open turn with the lifecycle's `aborted`
+   reason. The frame's runtime is POISONED: every further cell on THIS frame
+   refuses corr-matched loud until the frame is torn down (the wedge is
+   contained; destroy joins the hung interpreter thread — a documented
+   cost). FRM_STOP remains the drain-at-boundary control. */
+void frame_interrupt(frame_t* f);
+
 /* Test/debug + embedding accessor: the pool the frame's actor is attached
    to (NULL = inline). */
 scheduler_pool_t* frame_pool(const frame_t* f);

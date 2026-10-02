@@ -293,6 +293,12 @@ struct frame_t {
   uint64_t cell_corr;         /* the loop's audit corr for the pending cell */
   uint64_t cell_pyrt_corr;    /* the pyrt executor corr it was handed as */
   uint8_t cell_status;        /* completion status of the pending/last cell */
+  uint8_t pyrt_poisoned;      /* an interrupt wedged this frame's runtime
+                                 (in-memory, per-process: a restart rebuilds a
+                                 fresh runtime and the durable log already
+                                 carries the aborted turn) */
+  uint64_t cell_interrupted_corr;   /* the pyrt corr whose REAL result is
+                                       expected late and drops quietly */
   uint8_t stop_requested;     /* FRM_STOP: the loop drains, then stops */
   /* The nesting depth of THIS frame's behavior dispatches (0 = not inside a
      mailbox dispatch). The single-runner discipline keeps it exact; the sync
@@ -1434,6 +1440,101 @@ int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
   return rc;
 }
 
+/* The interrupt synthesis (surface-completion spec §2): ONE mechanism, three
+   callers, their own texts. arm_cut = 1 for the frame_interrupt entry (cases
+   may arm pyrt's boundary cut); arm_cut = 0 for the DEADLINE callers (the
+   inline driver's cell deadline, the pooled watchdog) — a deadline must
+   never arm a cut against a FUTURE legitimate cell.
+   Case 1 (cell pending): the corr-matched cell.result (status 1) + the
+   lifecycle riders [step.end, turn.end{aborted}] in ONE fire-and-post
+   batch. Case 2 (turn open, no cell): the riders minus cell.result. Case 3
+   (nothing open): arm the boundary cut only (per arm_cut), no store write.
+   After cases 1-2: the compose-time facts flip exactly like the cell-result
+   close (the helper clears turn_open/step_open when the batch posts), the
+   interrupt corr is kept (the REAL result drops quietly when it lands), the
+   frame poisons, and the ENGINE ends via _frame_engine_terminate (a child
+   binds its failure report with the same reason text). A store-stage
+   refusal leaves the pre-allocated seq rolled back and the tail to
+   resume-repair, the standing discipline.
+   GUARD: this function compiles in every python build AND the no-python
+   one — the f->pyrt accesses are #ifdef SA_HAS_PYTHON-wrapped INSIDE the
+   body. */
+void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
+                            const char* reason_text) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: interrupt apply on a dead frame");
+    return;
+  }
+  const char* names[3];   /* filled in step with payloads (an OOM'd cell.result
+                             record is SKIPPED, so indices must never alias) */
+  json_value_t* payloads[3];
+  size_t n = 0;
+  uint8_t cell_was_pending = f->cell_pending;
+  uint8_t with_riders =
+      (f->engine.engine_live != 0 && f->engine.turn_open != 0) ? 1 : 0;
+  if (cell_was_pending != 0) {
+    json_value_t* cell_result = json_new_object();
+    if (cell_result == NULL) {
+      log_error("frame: out of memory building the interrupt's cell.result "
+                "at '%s'", f->sid_path);
+      /* The cell slot still closes (the interrupt's contract never waits on
+         an OOM); the batch goes out without the result record. */
+    } else {
+      json_object_set(cell_result, "corr",
+                      json_new_int((int64_t)f->cell_corr));
+      json_object_set(cell_result, "status", json_new_int((int64_t)1));
+      json_object_set(cell_result, "text", json_new_string("pyrt: interrupted"));
+      names[n] = "cell.result";
+      payloads[n++] = cell_result;
+    }
+  }
+  if (with_riders != 0) {
+    names[n] = LIFE_EVENT_STEP_END;
+    payloads[n++] = lifecycle_step_json(f->engine.turn_counter, 1);
+    names[n] = LIFE_EVENT_TURN_END;
+    payloads[n++] =
+        lifecycle_turn_end_json(f->engine.turn_counter, LIFE_REASON_ABORTED,
+                                reason_text);
+  }
+  if (n == 0) {
+    if (arm_cut != 0) {
+      /* Case 3, true interrupt: the boundary cut, and nothing else. */
+#ifdef SA_HAS_PYTHON
+      if (f->pyrt != NULL) pyrt_interrupt(f->pyrt);
+#endif
+    } else {
+      /* A deadline firing at nothing-open: the cell completed before the
+         deadline's dispatch ran — a benign race, logged once. */
+      log_info("frame: the cell deadline fired at an already-complete cell "
+               "at '%s' — no-op", f->sid_path);
+    }
+    return;
+  }
+  int rc = _frame_event_batch_post_fire(f, names, payloads, n,
+                                        "interrupt close");
+  if (rc == 0) {
+    /* The close POSTED: the compose-time facts follow (the store's records
+       stay the truth) — mirrors _frame_engine_result_close_post's
+       discipline with the ABORTED reason and the interrupted corr's keep. */
+    f->engine.turn_open = 0;
+    f->engine.step_open = 0;
+    if (cell_was_pending != 0) {
+      f->cell_interrupted_corr = f->cell_pyrt_corr;
+      f->cell_pending = 0;
+      f->cell_status = 1;
+    }
+    f->pyrt_poisoned = 1;
+#ifdef SA_HAS_PYTHON
+    if (f->pyrt != NULL) pyrt_interrupt(f->pyrt);
+#endif
+    _frame_engine_terminate(f, 0, reason_text);
+    return;
+  }
+  log_error("frame: the interrupt close at '%s' was refused pre-post — the "
+            "tail stays for resume-repair", f->sid_path);
+  _frame_engine_terminate(f, 0, reason_text);
+}
+
 /* The SYNC-SEMANTICS write (frame_internal.h contract): post the event
    batch with a sync corr and pump-wait the reply — the caller keeps the
    "rc 0 = committed" contract. Its callers are the direct sync APIs
@@ -2077,6 +2178,20 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         frm_cell_payload_destroy(cp);
         break;
       }
+      if (f->pyrt_poisoned != 0) {
+        /* The poison contract (surface-completion spec §2): an interrupted
+           frame's cells refuse loud until the frame is torn down. The slot
+           fills synchronously (status, no pending) — the engine's refusal
+           composer writes the CORR-MATCHED paired cell.result from
+           _frame_cell_refusal_text's wording; the standing refusal
+           contract, never a new path. */
+        log_error("frame: cell corr %llu refused — runtime poisoned by an "
+                  "interrupted cell at '%s'",
+                  (unsigned long long)cp->corr, f->sid_path);
+        f->cell_status = 1;
+        frm_cell_payload_destroy(cp);
+        break;
+      }
 #ifdef SA_HAS_PYTHON
       /* The frame's OWN runtime: owner = this frame's actor, so cells'
          agent.* verbs arrive in the frame inbox (answered corr-matched by
@@ -2169,6 +2284,16 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         /* The engine awaits the cell (Task 3): repost the turn continuation
            — a no-op unless the engine is live in FRAME_PHASE_CELL. */
         _frame_engine_cell_done(f);
+      } else if (f->cell_interrupted_corr != 0 &&
+                 r->corr == f->cell_interrupted_corr) {
+        /* The interrupted cell's REAL result, late and unclaimable (the
+           poison contract): the EXPECTED shape the interrupt synthesis set
+           up — a documented quiet drop, distinct from the genuinely-
+           unknown-corr loud error below (surface-completion spec §2). */
+        log_info("frame: the interrupted cell's real result (pyrt corr %llu) "
+                 "landed after the synthesis — dropped quietly (the poison "
+                 "contract)",
+                 (unsigned long long)r->corr);
       } else {
         log_error("frame: unclaimed PYRT_RESULT corr %llu at '%s' — no "
                   "pending cell matches; dropping",
@@ -2351,6 +2476,14 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       _frame_report_bind_compose(f, b);
       break;
     }
+    case FRM_INT:
+      /* The interrupt entry (frame.h's frame_interrupt): the synthesis is
+         ONE mechanism with the caller's wording (surface-completion spec
+         §2). No payload. The case runs in python-less builds too — the
+         apply guards its pyrt accesses internally; the FRM_INT case is
+         unconditional. */
+      _frame_interrupt_apply(f, 1, "aborted: interrupted at the frame's request");
+      break;
     default:
       break;
   }
@@ -2676,6 +2809,17 @@ model_backend_t* _frame_backend_get(frame_t* f) {
 
 uint8_t _frame_cell_pending(const frame_t* f) {
   return (f != NULL) ? f->cell_pending : 0;
+}
+
+/* The synchronous refusal's paired cell.result text (frame_internal.h's
+   contract): the poison refusal is CORR-MATCHED failure data the model
+   reads — the paired composer names the wedge, the generic refusals keep
+   their standing wording (NULL). */
+const char* _frame_cell_refusal_text(const frame_t* f) {
+  if (f != NULL && f->pyrt_poisoned != 0) {
+    return "pyrt: runtime poisoned by an interrupted cell";
+  }
+  return NULL;
 }
 
 int _frame_cell_wait(frame_t* f, unsigned timeout_ms, uint8_t* status_out) {
@@ -3368,6 +3512,19 @@ int frame_start(frame_t* f) {
      dead-frame / already-live refuses, the per-run knob reset, and the ONE
      FRM_TURN continuation it queues. */
   return _frame_engine_start(f);
+}
+
+/* The interrupt entry (frame.h's contract): ONE FRM_INT posted into the
+   frame's OWN mailbox — ordinary mailbox injection, zero new locks; the
+   frame's dispatch (the scheduler worker's in production, the driver's pump
+   in tests) runs the synthesis. A payload-less post is the FRM_TURN
+   continuation's legal shape (nothing to destroy, nothing to consume). */
+void frame_interrupt(frame_t* f) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame_interrupt: dead frame");
+    return;
+  }
+  _frame_post(&f->actor, (uint32_t)FRM_INT, NULL, NULL, "interrupt");
 }
 
 scheduler_pool_t* frame_pool(const frame_t* f) {

@@ -655,8 +655,10 @@ static void _loop_turn_close_fail(frame_t* f, frame_engine_state_t* e,
 }
 
 /* The terminal step (defined below the turn engine's handlers; declared
-   early — the failure surfaces of this file run ahead of its definition). */
-static void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text);
+   early — the failure surfaces of this file run ahead of its
+   definition). EXPORTED (frame_internal.h): frame.c's interrupt synthesis
+   ends the engine with it on the frame's dispatch thread. */
+void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text);
 
 /* The failure surface (spec §4): the control event — kind + text, when the
    path carries one — stays in THIS frame's log (fire-and-post; the store's
@@ -1211,11 +1213,16 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
     log_error("loop: out of memory building the refused cell's paired "
               "cell.result at '%s'", frame_sid(f));
   } else {
+    /* The refusal's wording: the generic refusal, or the poisoned runtime's
+       own corr-matched failure data (frame.c's interrupt synthesis — the
+       poison contract, spec §2). */
+    const char* refusal_note = _frame_cell_refusal_text(f);
     json_object_set(result_payload, "corr",
                     json_new_int((int64_t)e->turn_cell_corr));
     json_object_set(result_payload, "status", json_new_int(1));
     json_object_set(result_payload, "text",
-                    json_new_string("cell refused before execution"));
+                    json_new_string((refusal_note != NULL) ? refusal_note
+                                    : "cell refused before execution"));
     /* with_riders = the engine's compose-time facts: its open turn closes
        completed with the refusal's result (the cycle answered, the engine
        continues); the helper clears the flags when the batch posts. */
@@ -1233,7 +1240,7 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
    resume. A TOP frame failure makes NO status change (the pinned
    cap-is-a-failure shape). A terminate re-entered on an already-ended engine
    is a loud no-op. Never silent. */
-static void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text) {
+void _frame_engine_terminate(frame_t* f, uint8_t ok, const char* text) {
   frame_engine_state_t* e = _frame_engine_state(f);
   if (e == NULL || !e->engine_live) {
     log_error("loop: a terminal step at '%s' reached an already-ended engine "
@@ -1651,8 +1658,23 @@ int frame_run_loop(frame_t* f) {
          own message is the diagnosis (the awaited reply routes whenever it
          lands; late engine replies drop loud). */
       const char* kind = "store-timeout";
-      if (e->phase == FRAME_PHASE_CELL) kind = "cell-timeout";
-      else if (e->phase == FRAME_PHASE_MODEL) kind = "model-await";
+      if (e->phase == FRAME_PHASE_CELL) {
+        /* The unification (surface-completion spec §2): the inline driver's
+           cell deadline runs the SAME interrupt synthesis the pooled
+           watchdog posts — the corr-matched close + poison — instead of
+           giving up with the cell slot left pending. arm_cut = 0: a
+           deadline never arms a cut. The synthesis flips the compose-time
+           facts (a POSTED close leaves turn_open 0 and the engine ended),
+           so the following _loop_fail writes ONLY the cell-timeout control
+           event — both branches land balanced. A batch refusal leaves
+           turn_open untouched, and _loop_fail's rider path closes the open
+           tail itself. */
+        _frame_interrupt_apply(f, 0,
+                               "aborted: cell exceeded the watchdog deadline");
+        _loop_fail(f, e, "cell-timeout", NULL);
+        break;
+      }
+      if (e->phase == FRAME_PHASE_MODEL) kind = "model-await";
       log_error("loop: the engine at '%s' awaited phase %u past its %u ms "
                 "deadline — the engine ends failed loud", frame_sid(f),
                 (unsigned)e->phase, _loop_phase_deadline_ms(e->phase));

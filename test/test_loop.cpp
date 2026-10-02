@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 extern "C" {
 #include "../src/Frame/frame.h"
 #include "../src/Frame/frame_messages.h"
@@ -1075,6 +1077,167 @@ TEST(TestLoop, TestAsyncScriptedBackendDrivesTheSameEngine) {
   EXPECT_TRUE(saw_assistant);
   json_value_destroy(events);
 
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* --- the interrupt seam (surface-completion spec §2) ------------------------
+   frame_interrupt's whole contract, in one inline-mode pair: the synthesis
+   (cut cell + aborted turn) with the runtime's POISON, and the idle shape
+   that must write nothing. The interrupt thread is genuinely concurrent —
+   the ASan dir is the race's proof (the pinned discipline for the
+   multi-threaded tests). */
+
+TEST(TestLoop, TestFrameInterruptCutsCellAndAbortsTurn) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "interrupt me", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* A cell that sleeps ~3 s: pyrt's interrupt is COOPERATIVE-ONLY (pinned
+     CPython 3.12.13), so the running cell cannot be cut — the interrupt's
+     own SYNTHESIS closes it corr-matched now, and the cell's REAL result
+     lands late and drops quietly. Timing margins are generous: interrupt at
+     ~300 ms (well into the sleep — the pyrt boot is far faster in every
+     non-valgrind build), cell sleep 3 s. */
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import time\\nprint('started')\\ntime.sleep(3)\"}"}}]}}]})json";
+
+  std::vector<std::string> replies = {turn1};
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  std::thread killer([f]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    frame_interrupt(f);
+  });
+
+  /* The engine ends ABORTED (a failure exit for the loop), never ok. */
+  EXPECT_EQ(frame_run_loop(f), 1);
+  killer.join();
+
+  /* The synthesized close rode ONE batch: cell.result (status 1, the
+     interrupt text) + step.end + turn.end {aborted}; the turn.end is the
+     log's NEWEST record (the engine ended; nothing posted after). */
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  int saw_result = 0, saw_step_end = 0, saw_turn_end = 0;
+  size_t turn_end_at = (size_t)-1;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    json_value_t* type_v = json_get(rec, "type");
+    if (type_v == NULL) continue;
+    const char* tn = json_as_string(type_v);
+    if (strcmp(tn, "cell.result") == 0) {
+      json_value_t* p = json_get(rec, "payload");
+      if (p != NULL && json_as_int(json_get(p, "status")) == 1 &&
+          strstr(json_as_string(json_get(p, "text")), "interrupted") != NULL) {
+        saw_result = 1;
+      }
+    } else if (strcmp(tn, "step.end") == 0) {
+      saw_step_end = 1;
+    } else if (strcmp(tn, "turn.end") == 0) {
+      json_value_t* p = json_get(rec, "payload");
+      json_value_t* reason = (p != NULL) ? json_get(p, "reason") : NULL;
+      json_value_t* kind = (reason != NULL) ? json_get(reason, "kind") : NULL;
+      if (kind != NULL &&
+          strcmp(json_as_string(kind), "aborted") == 0) {
+        saw_turn_end = 1;
+        turn_end_at = i;
+      }
+    }
+  }
+  EXPECT_EQ(saw_result, 1);
+  EXPECT_EQ(saw_step_end, 1);
+  EXPECT_EQ(saw_turn_end, 1);
+  ASSERT_NE(turn_end_at, (size_t)-1);
+  EXPECT_EQ(turn_end_at, json_size(events) - 1)
+      << "the aborted turn.end is the log's newest record";
+  json_value_destroy(events);
+
+  /* The frame still functions (the poison is the RUNTIME's, not the
+     frame's): recall runs its round trip without a deadlock. */
+  char* v = frame_recall(f, "nonexistent-key");
+  free(v);   /* NULL ok — the point is frame_recall did not crash */
+
+  /* Let the interrupted cell's 3 s sleep run out so its REAL pyrt result
+     parks in the frame's mailbox; the SECOND run's first pump then
+     dispatches the quiet-drop branch deterministically (it writes nothing —
+     and the cell's sleep has bounded the wait, so frame_destroy's join
+     below is instant). */
+  std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+
+  /* The poison contract: a resumed turn's cell refuses corr-matched loud —
+     its paired status-1 cell.result names the poison, and the run itself
+     continues (the refusal is failure data the model reads; the content
+     turn ends it cleanly). */
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('after', 1)\"}"}}]}}]})json";
+  std::string turn3 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"the poisoned refusal came through"}}]})json";
+  std::vector<std::string> replies2 = {turn2, turn3};
+  sm.replies = &replies2;
+  EXPECT_EQ(frame_run_loop(f), 0);
+
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  int saw_poison = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    json_value_t* type_v = json_get(rec, "type");
+    if (type_v == NULL) continue;
+    if (strcmp(json_as_string(type_v), "cell.result") == 0) {
+      json_value_t* p = json_get(rec, "payload");
+      if (p != NULL && json_as_int(json_get(p, "status")) == 1 &&
+          strstr(json_as_string(json_get(p, "text")), "poisoned") != NULL) {
+        saw_poison = 1;
+      }
+    }
+  }
+  EXPECT_EQ(saw_poison, 1)
+      << "the resumed turn's cell must refuse corr-matched loud with the "
+         "poison text";
+  json_value_destroy(events);
+
+  frame_destroy(f);   /* documented cost on a wedged runtime — the join; here
+                         bounded: the interrupt's cell already finished */
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestFrameInterruptArmsNoStoreWriteWhenNothingOpen) {
+  /* Interrupt an IDLE frame: no pending cell, no open turn — the boundary
+     cut arms only (pyrt has not even booted here) and NO store record
+     appears. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "idle interrupt", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  frame_interrupt(f);
+  _frame_pump(f);   /* the inline owner delivers the queued FRM_INT */
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  size_t before = json_size(events);
+  json_value_destroy(events);
+  EXPECT_EQ(before, 0u) << "an idle interrupt wrote nothing durable";
+
+  char* v = frame_recall(f, "k");   /* the frame still works (no deadlock) */
+  free(v);
   frame_destroy(f);
   wave_db_close(db);
 }
