@@ -521,6 +521,65 @@ TEST(TestPyrt, TestResultTextCappedAtSourceWithMarker) {
   py_frame_free(self);
 }
 
+/* Embedded stdout capture (spec §5, subprocess envelope parity): printed
+   stdout IS the result; the repr joins as a "=> repr" closing line only when
+   the last expression is not None; a crashing cell keeps its partial stdout
+   ahead of the traceback. */
+TEST(TestPyrt, TestPrintedStdoutIsTheResult) {
+  py_frame_t* self = py_frame_create();
+  py_frame_execute(self, "print('hello world')");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  ASSERT_NE(self->results[0]->text, nullptr);
+  EXPECT_STREQ(self->results[0]->text, "hello world");
+  py_frame_free(self);
+}
+
+TEST(TestPyrt, TestStdoutAndReturnValueCompose) {
+  /* The composed shape needs the EVAL path: a multi-statement cell like
+     "print('head')\n41 + 1" only parses as exec, where the helper's result is
+     None (parity with the subprocess envelope, which reports the child's
+     stdout alone — TestExecCellStdoutAlone below). The eval-path compose is
+     reached by an expression that prints as a side effect and yields a value. */
+  py_frame_t* self = py_frame_create();
+  py_frame_execute(self, "print('head') or 42");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  ASSERT_NE(self->results[0]->text, nullptr);
+  EXPECT_STREQ(self->results[0]->text, "head\n=> 42");
+  py_frame_free(self);
+}
+
+TEST(TestPyrt, TestExecCellStdoutAlone) {
+  py_frame_t* self = py_frame_create();
+  py_frame_execute(self, "print('head')\n41 + 1");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 0);
+  ASSERT_NE(self->results[0]->text, nullptr);
+  EXPECT_STREQ(self->results[0]->text, "head");
+  py_frame_free(self);
+}
+
+TEST(TestPyrt, TestExceptionKeepsPartialStdout) {
+  py_frame_t* self = py_frame_create();
+  py_frame_execute(self, "print('before the crash')\n1 / 0");
+  py_frame_pump(self, 10000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  EXPECT_EQ(self->results[0]->status, 1);
+  ASSERT_NE(self->results[0]->text, nullptr);
+  const char* text = self->results[0]->text;
+  EXPECT_NE(strstr(text, "before the crash"), nullptr);
+  EXPECT_NE(strstr(text, "ZeroDivisionError"), nullptr);
+  py_frame_free(self);
+}
+
 /* A small result never touches the marker: the cap is a clean copy when the
    text fits. */
 TEST(TestPyrt, TestSmallResultUnchangedByCap) {

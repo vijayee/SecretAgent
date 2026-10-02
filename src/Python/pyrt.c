@@ -80,23 +80,41 @@ static size_t _pyrt_live = 0;
 
 /* Runs once per subinterpreter; defines the cell executor the thread calls.
    `import actor` binds the injected module for the interp so a never-importing
-   cell still speaks the bridge — live models emit bare `actor.*` calls. */
+   cell still speaks the bridge — live models emit bare `actor.*` calls.
+   Printed stdout is captured per cell and IS the result (the subprocess
+   envelope's parity — spec §5); the last expression's repr joins it as a
+   closing "=> repr" line when both exist; a crashing cell keeps its partial
+   stdout ahead of the traceback. */
 static const char _PYRT_HELPERS[] =
     "import actor\n"
     "def __sa_exec_cell(code):\n"
-    "    import traceback\n"
+    "    import traceback, io, sys\n"
+    "    buf = io.StringIO()\n"
+    "    old = sys.stdout\n"
+    "    sys.stdout = buf\n"
     "    try:\n"
     "        try:\n"
     "            result = eval(compile(code, '<cell>', 'eval'), globals())\n"
     "        except SyntaxError:\n"
     "            exec(compile(code, '<cell>', 'exec'), globals())\n"
     "            result = None\n"
+    "        result_txt = None if result is None else repr(result)\n"
     "        if result is not None:\n"
     "            globals()['_'] = result\n"
-    "            return 0, repr(result)\n"
-    "        return 0, ''\n"
+    "        sys.stdout = old\n"
+    "        out = buf.getvalue()\n"
+    "        if out.endswith('\\n'):\n"
+    "            out = out[:-1]\n"
+    "        if out:\n"
+    "            if result_txt is not None:\n"
+    "                return 0, out + '\\n=> ' + result_txt\n"
+    "            return 0, out\n"
+    "        return 0, result_txt if result_txt is not None else ''\n"
     "    except BaseException:\n"
-    "        return 1, traceback.format_exc()\n";
+    "        status, text = 1, traceback.format_exc()\n"
+    "        sys.stdout = old\n"
+    "        out = buf.getvalue()\n"
+    "        return status, (out + '\\n' + text) if out else text\n";
 
 /* ------------------------------------------------------------------ */
 /* Payload destroyers (pyrt_messages.h). NULL-safe, plain free().      */
