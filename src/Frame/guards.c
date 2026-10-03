@@ -15,7 +15,7 @@ uint8_t guards_doom_next(uint8_t streak, uint8_t identical_code,
     streak = 0;   /* the reset runs BEFORE the identity check */
   }
   if (identical_code != 0) {
-    streak = (uint8_t)(streak + 1);
+    if (streak != UINT8_MAX) streak = (uint8_t)(streak + 1);
     if (tripped != NULL && streak >= SA_GUARDS_DOOM_THRESHOLD) {
       *tripped = 1;
     }
@@ -48,7 +48,9 @@ static unsigned _guards_backoff_step(uint8_t retry_index) {
 
 guards_cause_e guards_retry_cause(int http_status, const char* finish_reason) {
   if (http_status < 0) return GUARDS_CAUSE_TRANSPORT;
-  if (finish_reason != NULL && finish_reason[0] == 'l' &&
+  /* the overload shape: ONLY a 2xx decode whose finish_reason is the
+     load-stop — a 429/4xx/5xx with a stray load reason keeps its own class */
+  if (http_status >= 200 && http_status < 300 && finish_reason != NULL &&
       strcmp(finish_reason, "load") == 0) {
     return GUARDS_CAUSE_OVERLOAD;
   }
@@ -60,8 +62,10 @@ guards_cause_e guards_retry_cause(int http_status, const char* finish_reason) {
 
 const guards_retry_plan_t* guards_retry_plan(guards_cause_e cause) {
   size_t i = (size_t)(int)cause;
+  /* an out-of-range cause (an enum drift's worst case) must never inherit
+     TRANSPORT's retry-5 plan — the FALLBACK plan is the sink */
   if (i >= (sizeof(_guards_plans) / sizeof(_guards_plans[0]))) {
-    i = 0;
+    i = (size_t)GUARDS_CAUSE_FALLBACK;
   }
   return &_guards_plans[i];
 }

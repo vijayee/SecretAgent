@@ -20,8 +20,10 @@
 /* The breaker's threshold: the Nth byte-identical consecutive cell is
    refused before its audit (opencode's processor.ts DOOM_LOOP_THRESHOLD = 3;
    doc steal-line: an event to the runtime's policy, never a self-approving
-   ask). */
+   ask). ifndef discipline — a build can override with -D. */
+#ifndef SA_GUARDS_DOOM_THRESHOLD
 #define SA_GUARDS_DOOM_THRESHOLD 3
+#endif
 
 /* The doom streak's next value. identical_code = the incoming cell code is
    byte-identical to the last dispatched one; fresh_input = a NEW user-role

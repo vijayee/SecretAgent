@@ -50,6 +50,13 @@ TEST(TestGuards, TestDoomThresholdIsThree) {
             SA_GUARDS_DOOM_THRESHOLD);
 }
 
+TEST(TestGuards, TestStreakSaturates) {
+  uint8_t tripped = 0;
+  uint8_t s = guards_doom_next(UINT8_MAX, 1, 0, &tripped);
+  EXPECT_EQ(tripped, 1);
+  EXPECT_EQ(s, UINT8_MAX) << "the streak never wraps into a fresh streak";
+}
+
 /* --- the retry table ----------------------------------------------------- */
 
 TEST(TestGuards, TestCauseClasses) {
@@ -62,6 +69,9 @@ TEST(TestGuards, TestCauseClasses) {
   EXPECT_EQ(guards_retry_cause(200, NULL), GUARDS_CAUSE_FALLBACK);
   /* the overload shape: a 2xx decode whose finish_reason is the load-stop */
   EXPECT_EQ(guards_retry_cause(200, "load"), GUARDS_CAUSE_OVERLOAD);
+  EXPECT_EQ(guards_retry_cause(429, "load"), GUARDS_CAUSE_RATE)
+      << "a genuine rate limit is not shadowed by a stray load reason";
+  EXPECT_EQ(guards_retry_cause(404, "load"), GUARDS_CAUSE_OVERFLOW);
 }
 
 TEST(TestGuards, TestRetryPlans) {
@@ -73,6 +83,14 @@ TEST(TestGuards, TestRetryPlans) {
   EXPECT_EQ(guards_retry_plan(GUARDS_CAUSE_OVERFLOW)->retryable, 0);
   EXPECT_EQ(guards_retry_plan(GUARDS_CAUSE_FALLBACK)->cap, 1)
       << "the fallback keeps today's once-only rule";
+}
+
+TEST(TestGuards, TestInvalidCauseFallsBack) {
+  /* an out-of-range cause (an enum drift's worst case) must never say
+     "retry 5 times" — the fallback's once-only plan is the sink */
+  EXPECT_EQ(guards_retry_plan((guards_cause_e)99)->cap, 1);
+  EXPECT_EQ(guards_retry_plan((guards_cause_e)99)->retryable, 1);
+  EXPECT_EQ(guards_retry_plan((guards_cause_e)-1)->cap, 1);
 }
 
 TEST(TestGuards, TestBackoffProgressionAndRetryAfter) {
