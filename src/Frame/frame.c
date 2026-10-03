@@ -330,6 +330,15 @@ struct frame_t {
                                              written ONLY on this frame's
                                              dispatch thread — frame.c's
                                              disarm protocol owns it */
+  platform_thread_t* delayed_post_thread; /* the armed retry backoff's
+                                             one-shot timer (NULL = none);
+                                             JOINABLE — reaped at the FRM_TURN
+                                             dispatch's head and in
+                                             frame_destroy FIRST. Dispatch-
+                                             thread-only bookkeeping (arm +
+                                             reap), like the cell slot; the
+                                             thread itself never touches frame
+                                             state (guards spec §3). */
   uint8_t stop_requested;     /* FRM_STOP: the loop drains, then stops */
   /* The nesting depth of THIS frame's behavior dispatches (0 = not inside a
      mailbox dispatch). The single-runner discipline keeps it exact; the sync
@@ -863,6 +872,79 @@ static void _frame_cell_watchdog_arm(frame_t* f) {
   }
   f->cell_watchdog = w;
   platform_mutex_unlock(w->lock);
+}
+
+/* --- the one-shot delayed post (guards spec §3): the retry table's backoff
+   DELIBERATELY not the cell watchdog: no handoff message, no disarm
+   protocol, no private mutex. WHY this is still race-free:
+     - The thread's ONLY cross-thread touches are (a) reading die_requested
+       (an ATOMIC) and (b) the post itself — both safe while the frame's
+       memory is alive, and the frame's memory IS alive: frame_destroy JOINS
+       the stored thread BEFORE any teardown step.
+     - f->delayed_post_thread is written ONLY by the frame's dispatch thread
+       (arm + reap) and read by nobody else (the thread never touches frame
+       bookkeeping) — so the watchdog's publish-before-create race has NO
+       counterpart here.
+     - NO MUTEX exists in this block (the no-locks grep gate: only the
+       watchdog's own quartet and model.c may carry mutexes) — the single
+       writer plus the join-before-teardown ordering substitutes for one.
+   The thread frees its OWN record below — the frame never dereferences the
+   struct, only joins the thread.
+   A delay of 0 never spawns: the caller posts directly (today's shape). */
+typedef struct frame_delayed_post_t {
+  uint32_t delay_ms;
+  frame_t* f;                 /* BORROWED; dies after frame_destroy joins */
+} frame_delayed_post_t;
+
+static void* _frame_delayed_post_main(void* arg) {
+  frame_delayed_post_t* d = (frame_delayed_post_t*)arg;
+  if (d->delay_ms > 0) platform_sleep_ms(d->delay_ms);
+  frame_t* f = d->f;
+  if (_frame_engine_die_requested(f) != 0) {
+    /* the die rule: no repost into a dying frame — the log carries it */
+    log_error("loop: a retry backoff expired into the dying frame '%s' — "
+              "dropped loud", frame_sid(f));
+  } else {
+    _frame_post(&f->actor, (uint32_t)FRM_TURN, NULL, NULL, "retry backoff");
+  }
+  free(d);
+  return NULL;
+}
+
+/* Join the in-flight (or already-exited) timer thread; clear the pointer.
+   The FRM_TURN dispatch's head and frame_destroy call it — the join's
+   ordering against the teardown is what keeps the thread's die-check
+   provable against live frame memory. NEVER join when NULL. */
+static void _frame_delayed_post_reap(frame_t* f) {
+  if (f == NULL || f->delayed_post_thread == NULL) return;
+  platform_thread_join(f->delayed_post_thread);
+  f->delayed_post_thread = NULL;
+}
+
+/* Arm one delayed FRM_TURN; delay_ms > 0 ONLY (0 posts directly, today's
+   shape). The thread is JOINABLE so the completion sites reap it. */
+int _frame_delayed_post(frame_t* f, uint32_t delay_ms) {
+  if (f == NULL || f->st == NULL) return -1;
+  if (f->delayed_post_thread != NULL) {
+    /* INVARIANT: the engine is sequential — the previous timer's own post
+       IS the dispatch that reaps it. Seeing one here is a routing bug's
+       loud trace; reap-and-continue keeps the state machine safe anyway. */
+    log_error("frame: a second delayed post armed at '%s' — reaping the "
+              "stale one first", f->sid_path);
+    _frame_delayed_post_reap(f);
+  }
+  frame_delayed_post_t* d =
+      (frame_delayed_post_t*)get_clear_memory(sizeof(frame_delayed_post_t));
+  if (d == NULL) return -1;
+  d->delay_ms = delay_ms;
+  d->f = f;
+  platform_thread_t* t = platform_thread_create(_frame_delayed_post_main, d);
+  if (t == NULL) {
+    free(d);
+    return -1;
+  }
+  f->delayed_post_thread = t;
+  return 0;
 }
 
 /* The store's outgoing reply: corr-matched to the requester's actor. records
@@ -2855,7 +2937,11 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
     case FRM_TURN:
       /* The engine's scheduled turn-step continuation (Task 3): ONE turn
          step — the checks and the derive's store round trip — then a yield,
-         with the step continued by the arrival dispatches. No payload. */
+         with the step continued by the arrival dispatches. No payload.
+         The HEAD REAPS the retry backoff's timer first (guards spec §3):
+         the previous backoff's own FRM_TURN IS this dispatch, so its join
+         is always immediate — idempotent (NULL = none), never a wait. */
+      _frame_delayed_post_reap(f);
       _frame_engine_turn(f);
       break;
     case FRM_MODEL_RESULT: {
@@ -4219,6 +4305,15 @@ void frame_destroy(frame_t* f) {
               "ignored (the deferred teardown's owner runs it)");
     return;
   }
+  /* The retry backoff's timer JOINS FIRST (guards spec §3): die is now 1,
+     so a joined thread's expiry lands on its die-check's loud drop — and
+     every later teardown step runs against a frame whose only cross-thread
+     timer thread is already gone. The join's ordering against the teardown
+     is the timer's memory-safety contract: the thread's die-check and post
+     touch borrowed frame memory, so it must never outlive record teardown
+     — here it is joined BEFORE the watchdog disarm, the pyrt destroy's own
+     join, and the mailbox teardown. */
+  _frame_delayed_post_reap(f);
   /* The POOLED cell watchdog disarms/joins FIRST (spec §2): before the
      pyrt destroy's own join and before the mailbox teardown, so a not-yet-
      handed-off watcher provably exits (joined, struct freed) and an

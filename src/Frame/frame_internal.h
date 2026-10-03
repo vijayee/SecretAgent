@@ -201,6 +201,19 @@ const char* _frame_cell_refusal_text(const frame_t* f);
    (or defers) mid-turn. 0 for a NULL frame. */
 uint8_t _frame_engine_die_requested(const frame_t* f);
 
+/* The retry backoff's ONE-SHOT delayed post (frame.c implements; guards
+   spec §3 — the loop's retry branch calls it after each backoff'd model
+   failure): spawn one short-lived JOINABLE thread that sleeps delay_ms,
+   posts the FRM_TURN continuation into the frame's own mailbox (a dying
+   frame's expiry drops loud), and quits. The thread is reaped at the
+   FRM_TURN dispatch's head (its own post IS that dispatch) and in
+   frame_destroy FIRST (join-before-teardown keeps the thread's die-check
+   provable against live frame memory). Returns 0 armed, -1 refused — the
+   caller then posts immediately (the bounded wait is an optimization;
+   never a correctness dependency). delay_ms is the table's backoff; the
+   caller posts DIRECTLY on a 0 backoff (today's shape). */
+int _frame_delayed_post(frame_t* f, uint32_t delay_ms);
+
 /* Engine handlers (loop.c implements, frame.c's _frame_behavior routes): */
 
 /* Start the engine: refuses (-1, loud) on a dead frame or an engine already

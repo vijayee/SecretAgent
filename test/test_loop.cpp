@@ -1256,6 +1256,248 @@ TEST(TestLoop, TestAsyncScriptedBackendDrivesTheSameEngine) {
   wave_db_close(db);
 }
 
+/* --- the retry branch (guards spec §2) --------------------------------------
+   The retry table drives the engine's model-failure branch: server/transport/
+   rate classes retry with the class's backoff (the one-shot delayed-post
+   timer owns the wait), overload/overflow fail loud and never repost, and
+   the fallback class keeps today's once-only rule. The async scripted
+   harness again: each delivery is a (status, body, retry-after) the fake
+   backend hands the engine's sink — the sink CONSUMES the headers it is
+   passed (the completion's ownership contract: the engine's sink deinits +
+   frees the capture), so every header-carrying delivery heap-constructs its
+   own capture and hands it over exactly once. Timing pins: FLOORS only
+   (timing ceilings are flaky — never one). */
+
+#if defined(SA_HAS_STREAMS)
+extern "C" {
+#include "../src/Streams/http_headers.h"
+}
+#endif
+
+typedef struct retry_delivery_t {
+  int status;
+  const char* body;          /* NULL = no body (the empty response shape) */
+  unsigned retry_after_sec;  /* 0 = no retry-after header */
+} retry_delivery_t;
+
+typedef struct retry_model_t {
+  model_backend_t base;
+  std::vector<retry_delivery_t> deliveries;
+  size_t next;
+} retry_model_t;
+
+static int retry_submit(void* self, json_value_t* messages, json_value_t* tools,
+                        model_response_sink_fn on_done, void* on_done_ctx) {
+  (void)tools;
+  (void)messages;
+  retry_model_t* rm = (retry_model_t*)self;
+  if (rm->next >= rm->deliveries.size() || on_done == NULL) {
+    return -1;   /* rejected before any I/O: the sink never fires */
+  }
+  const retry_delivery_t& d = rm->deliveries[rm->next++];
+  http_headers_t* headers = nullptr;
+#if defined(SA_HAS_STREAMS)
+  if (d.retry_after_sec > 0) {
+    headers = (http_headers_t*)malloc(sizeof(http_headers_t));
+    EXPECT_NE(headers, nullptr);
+    if (headers != nullptr) {
+      http_headers_init(headers);
+      http_headers_set(headers, "retry-after",
+                       std::to_string(d.retry_after_sec).c_str());
+    }
+  }
+#endif
+  char* heap_body = (d.body != nullptr) ? strdup(d.body) : nullptr;
+  on_done(on_done_ctx, d.status, heap_body,
+          (heap_body != nullptr) ? strlen(heap_body) : 0, NULL, headers);
+  return 0;
+}
+
+static size_t count_control_kind(json_value_t* events, const char* kind) {
+  size_t n = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = (rec != nullptr) ? payload_of(rec) : nullptr;
+    json_value_t* k = (p != nullptr) ? json_get(p, "kind") : nullptr;
+    if (k != nullptr && strcmp(json_as_string(k), kind) == 0) n++;
+  }
+  return n;
+}
+
+static std::string control_text_of(json_value_t* events, const char* kind) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != nullptr) ? json_get(p, "kind") : nullptr;
+    if (k == nullptr || strcmp(json_as_string(k), kind) != 0) continue;
+    json_value_t* t = json_get(p, "text");
+    return (t != nullptr) ? std::string(json_as_string(t)) : std::string();
+  }
+  return std::string();
+}
+
+TEST(TestLoop, TestServerFailureRetriesWithBackoff) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "retry it", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* Four 503s (the server class, cap 5) then success: the server class's
+     backoff steps for the four retries are 0/250/500/1000 ms — the run
+     cannot complete faster than the waits. */
+  retry_model_t rm = {};   /* zero-init: the vtable's members set explicitly */
+  rm.base.complete = NULL;   /* async-only: the engine takes the submit path */
+  rm.base.submit = retry_submit;
+  std::string done_body =
+      R"json({"choices":[{"message":{"role":"assistant","content":"recovered"}}]})json";
+  rm.deliveries = {{503, nullptr, 0},
+                   {503, nullptr, 0},
+                   {503, nullptr, 0},
+                   {503, nullptr, 0},
+                   {200, done_body.c_str(), 0}};
+  frame_set_model_backend(f, &rm.base);
+
+  auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(frame_run_loop(f), 0) << "the run completed after four retries";
+  auto t1 = std::chrono::steady_clock::now();
+  long long elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+  EXPECT_GE(elapsed_ms, 1000)
+      << "the server class's backoff waits ran (a floor, never a ceiling)";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_control_kind(events, "model-error"), 4u)
+      << "one control per retry, exactly";
+  EXPECT_EQ(count_control_kind(events, "model-error-final"), 0u);
+  EXPECT_EQ(rm.next, 5u) << "the backend saw five deliveries total";
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestRateFailureHonorsRetryAfter) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "slow down", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* Two 429s whose retry-after asks 2 s, then success: the rate class's
+     backoff honors the provider's pacing — 2 x 2000 ms of waiting. */
+  retry_model_t rm = {};
+  rm.base.complete = NULL;
+  rm.base.submit = retry_submit;
+  std::string done_body =
+      R"json({"choices":[{"message":{"role":"assistant","content":"paced"}}]})json";
+  rm.deliveries = {{429, nullptr, 2}, {429, nullptr, 2}, {200, done_body.c_str(), 0}};
+  frame_set_model_backend(f, &rm.base);
+
+  auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(frame_run_loop(f), 0) << "the run completed after two retries";
+  auto t1 = std::chrono::steady_clock::now();
+  long long elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+#if defined(SA_HAS_STREAMS)
+  EXPECT_GE(elapsed_ms, 4000) << "both retry-after waits were honored";
+#else
+  EXPECT_GE(elapsed_ms, 0) << "no streams: no header ever arrives — the "
+                              "table's immediate steps run instead";
+#endif
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_control_kind(events, "model-error"), 2u);
+  EXPECT_EQ(count_control_kind(events, "model-error-final"), 0u);
+  EXPECT_EQ(rm.next, 3u);
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestOverloadFailsLoudNeverRetries) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "overloaded", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* The load-stop shape: a 200 whose decode carries finish_reason "load".
+     The reply DECODES fine — the old code turned it into an empty content
+     turn (the frame-tree slice's flagged follow-up: the zero-token load-stop
+     mapping to empty-turn/done); now the engine fails loud and NEVER
+     retries. */
+  retry_model_t rm = {};
+  rm.base.complete = NULL;
+  rm.base.submit = retry_submit;
+  std::string load_body =
+      R"json({"choices":[{"message":{"role":"assistant","content":""},)json"
+      R"json("finish_reason":"load"}]})json";
+  rm.deliveries = {{200, load_body.c_str(), 0}};
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 1) << "the engine failed loud";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_control_kind(events, "model-error"), 0u)
+      << "no retry repost happened";
+  EXPECT_EQ(count_control_kind(events, "model-error-final"), 1u);
+  std::string final_text = control_text_of(events, "model-error-final");
+  EXPECT_NE(final_text.find("overload"), std::string::npos)
+      << "the final control names the overload class";
+  EXPECT_EQ(rm.next, 1u) << "the backend saw exactly one delivery (zero reposts)";
+  EXPECT_EQ(count_type(events, "turn.end"), 1u)
+      << "the failed turn still closed (the finally-discipline)";
+
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestOverflowNeverRetries) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "too big", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* A client-side refusal (http 400): retrying blind is never right — the
+     engine fails loud on the FIRST overflow, no repost, no retry. */
+  retry_model_t rm = {};
+  rm.base.complete = NULL;
+  rm.base.submit = retry_submit;
+  rm.deliveries = {{400, nullptr, 0}};
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 1) << "the engine failed loud";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_control_kind(events, "model-error"), 0u)
+      << "no retry repost happened";
+  EXPECT_EQ(count_control_kind(events, "model-error-final"), 1u);
+  std::string final_text = control_text_of(events, "model-error-final");
+  EXPECT_NE(final_text.find("overflow:"), std::string::npos)
+      << "the final control carries the overflow class's name";
+  EXPECT_EQ(rm.next, 1u) << "the backend saw exactly one delivery (zero reposts)";
+
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 /* --- the interrupt seam (surface-completion spec §2) ------------------------
    frame_interrupt's whole contract, in one inline-mode pair: the synthesis
    (cut cell + aborted turn) with the runtime's POISON, and the idle shape

@@ -96,14 +96,17 @@
 // the result text carries the outcome, and history-by-projection is where
 // token bloat would otherwise creep back. One helper builds the whole array.
 //
-// ERRORS: model errors retry ONCE (the retry is ONE fresh FRM_TURN repost —
+// ERRORS: model errors retry per the GUARDS TABLE (guards spec §2; the
+// cause-specific caps + backoffs — the retry is ONE fresh FRM_TURN repost,
 // the re-derive is provably equivalent to the old loop's same-array retry
 // because the derive is stateless from the store: a steering write that
-// slipped in only ADDS context) and end the engine failed with control
-// events ("model-error", then "model-error-final"); the store round trips'
-// refusals, a missing backend, a missing python runtime, and each awaited
-// phase's deadline break each fail loud with their own control kind. The
-// engine NEVER spins and never fails silently.
+// slipped in only ADDS context; wait-bearing retries post the SAME
+// continuation through the delayed-post timer) and end the engine failed
+// with control events ("model-error" per retry, then "model-error-final"
+// carrying the class's name); the store round trips' refusals, a missing
+// backend, a missing python runtime, and each awaited phase's deadline
+// break each fail loud with their own control kind. The engine NEVER spins
+// and never fails silently.
 //
 // The synchronous driver: frame_run_loop (below) is start-or-pump — a
 // bounded pump of the frame's, its live ancestors', and the inline store's
@@ -117,6 +120,9 @@
 #include "loop.h"
 #include "frame_internal.h"
 #include "frame_messages.h"
+#include "guards.h"     /* the retry table (guards spec §2): this file's reply
+                           path is the table's SECOND integration point — the
+                           cause lookup + the plan's cap + the backoff */
 #include "lifecycle.h"
 #include "model.h"
 #include "model_internal.h"
@@ -1038,40 +1044,97 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
   /* yield: the FINISH reply takes the END rule */
 }
 
+/* The retry table's class-name surface (the failure close's text carries
+   the cause's name: "model-error-final: <class>: <detail>"). Borrowed
+   literals; the guards_cause_e → text table. */
+static const char* _loop_cause_name(guards_cause_e cause) {
+  switch (cause) {
+    case GUARDS_CAUSE_TRANSPORT: return "transport";
+    case GUARDS_CAUSE_SERVER: return "server";
+    case GUARDS_CAUSE_RATE: return "rate";
+    case GUARDS_CAUSE_OVERLOAD: return "overload";
+    case GUARDS_CAUSE_OVERFLOW: return "overflow";
+    default: return "fallback";
+  }
+}
+
 /* The reply processing, shared by the sync and the async arrival paths —
-   "scripted backends drive the SAME code". Model error → control
-   "model-error" + ONE retry (a fresh FRM_TURN repost; the re-derive is
-   provably equivalent — the derive is stateless from the store), second
-   consecutive failure → control "model-error-final" + engine end failed.
-   http_status + retry_after_sec ride the failure's observed facts into
-   this function from BOTH callers: the async arrival passes the payload's
-   fields; the sync drain has no status facts (a scripted sync backend
-   speaks no HTTP) and passes 0/0 = absent. Task 5's retry branch consumes
-   them (the guards table's cause + the rate class's Retry-After backoff);
-   today's branch behaves identically without them. */
+   "scripted backends drive the SAME code". The GUARDS TABLE (guards spec
+   §2) drives the model-failure branch: the cause folds the failure's
+   observed facts (http_status — the async arrival passes the payload's
+   status, the sync drain passes 0 = a scripted sync backend speaks no
+   HTTP — and a 2xx decode's finish_reason), the class's plan decides
+   retry-vs-fail, and a retry's repost carries the class's backoff: 0 =
+   the immediate FRM_TURN repost (today's shape, the re-derive provably
+   equivalent — the derive is stateless from the store), > 0 = the
+   one-shot delayed-post timer's same continuation. Retryable exhaustion
+   or a non-retryable class ends the engine failed with control
+   "model-error-final" carrying "<class>: <detail>". */
 static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
                                 int rc, model_reply_t* reply, char* err,
                                 int http_status, unsigned retry_after_sec) {
-  (void)http_status;        /* the guards table's cause input — consumed by */
-  (void)retry_after_sec;    /* Task 5's retry branch in this same function */
   if (rc != 0 || reply == NULL) {
     const char* detail =
         (err != NULL && err[0] != '\0') ? err : "backend returned no reply";
-    if (e->model_retries < 1) {
+    /* The cause folds the failure's observed facts FIRST — a non-retryable
+       class must never take the retry path. The finish_reason rides only a
+       reply object that coexisted with an error rc (the decode NULLs the
+       reply on every error shape; the overload shape DECODES fine and is
+       the success path's guest below). */
+    guards_cause_e cause = guards_retry_cause(
+        http_status,
+        (reply != NULL) ? reply->finish_reason : NULL);
+    const guards_retry_plan_t* plan = guards_retry_plan(cause);
+    if (plan->retryable != 0 && e->model_retries < plan->cap) {
+      unsigned backoff = guards_retry_backoff_ms(plan, e->model_retries,
+                                                 retry_after_sec);
       _loop_control(f, "model-error", detail);
       free(err);
-      e->model_retries = 1;
-      e->model_retry_step = 1;   /* the repost skips the checks + the count */
-      (void)_loop_post_turn(f);
+      if (reply != NULL) model_reply_destroy(reply);
+      e->model_retries = (uint8_t)(e->model_retries + 1);
+      /* The repost: the SAME continuation, ONE fresh FRM_TURN (the model-
+         RETRY machinery is untouched — model_retry_step = 1 skips the
+         entry checks + the count; the turn is never renumbered). backoff
+         0 = today's immediate repost (the standing re-derive equivalence);
+         > 0 = the delayed post of the same continuation — the table's
+         wait is an optimization layered on the SAME state machine. */
+      e->model_retry_step = 1;
+      if (backoff == 0) {
+        (void)_loop_post_turn(f);
+      } else if (_frame_delayed_post(f, backoff) != 0) {
+        log_error("loop: the retry's delayed post refused at '%s' — the "
+                  "retry reposts immediately instead (the bounded wait is "
+                  "an optimization; never a correctness dependency)",
+                  frame_sid(f));
+        (void)_loop_post_turn(f);   /* the optimization degrades, never the
+                                       correctness */
+      }
       return;
     }
-    _loop_fail(f, e, "model-error-final", detail);
+    /* Exhausted retries or a non-retryable class: the class's name rides
+       the final control's text (the standing loud-wording rule). */
+    char final_text[256];
+    snprintf(final_text, sizeof(final_text), "%s: %s",
+             _loop_cause_name(cause), detail);
+    _loop_fail(f, e, "model-error-final", final_text);
     free(err);
     if (reply != NULL) model_reply_destroy(reply);
     return;
   }
   free(err);
   e->model_retries = 0;       /* fresh retry budget per successful call */
+
+  /* The OVERLOAD shape (the load-stop decoded "fine": rc == 0, an empty
+     reply — the success path's guest): never a content turn, never a
+     retry — the frame-tree slice's flagged follow-up fails LOUD (spec §2;
+     the old code turned a zero-token load-stop into empty-turn/done). */
+  if (guards_retry_cause(http_status, reply->finish_reason) ==
+      GUARDS_CAUSE_OVERLOAD) {
+    _loop_fail(f, e, "model-error-final",
+               "overload: the provider answered with a load-stop");
+    model_reply_destroy(reply);
+    return;
+  }
 
   if (reply->tool_code != NULL) {
     _loop_tool_path(f, e, reply);
