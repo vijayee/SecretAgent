@@ -584,6 +584,11 @@ TEST(TestModelDecode, TestSubmitRoundTripMatchesComplete) {
     EXPECT_FALSE(rec.has_error);
     EXPECT_NE(rec.thread_id, std::this_thread::get_id())
         << "the sink fires on the loop thread, never the submitter";
+    /* The canned server's three headers ride the delivery: the recorded
+       count pins the relay's pass-through (the sink parses Retry-After from
+       this capture on the real path). */
+    EXPECT_GT(rec.header_count, 0u)
+        << "the relay passes the captured headers through to the sink";
   }
   /* A second delivery must not follow the first (at-most-one). */
   std::this_thread::sleep_for(std::chrono::milliseconds(50));

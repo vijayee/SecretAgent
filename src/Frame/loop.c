@@ -810,14 +810,15 @@ static void _loop_model_sink(void* ctx, int status, char* body,
                              http_headers_t* headers) {
   /* Retry-After FIRST — the headers' OWNERSHIP ends here (this sink is the
      final consumer; model.h's contract), so the value is parsed and the
-     capture deinit+freed before ANY of the exits below: the die gate, the
-     no-frame drop, and the no-memory drop every free it by construction.
+     capture deinit+freed before ANY of the exits below — the headers die on
+     every exit path, including the no-memory drop.
      Bounded parse (spec §2): seconds only — strcasecmp'd lookup by
-     http_headers_get, strtol, whole-string digits, > 0 and <= 3600
-     accepted; the date form (leading non-digit, or any trailing bytes)
-     answers 0 = absent, and the table's own cap (guards.c's 5 s) bounds the
-     value downstream. µs-scale on the streams loop thread: one lookup, one
-     strtol. */
+     http_headers_get, strtol, digits (strtol also tolerates leading
+     whitespace/sign — harmless: http-parser strips OWS and the guards' 5 s
+     cap bounds the value), > 0 and <= 3600 accepted; the date form (leading
+     non-digit, or any trailing bytes) answers 0 = absent, and the table's
+     own cap (guards.c's 5 s) bounds the value downstream. µs-scale on the
+     streams loop thread: one lookup, one strtol. */
 #if defined(SA_HAS_STREAMS)
   unsigned retry_after_sec = 0;
   if (headers != NULL) {
@@ -825,7 +826,7 @@ static void _loop_model_sink(void* ctx, int status, char* body,
     if (ra != NULL) {
       char* end = NULL;
       long v = strtol(ra, &end, 10);
-      if (end != NULL && end != ra && *end == '\0' && v > 0 && v <= 3600) {
+      if (end != ra && *end == '\0' && v > 0 && v <= 3600) {
         retry_after_sec = (unsigned)v;
       }
     }
