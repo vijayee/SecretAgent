@@ -46,6 +46,9 @@ if (BUILD_TESTING)
             # The budget suite is PURE (Util constants + the marker helper):
             # no WDB, no streams — same plain gate as test_lifecycle.
             test_budget.cpp
+            # The guards suite is PURE (the doom fold + the retry table):
+            # no WDB, no streams.
+            test_guards.cpp
             )
 
     # Same CMake-level mirror idiom as the pyrt gate above: frame store tests
