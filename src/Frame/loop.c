@@ -127,6 +127,14 @@
 #include "../Util/budget.h"
 #include "../Util/log.h"
 
+/* The model sink's Retry-After lookup (below). Streams-gated: the header
+   module's .c is streams-compiled, and in a WDB-no-streams build no http
+   backend exists — every sink delivery's headers is NULL — so the parse
+   compiles out with the transport. */
+#if defined(SA_HAS_STREAMS)
+#include "../Streams/http_headers.h"
+#endif
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -787,7 +795,10 @@ static int _loop_post_turn(frame_t* f) {
    completes on (the streams loop thread; a test backend synchronously within
    submit — µs-scale either way: field writes + one post, NO decode here),
    it moves body/error ownership into the FRM_MODEL_RESULT payload the
-   frame's own dispatch decodes.
+   frame's own dispatch decodes. The delivery's headers capture is BORROWED
+   into this call and OWNED here — this sink is the final consumer, so it
+   parses Retry-After (the rate class's pacing fact) and deinits + frees the
+   capture before every exit below.
 
    The sink also OWNS one pending-submit slot (frame_internal.h's lifetime
    handoff: the engine's submit step acquired it for exactly this
@@ -795,7 +806,35 @@ static int _loop_post_turn(frame_t* f) {
    die-requested frame runs the deferred teardown (frame.c: the record dies
    exactly once, on whichever thread got there last). */
 static void _loop_model_sink(void* ctx, int status, char* body,
-                             size_t body_len, char* error) {
+                             size_t body_len, char* error,
+                             http_headers_t* headers) {
+  /* Retry-After FIRST — the headers' OWNERSHIP ends here (this sink is the
+     final consumer; model.h's contract), so the value is parsed and the
+     capture deinit+freed before ANY of the exits below: the die gate, the
+     no-frame drop, and the no-memory drop every free it by construction.
+     Bounded parse (spec §2): seconds only — strcasecmp'd lookup by
+     http_headers_get, strtol, whole-string digits, > 0 and <= 3600
+     accepted; the date form (leading non-digit, or any trailing bytes)
+     answers 0 = absent, and the table's own cap (guards.c's 5 s) bounds the
+     value downstream. µs-scale on the streams loop thread: one lookup, one
+     strtol. */
+#if defined(SA_HAS_STREAMS)
+  unsigned retry_after_sec = 0;
+  if (headers != NULL) {
+    const char* ra = http_headers_get(headers, "retry-after");
+    if (ra != NULL) {
+      char* end = NULL;
+      long v = strtol(ra, &end, 10);
+      if (end != NULL && end != ra && *end == '\0' && v > 0 && v <= 3600) {
+        retry_after_sec = (unsigned)v;
+      }
+    }
+    http_headers_deinit(headers);
+    free(headers);
+  }
+#else
+  unsigned retry_after_sec = 0;   /* no streams: no headers ever arrive */
+#endif
   frame_t* f = (frame_t*)ctx;
   if (f == NULL) {
     log_error("loop: the model completion arrived with no frame context — "
@@ -831,6 +870,7 @@ static void _loop_model_sink(void* ctx, int status, char* body,
   p->body = body;
   p->body_len = body_len;
   p->error = error;
+  p->retry_after_sec = retry_after_sec;
   actor_t* mailbox = _frame_actor(f);
   if (mailbox == NULL) {
     /* Defensive only (the handoff keeps the record alive over the slot; the
@@ -1001,9 +1041,18 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
    "scripted backends drive the SAME code". Model error → control
    "model-error" + ONE retry (a fresh FRM_TURN repost; the re-derive is
    provably equivalent — the derive is stateless from the store), second
-   consecutive failure → control "model-error-final" + engine end failed. */
+   consecutive failure → control "model-error-final" + engine end failed.
+   http_status + retry_after_sec ride the failure's observed facts into
+   this function from BOTH callers: the async arrival passes the payload's
+   fields; the sync drain has no status facts (a scripted sync backend
+   speaks no HTTP) and passes 0/0 = absent. Task 5's retry branch consumes
+   them (the guards table's cause + the rate class's Retry-After backoff);
+   today's branch behaves identically without them. */
 static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
-                                int rc, model_reply_t* reply, char* err) {
+                                int rc, model_reply_t* reply, char* err,
+                                int http_status, unsigned retry_after_sec) {
+  (void)http_status;        /* the guards table's cause input — consumed by */
+  (void)retry_after_sec;    /* Task 5's retry branch in this same function */
   if (rc != 0 || reply == NULL) {
     const char* detail =
         (err != NULL && err[0] != '\0') ? err : "backend returned no reply";
@@ -1143,7 +1192,12 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
   char* err = NULL;
   int crc = mb->complete(mb, messages, NULL, NULL, &reply, &err);
   json_value_destroy(messages);
-  _frame_engine_reply(f, e, crc, reply, err);
+  /* The sync drain has NO status facts: a scripted sync backend speaks no
+     HTTP — complete()'s rc is its own contract, not a status code — so the
+     arrival passes 0/0 = absent both ways. The guards table then reads the
+     fallback class for a sync failure, which keeps the standing once-only
+     retry rule byte-identical (Task 5). */
+  _frame_engine_reply(f, e, crc, reply, err, 0, 0);
 }
 
 /* The FRAME_STORE_CELL_RUN reply's continuation: rc != 0 → the old loop's
@@ -1508,11 +1562,16 @@ void _frame_engine_model_arrived(frame_t* f, frm_model_payload_t* payload) {
   e->phase = FRAME_PHASE_NONE;
   model_reply_t* reply = NULL;
   char* err = NULL;
-  int rc = _model_result_from_http(payload->status, payload->body,
+  /* The payload's facts outlive its record: read BEFORE the destroy (the
+     sink parsed the header capture, the decode carries the retry value
+     byte-identically, the reply branch consults the table with both). */
+  int model_status = payload->status;
+  unsigned retry_after_sec = payload->retry_after_sec;
+  int rc = _model_result_from_http(model_status, payload->body,
                                    payload->body_len, payload->error,
-                                   &reply, &err);
+                                   retry_after_sec, &reply, &err);
   frm_model_payload_destroy(payload);   /* the raw body/error die here */
-  _frame_engine_reply(f, e, rc, reply, err);
+  _frame_engine_reply(f, e, rc, reply, err, model_status, retry_after_sec);
 }
 
 void _frame_engine_cell_done(frame_t* f) {

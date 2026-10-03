@@ -1205,7 +1205,7 @@ static int async_submit(void* self, json_value_t* messages, json_value_t* tools,
   if (on_done == NULL) return -1;
   char* heap_body = strdup(body.c_str());
   if (heap_body == NULL) return -1;
-  on_done(on_done_ctx, 200, heap_body, strlen(heap_body), NULL);
+  on_done(on_done_ctx, 200, heap_body, strlen(heap_body), NULL, NULL);
   return 0;
 }
 
@@ -1703,7 +1703,7 @@ TEST(TestLoop, TestDestroyMidTurnDefersToThePendingSink) {
      record is gone and even reading it is the caller's own bug.) */
   char* body = strdup(hm.body);
   ASSERT_NE(body, nullptr);
-  hm.held_fn(hm.held_ctx, 200, body, strlen(body), NULL);
+  hm.held_fn(hm.held_ctx, 200, body, strlen(body), NULL, NULL);
 
   wave_db_close(db);
 }

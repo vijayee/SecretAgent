@@ -113,6 +113,11 @@ typedef struct frm_model_payload_t {
   char* body;       /* heap; steal-slot */
   size_t body_len;
   char* error;      /* heap transport reason on status -1 */
+  /* The sink's parsed Retry-After, in SECONDS (0 = absent): a VALUE — the
+     header capture itself died in the sink, so no heap member rides here
+     and the destroyer stays untouched. The guards table's rate class reads
+     it at the engine's reply branch. */
+  unsigned retry_after_sec;
 } frm_model_payload_t;
 /* Child terminal: bookkeeping only — the parent-side report binding ALREADY
    happened in the child's ONE cross-subtree report-bind batch (composed by

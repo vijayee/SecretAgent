@@ -15,9 +15,14 @@
    (no body)>"). 0 ok (*reply_out owns the reply); nonzero (*error_out owns
    the reason). The single helper behind BOTH the synchronous complete() and
    the engine's FRM_MODEL_RESULT behavior — one error surface, two
-   delivery modes. */
+   delivery modes.
+   retry_after_sec is a PASS-THROUGH fact (0 = absent): the value the loop's
+   sink parsed from the response headers, handed back to `_frame_engine_reply`'s
+   reach through the arrival — the decode itself treats every value
+   byte-identically (the retry table is the LOOP's business, not the decode's). */
 int _model_result_from_http(int status, const char* body, size_t body_len,
                             const char* transport_error,
+                            unsigned retry_after_sec,
                             model_reply_t** reply_out, char** error_out);
 
 #if defined(SA_HAS_STREAMS)

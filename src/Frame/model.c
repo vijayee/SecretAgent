@@ -143,7 +143,12 @@ static int _model_decode_body(const char* body, size_t body_len,
 
 int _model_result_from_http(int status, const char* body, size_t body_len,
                             const char* transport_error,
+                            unsigned retry_after_sec,
                             model_reply_t** reply_out, char** error_out) {
+  (void)retry_after_sec;   /* the loop's pass-through fact (see
+                              model_internal.h): every value decodes
+                              byte-identically — the retry table is the
+                              engine's, not the decode's */
   *reply_out = NULL;
   *error_out = NULL;
   /* Non-2xx (status -1, the transport-failure shape, included) is an error
@@ -750,7 +755,7 @@ static int _model_http_complete(void* self, json_value_t* messages,
      the very same helper. */
   model_reply_t* decoded = NULL;
   char* result_err = NULL;
-  int drc = _model_result_from_http(status, body, body_len, error,
+  int drc = _model_result_from_http(status, body, body_len, error, 0,
                                     &decoded, &result_err);
   /* The stolen body (heap, NUL-terminated by the client) moves out raw —
      complete()'s documented 4th out-param. */
@@ -783,29 +788,29 @@ typedef struct _model_submit_relay_t {
 
 /* The http completion → the model sink, ownership straight through: body
    and error move into the sink's hands untouched (model.h's contract), the
-   relay dies, and the client teardown defers (a client cannot be destroyed
-   from inside its own completion — destroy joins the loop; the deferred
-   variant returns and lets the queued op finish the record). Runs ON the
-   loop thread, µs-scale (one indirect call + one enqueue). The captured
-   headers are consumed on EVERY path for now (Task 4's bridge moves this to
-   a pass-through when the sink signature carries them): the bounded capture
-   dies here — parsed by nobody, logged by nobody. */
+   captured headers move WITH them (the engine's sink in loop.c is the final
+   owner — it parses Retry-After and deinits + frees the capture), the relay
+   dies, and the client teardown defers (a client cannot be destroyed from
+   inside its own completion — destroy joins the loop; the deferred variant
+   returns and lets the queued op finish the record). Runs ON the loop
+   thread, µs-scale (one indirect call + one enqueue). */
 static void _model_submit_on(void* ctx, int status, char* body,
                              size_t body_len, char* error,
                              http_headers_t* headers) {
   _model_submit_relay_t* relay = (_model_submit_relay_t*)ctx;
-  if (headers != NULL) {
-    http_headers_deinit(headers);
-    free(headers);
-  }
   if (relay->fn != NULL) {
-    relay->fn(relay->ctx, status, body, body_len, error);
+    relay->fn(relay->ctx, status, body, body_len, error, headers);
   } else {
     /* Defensive only (every submit path carries a sink): the heap still
-       dies instead of leaking — a dropped delivery must not leak either. */
+       dies instead of leaking — a dropped delivery (headers included) must
+       not leak either. */
     log_error("model client: a submit completion arrived with no sink");
     free(body);
     free(error);
+    if (headers != NULL) {
+      http_headers_deinit(headers);
+      free(headers);
+    }
   }
   http_client_t* client = relay->client;
   free(relay);
@@ -841,7 +846,8 @@ static int _model_http_submit(void* self, json_value_t* messages,
   if (relay == NULL) {
     free(request_text);
     on_done(on_done_ctx, -1, NULL, 0,
-            _model_error("model client: transport: relay allocation failed"));
+            _model_error("model client: transport: relay allocation failed"),
+            NULL);   /* nothing reached the wire: no headers captured */
     return 0;
   }
 
@@ -853,7 +859,8 @@ static int _model_http_submit(void* self, json_value_t* messages,
     free(request_text);
     on_done(on_done_ctx, -1, NULL, 0,
             _model_error("model client: transport: http client "
-                         "allocation failed"));
+                         "allocation failed"),
+            NULL);   /* nothing reached the wire: no headers captured */
     free(relay);
     return 0;
   }

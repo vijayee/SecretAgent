@@ -142,9 +142,11 @@ static json_value_t* make_messages(void) {
 /* ---------------------------------------------------------------------- */
 
 /* model.h's sink contract recorded from the test's side: every delivery
-   (body/error are OWNED by the sink — recorded then freed). wait() blocks a
-   bounded wall-clock on a real condition_variable, so a missed delivery
-   fails as a timeout, never a hang. */
+   (body/error are OWNED by the sink — recorded then freed; the headers
+   capture is BORROWED for the call — recorded then deinit+freed, since this
+   sink is the final owner on the REAL http path). wait() blocks a bounded
+   wall-clock on a real condition_variable, so a missed delivery fails as a
+   timeout, never a hang. */
 typedef struct sink_record_t {
   std::mutex m;
   std::condition_variable cv;
@@ -155,10 +157,11 @@ typedef struct sink_record_t {
   std::string body;
   bool has_error;
   std::string error;
+  size_t header_count;
 } sink_record_t;
 
 static void sink_record(void* ctx, int status, char* body, size_t body_len,
-                        char* error) {
+                        char* error, http_headers_t* headers) {
   sink_record_t* r = (sink_record_t*)ctx;
   std::unique_lock<std::mutex> lk(r->m);
   r->calls++;
@@ -168,12 +171,18 @@ static void sink_record(void* ctx, int status, char* body, size_t body_len,
   if (body != NULL) r->body.assign(body, body_len);
   r->has_error = (error != NULL);
   if (error != NULL) r->error = error;
+  r->header_count = (headers != NULL) ? http_headers_count(headers) : 0;
   lk.unlock();
   r->cv.notify_all();
-  /* The sink OWNS the heap body/error (model.h's contract): record, then
-     free — a recorded-then-freed delivery never leaks. */
+  /* The sink owns the heap body/error (model.h's contract) and the headers
+     capture's deinit/free (the final owner): record, then die — a
+     recorded-then-freed delivery never leaks. */
   free(body);
   free(error);
+  if (headers != NULL) {
+    http_headers_deinit(headers);
+    free(headers);
+  }
 }
 
 /* Bounded (3000 ms per the plan) wait for the n'th delivery. */
@@ -589,7 +598,7 @@ TEST(TestModelDecode, TestSubmitRoundTripMatchesComplete) {
   model_reply_t* reply = NULL;
   char* err = NULL;
   int drc = _model_result_from_http(rec.status, rec.body.c_str(),
-                                    rec.body.size(), NULL, &reply, &err);
+                                    rec.body.size(), NULL, 0, &reply, &err);
   EXPECT_EQ(drc, 0) << (err ? err : "(no error string)");
   ASSERT_NE(reply, nullptr);
   EXPECT_STREQ(reply->content, "thinking about it");
@@ -659,4 +668,51 @@ TEST(TestModelDecode, TestSubmitRejectedNeverCallsSink) {
   }
 
   model_backend_destroy(mb);
+}
+
+TEST(TestModelDecode, TestRetryAfterRidesTheSurface) {
+  /* The decode's retry_after_sec param is a PASS-THROUGH fact for the
+     loop's retry branch (model_internal.h): the value rides the surface and
+     the decode treats every value byte-identically — a 0 (absent) and a
+     present value decode the SAME body to the SAME reply, and a failure
+     surfaces the SAME standing error text. The value's CONSUMER is
+     `_frame_engine_reply`'s retry branch (guards slice Task 5); nothing in
+     the decode may change shape because a Retry-After arrived. */
+  model_reply_t* r_absent = NULL;
+  model_reply_t* r_present = NULL;
+  char* e_absent = NULL;
+  char* e_present = NULL;
+
+  /* A 2xx body decodes identically with the value present and absent. */
+  ASSERT_EQ(_model_result_from_http(200, CONTENT_AND_TOOL_BODY,
+                                    strlen(CONTENT_AND_TOOL_BODY), NULL, 0,
+                                    &r_absent, &e_absent), 0);
+  ASSERT_EQ(_model_result_from_http(200, CONTENT_AND_TOOL_BODY,
+                                    strlen(CONTENT_AND_TOOL_BODY), NULL, 3,
+                                    &r_present, &e_present), 0);
+  ASSERT_NE(r_absent, nullptr);
+  ASSERT_NE(r_present, nullptr);
+  EXPECT_STREQ(r_absent->content, r_present->content);
+  EXPECT_STREQ(r_absent->tool_code, r_present->tool_code);
+  EXPECT_STREQ(r_absent->finish_reason, r_present->finish_reason);
+  EXPECT_EQ(e_absent, nullptr);
+  EXPECT_EQ(e_present, nullptr);
+  model_reply_destroy(r_absent);
+  model_reply_destroy(r_present);
+
+  /* A non-2xx keeps the standing error surface, byte-identical either way
+     (the status/class text is the decode's; the retry VALUE is not in it). */
+  ASSERT_EQ(_model_result_from_http(429, NULL, 0, NULL, 0,
+                                    &r_absent, &e_absent), -1);
+  ASSERT_EQ(_model_result_from_http(429, NULL, 0, NULL, 90,
+                                    &r_present, &e_present), -1);
+  EXPECT_EQ(r_absent, nullptr);
+  EXPECT_EQ(r_present, nullptr);
+  ASSERT_NE(e_absent, nullptr);
+  ASSERT_NE(e_present, nullptr);
+  EXPECT_STREQ(e_absent, e_present)
+      << "the standing surface is value-blind";
+  EXPECT_NE(strstr(e_absent, "429"), nullptr) << "err: " << e_absent;
+  free(e_absent);
+  free(e_present);
 }
