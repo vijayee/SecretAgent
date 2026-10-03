@@ -17,6 +17,7 @@
 extern "C" {
 #include "../src/Streams/loop_thread.h"
 #include "../src/Streams/http_client.h"
+#include "../src/Streams/http_headers.h"
 }
 
 /* Async HTTP client proofs: one POST, one response, on the real poll-dancer
@@ -78,6 +79,16 @@ struct completion_record {
   bool body_null = true;
   bool error_null = true;
   std::string error;
+  http_headers_t* headers = nullptr;  /* the completion's captured set, OWNED
+                                         whole (deinit + frees on destruction) */
+  bool headers_null = true;
+  ~completion_record() {
+    if (headers != nullptr) {
+      http_headers_deinit(headers);
+      free(headers);
+      headers = nullptr;
+    }
+  }
 };
 
 static void completion_record_reset(completion_record* r) {
@@ -93,7 +104,8 @@ static void completion_record_reset(completion_record* r) {
 }
 
 extern "C" void completion_record_on(void* ctx, int status, char* body,
-                                     size_t body_len, char* error) {
+                                     size_t body_len, char* error,
+                                     http_headers_t* headers) {
   completion_record* r = (completion_record*)ctx;
   {
     std::lock_guard<std::mutex> lk(r->m);
@@ -103,6 +115,10 @@ extern "C" void completion_record_on(void* ctx, int status, char* body,
     if (body != NULL) r->body.assign(body, body_len);
     r->error_null = (error == NULL);
     if (error != NULL) r->error.assign(error);
+    /* The headers move INTO the record whole: the callback owns the capture,
+       the record is its owner from here (freed on destruction). */
+    r->headers = headers;
+    r->headers_null = (headers == NULL);
     r->fired = true;
     r->fire_count++;
   }
@@ -171,6 +187,7 @@ TEST(TestStreamsClient, TestDeadEndpointReportsTransport) {
   EXPECT_EQ(rec.status, -1);        /* transport failure, not an HTTP code */
   EXPECT_TRUE(rec.body_null);       /* no body on a transport error */
   EXPECT_FALSE(rec.error_null);     /* heap reason present */
+  EXPECT_TRUE(rec.headers_null);    /* a failed transport delivers no headers */
   EXPECT_FALSE(rec.error.empty());
   EXPECT_EQ(rec.fire_count, 1);
 
@@ -794,6 +811,40 @@ TEST(TestStreamsClient, TestContentLengthOverBodyCapRejectedBeforeAnyBody) {
   EXPECT_NE(rec.error.find("cap"), std::string::npos);
   EXPECT_TRUE(rec.body_null);
   EXPECT_EQ(rec.fire_count, 1);
+}
+
+/* The completion carries the response headers (the ported http_headers
+   module): a 429 with its Retry-After plus an arbitrary extra field arrive
+   on EVERY success-shaped completion. Lookup is case-INSENSITIVE (the
+   ported module pairs names with strcasecmp) — the lookups below use a
+   different case than the server delivered to pin that. */
+TEST(TestStreamsClient, TestCompletionCarriesHeaders) {
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(
+    "HTTP/1.1 429 Too Many Requests\r\n"
+    "Retry-After: 3\r\n"
+    "X-Wave-Test-Header: wave-wave\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "{}", rec));
+  EXPECT_EQ(rec.status, 429);
+  ASSERT_FALSE(rec.headers_null);
+  ASSERT_NE(rec.headers, nullptr);
+  const char* ra = http_headers_get(rec.headers, "retry-after");
+  ASSERT_NE(ra, nullptr);
+  EXPECT_STREQ(ra, "3");
+  /* the SECOND, arbitrary header arrived too — the capture is general, not
+     a Retry-After whitelist (neither name matched the wire's case) */
+  const char* other = http_headers_get(rec.headers, "X-WAVE-TEST-HEADER");
+  ASSERT_NE(other, nullptr);
+  EXPECT_STREQ(other, "wave-wave");
+  /* the transport framing headers ride along as well */
+  EXPECT_NE(http_headers_get(rec.headers, "connection"), nullptr);
+  EXPECT_TRUE(rec.error_null);      /* 429 is a pass-through, not an error */
+  EXPECT_EQ(rec.fire_count, 1);
+  /* rec.headers dies with the record (deinit + frees) — one owner per
+     delivery, none left behind */
 }
 
 /* A header value that never ends: the wire keeps coming long past any sane

@@ -80,6 +80,15 @@
    raw-response accumulator (http-parser delivers header/body splits). */
 #define _HTTP_CHUNK_SIZE 8192
 
+/* Response-header capture (the ported http_headers module): the Retry-After
+   fact rides the completion (the guards slice). Bounds are the transport-
+   bounds discipline — a header is a hint for later logic, never a reason to
+   fail a whole parse: entry count capped (beyond it new pairs are dropped
+   loud-but-continuing), value length truncated. */
+#define _HTTP_HEADERS_CAPTURE_MAX 16
+#define _HTTP_HEADER_VALUE_CAPTURE_MAX 512
+#define _HTTP_HEADER_FIELD_CAPTURE_MAX 128
+
 /* ---------------- types ---------------- */
 
 typedef struct http_client_req_t http_client_req_t;
@@ -130,6 +139,17 @@ struct http_client_req_t {
   uint64_t cl;
   int cap_error;
   int status;
+  /* response header capture (loop-serial): committed pairs move to the
+     completion; the pending field/value fragment accumulators mirror the
+     server side's shape (http_connection.c — fragments may arrive split) */
+  http_headers_t* headers;        /* committed pairs; NULL until the first */
+  char* hdr_field;                /* pending field fragments */
+  size_t hdr_field_len;
+  size_t hdr_field_cap;
+  char* hdr_value;                /* pending value fragments */
+  size_t hdr_value_len;
+  size_t hdr_value_cap;
+  int hdr_warned;                 /* the entry-cap log fires once per request */
   /* wiring */
   http_client_t* client;
   http_client_completion_fn on_done;
@@ -297,10 +317,21 @@ static void _req_complete(http_client_req_t* req, int status, char* body,
 static void _req_parse_error(http_client_req_t* req);
 static void _op_drain(void* p);
 static void _op_start(void* p);
+static void _hdr_pending_reset(http_client_req_t* req);
+
+/* A captured set leaves this file only through the completion; everywhere
+   else (cancellation, dead-client claims) it dies here whole. NULL-safe. */
+static void _captured_headers_free(http_headers_t* headers) {
+  if (headers == NULL) return;
+  http_headers_deinit(headers);
+  free(headers);
+}
 
 /* Frees every heap record the request owns (never the pd objects: they die
    in the deferred teardown). Safe from the submit thread (reject paths) and
-   from the loop thread (_op_start's cancel path). */
+   from the loop thread (_op_start's cancel path). The header capture's
+   leftovers appear here ONLY on cancellation paths: the completion extracts
+   the committed set before this runs on the completion itself. */
 static void _req_free_request_side(http_client_req_t* req) {
   /* Each member is freed exactly once and nulled: finalize's transfers
      below, and the deferred teardown (drain op) free only survivors. */
@@ -316,6 +347,9 @@ static void _req_free_request_side(http_client_req_t* req) {
   req->wire = NULL;
   free(req->dec_buf);   /* untouched when the body transferred to the callback */
   req->dec_buf = NULL;
+  _captured_headers_free(req->headers);
+  req->headers = NULL;
+  _hdr_pending_reset(req);
   free(req->dns_error);
   req->dns_error = NULL;
   if (req->res != NULL) {
@@ -361,6 +395,16 @@ static void _req_complete(http_client_req_t* req, int status, char* body,
   http_client_t* c = req->client;
 
   req->done = 1;
+  /* The captured headers move out of the record FIRST (their ownership rule:
+     delivered on every success shape, destroyed on a transport failure —
+     partial evidence never completes as a success). Exactly one owner per
+     delivery, and none left on the record for the teardowns below. */
+  http_headers_t* headers = req->headers;
+  req->headers = NULL;
+  if (status < 0) {
+    _captured_headers_free(headers);
+    headers = NULL;
+  }
   _req_transport_stop(req);
   _client_inflight_remove(c, req);
   /* The record moves to the deferred list: it must outlive its own watcher/
@@ -385,8 +429,9 @@ static void _req_complete(http_client_req_t* req, int status, char* body,
   if (dead) {
     free(body);
     free(error);
+    _captured_headers_free(headers);
   } else {
-    req->on_done(req->ctx, status, body, body_len, error);
+    req->on_done(req->ctx, status, body, body_len, error, headers);
   }
 }
 
@@ -414,12 +459,101 @@ static int _dec_append(http_client_req_t* req, const char* at, size_t length) {
   return 0;
 }
 
+/* --- response header capture (the ported http_headers module) ----------- */
+
+/* One fragment append into a pending field/value buffer. Fragments may
+   arrive SPLIT (http-parser semantics; the server side's accumulator at
+   http_connection.c is the mirrored shape). The capture never fails a
+   parse: past the passed cap the fragment truncates loud-but-continuing.
+   Growth follows the client's get_memory+copy idiom (not realloc). */
+static char* _hdr_pending_append(char* buf, size_t* len, size_t* cap,
+                                 size_t cap_max, const char* at,
+                                 size_t length) {
+  if (*len + length > cap_max) {
+    length = cap_max - *len;   /* truncate; the parse carries on */
+  }
+  if (buf == NULL) {
+    *cap = length * 2 + 1;
+    buf = get_memory(*cap);
+  } else if (*len + length + 1 > *cap) {
+    *cap = (*len + length) * 2 + 1;
+    char* grown = get_memory(*cap);
+    memcpy(grown, buf, *len);
+    free(buf);
+    buf = grown;
+  }
+  memcpy(buf + *len, at, length);
+  *len += length;
+  buf[*len] = '\0';
+  return buf;
+}
+
+/* Drops the pending fragment buffers (each commit and every teardown ends
+   here — a completed request never carries capture scratch into the drain). */
+static void _hdr_pending_reset(http_client_req_t* req) {
+  free(req->hdr_field);
+  req->hdr_field = NULL;
+  req->hdr_field_len = 0;
+  req->hdr_field_cap = 0;
+  free(req->hdr_value);
+  req->hdr_value = NULL;
+  req->hdr_value_len = 0;
+  req->hdr_value_cap = 0;
+}
+
+/* Commits the pending pair (the server side's _flush_header shape): the
+   accumulator composes on the first pair, and past the entry cap new pairs
+   are dropped loud-but-continuing, logged once per request — the fact later
+   logic wants (Retry-After et al.) is always among the first entries. */
+static void _hdr_flush(http_client_req_t* req) {
+  if (req->hdr_field != NULL && req->hdr_field_len > 0 &&
+      req->hdr_value != NULL && req->hdr_value_len > 0) {
+    if (req->headers == NULL) {
+      req->headers = get_clear_memory(sizeof(http_headers_t));
+      http_headers_init(req->headers);
+    }
+    if (http_headers_count(req->headers) >= _HTTP_HEADERS_CAPTURE_MAX) {
+      if (req->hdr_warned == 0) {
+        log_error("http_client: response header capture from %s:%u full "
+                  "(%d entries) — later pairs dropped",
+                  req->host, (unsigned)req->port, _HTTP_HEADERS_CAPTURE_MAX);
+        req->hdr_warned = 1;
+      }
+    } else {
+      http_headers_set(req->headers, req->hdr_field, req->hdr_value);
+    }
+  }
+  _hdr_pending_reset(req);
+}
+
 /* http-parser callbacks (response type): capture framing facts at the
    header boundary, accumulate decoded body bytes, and mark message end.
    A nonzero return halts the parser — the caller completes the request
    through the parse-error path. */
+static int _on_header_field(http_parser* parser, const char* at, size_t length) {
+  http_client_req_t* req = (http_client_req_t*)parser->data;
+  if (req->hdr_field_len > 0 && req->hdr_value_len > 0) {
+    _hdr_flush(req);   /* the previous pair's boundary: the next field began */
+  }
+  req->hdr_field = _hdr_pending_append(req->hdr_field, &req->hdr_field_len,
+                                       &req->hdr_field_cap,
+                                       _HTTP_HEADER_FIELD_CAPTURE_MAX,
+                                       at, length);
+  return 0;
+}
+
+static int _on_header_value(http_parser* parser, const char* at, size_t length) {
+  http_client_req_t* req = (http_client_req_t*)parser->data;
+  req->hdr_value = _hdr_pending_append(req->hdr_value, &req->hdr_value_len,
+                                       &req->hdr_value_cap,
+                                       _HTTP_HEADER_VALUE_CAPTURE_MAX,
+                                       at, length);
+  return 0;
+}
+
 static int _on_headers_complete(http_parser* parser) {
   http_client_req_t* req = (http_client_req_t*)parser->data;
+  _hdr_flush(req);   /* the last pair has no following field to flush it */
   req->header_complete = 1;
   req->status = (int)parser->status_code;
   req->saw_chunked = (parser->flags & F_CHUNKED) ? 1 : 0;
@@ -453,8 +587,8 @@ static http_parser_settings _parser_settings = {
   .on_message_begin = NULL,
   .on_url = NULL,
   .on_status = NULL,
-  .on_header_field = NULL,
-  .on_header_value = NULL,
+  .on_header_field = _on_header_field,
+  .on_header_value = _on_header_value,
   .on_headers_complete = _on_headers_complete,
   .on_body = _on_body,
   .on_message_complete = _on_message_complete,

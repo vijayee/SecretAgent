@@ -484,10 +484,17 @@ static void _model_completion_release(_model_completion_t* rec) {
 /* The http client's completion — runs ON the loop thread, µs-scale (a lock,
    some field writes, a broadcast). The completion's heap strings move into
    the steal-slot; the waiter takes them, a dropped waiter leaves them to
-   this record's teardown. */
+   this record's teardown. The captured headers have no surface on the SYNC
+   wait path (its completion shape carries no retry facts to the engine) —
+   consumed whole here, the contract's µs-scale deinit of a bounded vec. */
 static void _model_completion_on(void* ctx, int status, char* body,
-                                 size_t body_len, char* error) {
+                                 size_t body_len, char* error,
+                                 http_headers_t* headers) {
   _model_completion_t* rec = (_model_completion_t*)ctx;
+  if (headers != NULL) {
+    http_headers_deinit(headers);
+    free(headers);
+  }
   platform_mutex_lock(rec->lock);
   rec->status = status;
   rec->body = body;
@@ -779,10 +786,18 @@ typedef struct _model_submit_relay_t {
    relay dies, and the client teardown defers (a client cannot be destroyed
    from inside its own completion — destroy joins the loop; the deferred
    variant returns and lets the queued op finish the record). Runs ON the
-   loop thread, µs-scale (one indirect call + one enqueue). */
+   loop thread, µs-scale (one indirect call + one enqueue). The captured
+   headers are consumed on EVERY path for now (Task 4's bridge moves this to
+   a pass-through when the sink signature carries them): the bounded capture
+   dies here — parsed by nobody, logged by nobody. */
 static void _model_submit_on(void* ctx, int status, char* body,
-                             size_t body_len, char* error) {
+                             size_t body_len, char* error,
+                             http_headers_t* headers) {
   _model_submit_relay_t* relay = (_model_submit_relay_t*)ctx;
+  if (headers != NULL) {
+    http_headers_deinit(headers);
+    free(headers);
+  }
   if (relay->fn != NULL) {
     relay->fn(relay->ctx, status, body, body_len, error);
   } else {
