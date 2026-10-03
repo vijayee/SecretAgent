@@ -2938,9 +2938,15 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       /* The engine's scheduled turn-step continuation (Task 3): ONE turn
          step — the checks and the derive's store round trip — then a yield,
          with the step continued by the arrival dispatches. No payload.
-         The HEAD REAPS the retry backoff's timer first (guards spec §3):
-         the previous backoff's own FRM_TURN IS this dispatch, so its join
-         is always immediate — idempotent (NULL = none), never a wait. */
+         The HEAD REAPS the retry backoff's timer first (guards spec §3).
+         The join is immediate in the COMMON case — the timer's own FRM_TURN
+         IS this dispatch — but not always: in the window where the backoff
+         timer still sleeps, a child report's reposted FRM_TURN (it carries
+         model_retry_step = 1) can dispatch here first and BLOCK the join up
+         to the remaining backoff. Bounded either way: never joins a
+         detached thread, never longer than the guards table's 5 s
+         backoff cap; a timer post that lands after the reap
+         late-drops loud. Idempotent (NULL = none). */
       _frame_delayed_post_reap(f);
       _frame_engine_turn(f);
       break;

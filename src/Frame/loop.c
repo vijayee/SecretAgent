@@ -1077,10 +1077,10 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
     const char* detail =
         (err != NULL && err[0] != '\0') ? err : "backend returned no reply";
     /* The cause folds the failure's observed facts FIRST — a non-retryable
-       class must never take the retry path. The finish_reason rides only a
-       reply object that coexisted with an error rc (the decode NULLs the
-       reply on every error shape; the overload shape DECODES fine and is
-       the success path's guest below). */
+       class must never take the retry path. The finish_reason guard is
+       belt-and-braces only: the decode NULLs the reply on every error
+       shape (the overload shape DECODES fine and is the success path's
+       guest below). */
     guards_cause_e cause = guards_retry_cause(
         http_status,
         (reply != NULL) ? reply->finish_reason : NULL);
@@ -1113,7 +1113,7 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
     }
     /* Exhausted retries or a non-retryable class: the class's name rides
        the final control's text (the standing loud-wording rule). */
-    char final_text[256];
+    char final_text[640];
     snprintf(final_text, sizeof(final_text), "%s: %s",
              _loop_cause_name(cause), detail);
     _loop_fail(f, e, "model-error-final", final_text);
@@ -1705,8 +1705,10 @@ void _frame_engine_child_report(frame_t* f, frm_child_report_payload_t* payload)
  * ------------------------------------------------------------------------- */
 
 /* The deadline per awaited phase (frame_internal.h's contract); NONE — the
-   transient gap between a terminal step and the next dispatch — gets the
-   store deadline (it resolves within one pump in every real flow). */
+   gap between a terminal step and the next dispatch — gets the store
+   deadline. Mostly a one-pump transient, but a retry's backoff parks the
+   phase in NONE for up to 5 s (the guards table's backoff cap) — still
+   safe under the 30 s SA_LOOP_STORE_WAIT_MS deadline. */
 static unsigned _loop_phase_deadline_ms(frame_phase_e phase) {
   switch (phase) {
     case FRAME_PHASE_CELL:

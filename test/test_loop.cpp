@@ -1408,8 +1408,10 @@ TEST(TestLoop, TestRateFailureHonorsRetryAfter) {
 #if defined(SA_HAS_STREAMS)
   EXPECT_GE(elapsed_ms, 4000) << "both retry-after waits were honored";
 #else
-  EXPECT_GE(elapsed_ms, 0) << "no streams: no header ever arrives — the "
-                              "table's immediate steps run instead";
+  EXPECT_GE(elapsed_ms, 0) << "the no-streams shape cannot deliver "
+                              "retry-after: this pin is vacuous there "
+                              "(the streams-gated tests prove the real "
+                              "behavior)";
 #endif
 
   json_value_t* events = load_events(f);
