@@ -71,6 +71,8 @@ docs/superpowers/specs/2026-09-29-cpython-as-actor-design.md.
 | 49 | **LLM-facing error protocol surface + provider-agnostic streaming client** | AR (onyx reject/steal list, "tool ABI" line) | **PARTIAL** — `model_backend_t` vtable = the completion/submit boundary (OR §3); no streaming deltas (row 10) | L4 | `test_model_decode.cpp` |
 | 50 | **Windows verification** (PCBuild cpython branch; IOCP backend compiles) | CP §"Cross-platform"; ST §"Evidence bar" 4 | **P** — no toolchain on this machine; tracked on Atlas nodes | all | n/a here |
 | 51 | **`inspect` pull-forward** (list the frame's own state keys — "find", not just "recall a value") | Section 2's YAGNI deferral resolved by slice 3's Q6 | **L (DEV)** — `agent.keys(scope)` only (own-subtree key names, closed scope set, first-N + marker); events-scan/child-listing/read(path) YAGNI-unchanged. Source: slice 3's Q6 resolution (this slice) | L2/L4 | `test/test_py_agent.cpp` + `test/test_loop.cpp` keys tests |
+| 52 | **Doom-loop breaker** (N identical consecutive tool calls → refuse + end run; an event to the runtime, never a self-approving ask) | AR (opencode steal-list; `processor.ts:29,356-379`) | **L** — `src/Frame/guards.{h,c}` fold + the tool path's PRE-AUDIT refusal (the tripped call never runs, never audited); `turn.end {doom-loop}` (the union's new member + the fold's KNOWN-list row); byte-identical identity with reset-on-input; frame resumable after (`0471479`, `1691fee`, `00220e6`, `c331389`) | L3 | `test_guards.cpp` + `test_loop.cpp` TestDoom* |
+| 53 | **Cause-specific retry table owned by the runtime** (pattern-matched retryability, retry-after-aware backoff, non-retryable classes fail loud) | AR (opencode steal-list; `retry.ts:30-88`) | **L** — the table in guards.c (transport/server/rate retryable ×5 with the timed 0/250/500/1000 progression; overload/overflow fail loud; the fallback keeps the once-only rule); the async client captures RESPONSE HEADERS via the ported http_headers module (16 pairs, bounded values; the empty-value flush fixed CLIENT+SERVER — `66174c7`, `285816c`); Retry-After rides the completion/sink chain to the engine's retry branch (`d4d7cad`); the one-shot delayed-post timer (`5db3a8a`); the Ollama load-stop now fails loud (the frame-tree slice's flagged follow-up CLOSED — the empty-turn/done mapping is gone) | L4 | opencode retry.ts intent → `test_guards.cpp` + `test_loop.cpp` |
 
 ---
 
@@ -236,6 +238,8 @@ project memory (msg 4148's second layer) is the ctx/ layer + L3 refine state, ne
    tool-result cap + bridge payload cap) with fail-loud truncation-at-source.
    *Tests:* extend `test/test_py_agent.cpp` (emit durability), `test/test_pyrt.cpp` (interrupt at
    frame level), new inspect/budget tests. (LANDED — commits `f1c2f1f..1ed9933`)
+3.5 **Guards slice** (L3/L4, from opencode's addition): the doom-loop breaker + the retry
+   tables — LANDED (2026-10-03, commits 0471479..c331389).
 4. **Steering & multi-source input slice** (L3; PA's admission discipline, only when needed)
    steering writes between turns exist (`msg.append` between turns); formalize into the admission
    state machine ONLY if a second input source lands (desktop REST, heartbeats): legal-transition
