@@ -55,6 +55,7 @@ typedef struct http_connection_t {
   size_t header_value_len;
   size_t header_value_cap;
   size_t header_count;     /* number of headers flushed for the current request */
+  uint8_t header_saw_value; /* a value callback landed since the last flush */
   uint8_t headers_complete;
   uint8_t request_complete;
   uint8_t is_ssl;

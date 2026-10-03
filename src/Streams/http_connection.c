@@ -69,6 +69,7 @@ static void _reset_header_accumulator(http_connection_t* connection) {
     connection->header_value[0] = '\0';
     connection->header_value_len = 0;
   }
+  connection->header_saw_value = 0;
 }
 
 static int _accumulate_field(http_connection_t* connection, const char* at, size_t length) {
@@ -163,7 +164,13 @@ static int _on_url(http_parser* parser, const char* at, size_t length) {
 
 static int _on_header_field(http_parser* parser, const char* at, size_t length) {
   http_connection_t* connection = (http_connection_t*)parser->data;
-  if (connection->header_field_len > 0 && connection->header_value_len > 0) {
+  /* the previous pair's boundary: the next field began. The boundary is a
+     value callback SINCE the last flush — not a non-empty pending value, for
+     an EMPTY value ("A:\r\n") still fires the value callback (with length 0)
+     and must flush the pending field (commit skipped, buffers reset) so the
+     next pair starts clean. Field fragments of ONE name stay unflushed: no
+     value callback ran between them. */
+  if (connection->header_field_len > 0 && connection->header_saw_value) {
     _flush_header(connection);
   }
   /* Reject once the per-request header count is exceeded. header_count is
@@ -183,6 +190,7 @@ static int _on_header_value(http_parser* parser, const char* at, size_t length) 
   if (_accumulate_value(connection, at, length) != 0) {
     return -1;
   }
+  connection->header_saw_value = 1;   /* even a length-0 value completes the pair */
   return 0;
 }
 

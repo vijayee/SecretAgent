@@ -29,6 +29,8 @@ extern "C" {
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -294,4 +296,44 @@ TEST_F(TestStreamsServer, TestAuthBearerEnforced) {
   EXPECT_EQ(hits_.load(), 1);
   EXPECT_NE(good.find("HTTP/1.1 200 OK"), std::string::npos);
   EXPECT_EQ(good.substr(good.find("\r\n\r\n") + 4), "ok");
+}
+
+/* The route handler echoes back the observation the empty-value probe needs:
+   whether "B" made it whole, whether "A" (declared with NO value) stayed
+   skipped, and how many pairs the accumulator accepted. */
+extern "C" void _stream_test_header_probe_handler(http_request_t* request,
+                                                  http_response_t* response,
+                                                  void* user_data) {
+  (void)user_data;
+  const char* b = http_headers_get(&request->headers, "b");
+  char body[64];
+  snprintf(body, sizeof(body), "b=%s;a=%s;count=%zu",
+           b != NULL ? b : "MISSING",
+           http_headers_get(&request->headers, "a") != NULL ? "PRESENT"
+                                                            : "SKIPPED",
+           http_headers_count(&request->headers));
+  http_response_set_status(response, 200);
+  http_response_set_header(response, "Content-Type", "text/plain");
+  http_response_write(response, body, strlen(body));
+  http_response_end(response);
+}
+
+/* An empty-valued request header must not poison its neighbor: "A:" carries
+   no value (http-parser still fires the value callback with length 0), the
+   empty pair commits as a skip, and the accumulator MUST reset so "B: v2"
+   parses as its own pair — not a mangled "AB": "v2" merge. */
+TEST_F(TestStreamsServer, TestEmptyHeaderValueDoesNotMangleNextPair) {
+  CreateServer();
+  http_server_get(server_, "^/hdr$", _stream_test_header_probe_handler, NULL);
+  ListenServer();
+
+  std::string reply = Exchange(
+      "GET /hdr HTTP/1.1\r\nA:\r\nB: v2\r\nHost: test\r\nConnection: close\r\n\r\n");
+
+  EXPECT_NE(reply.find("HTTP/1.1 200 OK"), std::string::npos);
+  size_t body_pos = reply.find("\r\n\r\n");
+  ASSERT_NE(body_pos, std::string::npos);
+  /* B whole, A absent (empty skipped), count 3 = B + Host + Connection (no
+     merged "AB" entry, no skipped-only entry) */
+  EXPECT_EQ(reply.substr(body_pos + 4), "b=v2;a=SKIPPED;count=3");
 }

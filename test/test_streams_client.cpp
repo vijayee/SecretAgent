@@ -817,11 +817,17 @@ TEST(TestStreamsClient, TestContentLengthOverBodyCapRejectedBeforeAnyBody) {
    module): a 429 with its Retry-After plus an arbitrary extra field arrive
    on EVERY success-shaped completion. Lookup is case-INSENSITIVE (the
    ported module pairs names with strcasecmp) — the lookups below use a
-   different case than the server delivered to pin that. */
+   different case than the server delivered to pin that.
+
+   X-Wave-Empty carries NO value (http-parser still fires the value callback
+   with length 0): the empty pair commits as a skip, but the accumulator MUST
+   reset — without the reset the Retry-After fragments append onto the
+   mangled "X-Wave-EmptyRetry-After" name. */
 TEST(TestStreamsClient, TestCompletionCarriesHeaders) {
   completion_record rec;
   ASSERT_TRUE(canned_roundtrip(
     "HTTP/1.1 429 Too Many Requests\r\n"
+    "X-Wave-Empty:\r\n"
     "Retry-After: 3\r\n"
     "X-Wave-Test-Header: wave-wave\r\n"
     "Content-Length: 2\r\n"
@@ -834,6 +840,12 @@ TEST(TestStreamsClient, TestCompletionCarriesHeaders) {
   const char* ra = http_headers_get(rec.headers, "retry-after");
   ASSERT_NE(ra, nullptr);
   EXPECT_STREQ(ra, "3");
+  /* the empty-valued pair vanished entirely (empty values commit as a skip)
+     and NO mangled merge of its name into the next field is present; the
+     count is the strongest pin — the wire carried 5 headers, one skipped */
+  EXPECT_EQ(http_headers_get(rec.headers, "x-wave-empty"), nullptr);
+  EXPECT_EQ(http_headers_get(rec.headers, "x-wave-emptyretry-after"), nullptr);
+  EXPECT_EQ(http_headers_count(rec.headers), 4);
   /* the SECOND, arbitrary header arrived too — the capture is general, not
      a Retry-After whitelist (neither name matched the wire's case) */
   const char* other = http_headers_get(rec.headers, "X-WAVE-TEST-HEADER");
@@ -845,6 +857,30 @@ TEST(TestStreamsClient, TestCompletionCarriesHeaders) {
   EXPECT_EQ(rec.fire_count, 1);
   /* rec.headers dies with the record (deinit + frees) — one owner per
      delivery, none left behind */
+}
+
+/* A value past the 512-byte capture cap truncates loud-but-continuing (the
+   one-shot truncation log fires here — hdr_warned idiom): the pair still
+   commits its truncated value, and the request completes normally. */
+TEST(TestStreamsClient, TestOversizedHeaderValueTruncatesGracefully) {
+  std::string canned =
+    "HTTP/1.1 200 OK\r\n"
+    "X-Wave-Big: " + std::string(600, 'x') + "\r\n"
+    "Content-Length: 2\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "{}";
+  completion_record rec;
+  ASSERT_TRUE(canned_roundtrip(canned, rec));
+  EXPECT_EQ(rec.status, 200);
+  ASSERT_FALSE(rec.headers_null);
+  ASSERT_NE(rec.headers, nullptr);
+  const char* big_val = http_headers_get(rec.headers, "x-wave-big");
+  ASSERT_NE(big_val, nullptr);
+  EXPECT_EQ(strlen(big_val), (size_t)512);
+  EXPECT_EQ(http_headers_count(rec.headers), 3);
+  EXPECT_TRUE(rec.error_null);
+  EXPECT_EQ(rec.fire_count, 1);
 }
 
 /* A header value that never ends: the wire keeps coming long past any sane

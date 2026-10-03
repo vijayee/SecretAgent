@@ -150,6 +150,8 @@ struct http_client_req_t {
   size_t hdr_value_len;
   size_t hdr_value_cap;
   int hdr_warned;                 /* the entry-cap log fires once per request */
+  int hdr_trunc_warned;           /* the fragment-truncation log: once per request */
+  int hdr_saw_value;              /* a value callback landed since the last flush */
   /* wiring */
   http_client_t* client;
   http_client_completion_fn on_done;
@@ -464,13 +466,21 @@ static int _dec_append(http_client_req_t* req, const char* at, size_t length) {
 /* One fragment append into a pending field/value buffer. Fragments may
    arrive SPLIT (http-parser semantics; the server side's accumulator at
    http_connection.c is the mirrored shape). The capture never fails a
-   parse: past the passed cap the fragment truncates loud-but-continuing.
-   Growth follows the client's get_memory+copy idiom (not realloc). */
-static char* _hdr_pending_append(char* buf, size_t* len, size_t* cap,
+   parse: past the passed cap the fragment truncates loud-but-continuing —
+   the truncation logs ONCE per request (the hdr_warned idiom). Growth
+   follows the client's get_memory+copy idiom (not realloc). */
+static char* _hdr_pending_append(http_client_req_t* req, const char* what,
+                                 char* buf, size_t* len, size_t* cap,
                                  size_t cap_max, const char* at,
                                  size_t length) {
   if (*len + length > cap_max) {
     length = cap_max - *len;   /* truncate; the parse carries on */
+    if (req->hdr_trunc_warned == 0) {
+      log_error("http_client: response header %s from %s:%u truncated at the "
+                "%zu-byte cap — the parse carries on",
+                what, req->host, (unsigned)req->port, cap_max);
+      req->hdr_trunc_warned = 1;
+    }
   }
   if (buf == NULL) {
     *cap = length * 2 + 1;
@@ -499,6 +509,7 @@ static void _hdr_pending_reset(http_client_req_t* req) {
   req->hdr_value = NULL;
   req->hdr_value_len = 0;
   req->hdr_value_cap = 0;
+  req->hdr_saw_value = 0;
 }
 
 /* Commits the pending pair (the server side's _flush_header shape): the
@@ -532,10 +543,16 @@ static void _hdr_flush(http_client_req_t* req) {
    through the parse-error path. */
 static int _on_header_field(http_parser* parser, const char* at, size_t length) {
   http_client_req_t* req = (http_client_req_t*)parser->data;
-  if (req->hdr_field_len > 0 && req->hdr_value_len > 0) {
-    _hdr_flush(req);   /* the previous pair's boundary: the next field began */
+  /* the previous pair's boundary: the next field began. The boundary is a
+     value callback SINCE the last flush — not a non-empty pending value, for
+     an EMPTY value ("X:\r\n") still fires the value callback (with length 0)
+     and must flush the pending field so the next pair starts clean. Field
+     fragments of ONE name stay unflushed: no value callback ran between them. */
+  if (req->hdr_field_len > 0 && req->hdr_saw_value) {
+    _hdr_flush(req);
   }
-  req->hdr_field = _hdr_pending_append(req->hdr_field, &req->hdr_field_len,
+  req->hdr_field = _hdr_pending_append(req, "field", req->hdr_field,
+                                       &req->hdr_field_len,
                                        &req->hdr_field_cap,
                                        _HTTP_HEADER_FIELD_CAPTURE_MAX,
                                        at, length);
@@ -544,10 +561,12 @@ static int _on_header_field(http_parser* parser, const char* at, size_t length) 
 
 static int _on_header_value(http_parser* parser, const char* at, size_t length) {
   http_client_req_t* req = (http_client_req_t*)parser->data;
-  req->hdr_value = _hdr_pending_append(req->hdr_value, &req->hdr_value_len,
+  req->hdr_value = _hdr_pending_append(req, "value", req->hdr_value,
+                                       &req->hdr_value_len,
                                        &req->hdr_value_cap,
                                        _HTTP_HEADER_VALUE_CAPTURE_MAX,
                                        at, length);
+  req->hdr_saw_value = 1;   /* even a length-0 value completes the pending pair */
   return 0;
 }
 
