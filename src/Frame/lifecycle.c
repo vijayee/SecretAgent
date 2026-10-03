@@ -32,6 +32,7 @@ const char LIFE_REASON_TURN_LIMIT[] = "turn-limit";
 const char LIFE_REASON_INTERRUPTED[] = "interrupted";
 const char LIFE_REASON_ABORTED[] = "aborted";
 const char LIFE_REASON_BLOCKED[] = "blocked";
+const char LIFE_REASON_DOOM_LOOP[] = "doom-loop";
 
 /* ------------------------------------------------------------------ */
 /* The pinned brief wording (spec §2 — VERBATIM, word-for-word)        */
@@ -102,6 +103,7 @@ static int _life_kind_known(const char* kind) {
   static const char* const KNOWN[] = {
       LIFE_REASON_COMPLETED,  LIFE_REASON_ERROR,      LIFE_REASON_TURN_LIMIT,
       LIFE_REASON_INTERRUPTED, LIFE_REASON_ABORTED,   LIFE_REASON_BLOCKED,
+      LIFE_REASON_DOOM_LOOP,
   };
   for (size_t i = 0; i < sizeof(KNOWN) / sizeof(KNOWN[0]); i++) {
     if (strcmp(kind, KNOWN[i]) == 0) return 1;

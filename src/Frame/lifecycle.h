@@ -34,6 +34,9 @@ extern const char LIFE_REASON_TURN_LIMIT[];   /* "turn-limit" (no writer today) 
 extern const char LIFE_REASON_INTERRUPTED[];  /* "interrupted" */
 extern const char LIFE_REASON_ABORTED[];      /* "aborted" — reserved */
 extern const char LIFE_REASON_BLOCKED[];      /* "blocked" — reserved */
+extern const char LIFE_REASON_DOOM_LOOP[];    /* "doom-loop" — the breaker's
+                                                 first writer is the tool
+                                                 path's guard trip */
 
 /* --- payload composers (the engine's riders; caller owns the DOM) --------
    Every rider's payload shape is FROZEN here. turn/step are JSON ints

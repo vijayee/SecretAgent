@@ -250,6 +250,26 @@ TEST(TestLifecycle, TestBalancedTailComposesNothing) {
   lifecycle_cursor_destroy(&c);
 }
 
+TEST(TestLifecycle, TestDoomLoopReasonIsABalanceNeutralMember) {
+  /* The breaker's balance rule is unaffected by the reason's TEXT: a tail
+     whose newest record is turn.end {reason doom-loop} composes nothing —
+     and the literal's text is pinned (the repair brief never quotes it, but
+     the log honesty does). */
+  lifecycle_cursor_t c;
+  memset(&c, 0, sizeof(c));
+  lifecycle_closers_t out;
+  memset(&out, 0, sizeof(out));
+  std::string balanced =
+      lc_joint({rec_turn_start(0, 1), rec_turn_end(1, 1, "doom-loop")});
+  ASSERT_EQ(lifecycle_cursor_fold(balanced.c_str(), &c), 0);
+  EXPECT_EQ(c.turn_open, 0);
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  EXPECT_EQ(out.n, 0u) << "a doom-loop turn.end is a balanced tail's newest record";
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+  EXPECT_STREQ(LIFE_REASON_DOOM_LOOP, "doom-loop");
+}
+
 TEST(TestLifecycle, TestOpenTurnNoStepClosesWithTurnEndOnly) {
   /* port of repair.spec:116-123: an open turn (a turn.start, no turn.end)
      with NO step records composes exactly [turn.end {reason interrupted}] at
