@@ -1292,6 +1292,15 @@ typedef struct retry_model_t {
   model_backend_t base;
   std::vector<retry_delivery_t> deliveries;
   size_t next;
+  /* The steer-on-model-call machinery, mirrored from scripted_model_t: the
+     loop runs on the SAME thread as this submit, so a user message appended
+     inside it is exactly "steering between turns" — the steer at a chosen
+     1-based call lands at the model boundary and the NEXT derive reads it
+     as fresh input. Zero-init = never steers. */
+  frame_t* steer_frame;
+  const char* steer_text;
+  unsigned steer_on;
+  unsigned calls;
 } retry_model_t;
 
 static int retry_submit(void* self, json_value_t* messages, json_value_t* tools,
@@ -1301,6 +1310,11 @@ static int retry_submit(void* self, json_value_t* messages, json_value_t* tools,
   retry_model_t* rm = (retry_model_t*)self;
   if (rm->next >= rm->deliveries.size() || on_done == NULL) {
     return -1;   /* rejected before any I/O: the sink never fires */
+  }
+  rm->calls++;
+  if (rm->steer_frame != NULL && rm->steer_text != NULL &&
+      rm->calls == rm->steer_on) {
+    EXPECT_EQ(frame_append_msg(rm->steer_frame, "user", rm->steer_text), 0);
   }
   const retry_delivery_t& d = rm->deliveries[rm->next++];
   http_headers_t* headers = nullptr;
@@ -2091,6 +2105,211 @@ TEST(TestLoop, TestDoomStreakResetsOnDifferentCell) {
     json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
     EXPECT_TRUE(k == NULL || strcmp(json_as_string(k), "doom-loop") != 0)
         << "no breaker control fired on a varied pattern";
+  }
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* --- the doom x retry cross-seam (guards spec §1 through the reply path's
+   failure branch) ----------------------------------------------------------
+
+   The CROSS-SEAM fact only the composed run can trace: the model-failure
+   branch (loop.c's reply path) folds ONLY model_retries/model_retry_step —
+   it never touches the doom streak. Whether the consecutive-identical count
+   survives a model-error repost is exactly what these two runs pin. The
+   backend is the retry family's async fake (status script), delivering the
+   doom suite's byte-identical cell; its steer fields extend the steer-on-
+   model-call machinery the doom suite already steers with. */
+
+TEST(TestLoop, TestModelRetryDoesNotResetTheDoomStreak) {
+  /* delivery script: exec(A) OK (streak 1), a 503 FAILURE (the server
+     class's repost — the SAME turn, no user append side), then exec(A)
+     twice more with no steering between. The THIRD exec(A) — the one AFTER
+     the failed turn — must still be the threshold-th identical call: the
+     run ends 1, the control record carries "doom-loop", and cell.run
+     counts 2 (the third call was refused, not the fourth). A retry neither
+     counts as a tool call nor resets the streak. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "doom through a retry", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string cell =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('n', 1)\"}"}}]}}]})json";
+  std::string turn5 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"never"}}]})json";
+  retry_model_t rm = {};   /* zero-init: the vtable's members set explicitly
+                              (no steer fields — this run never steers) */
+  rm.base.complete = NULL;   /* async-only: the engine takes the submit path */
+  rm.base.submit = retry_submit;
+  rm.deliveries = {{200, cell.c_str(), 0},
+                   {503, nullptr, 0},
+                   {200, cell.c_str(), 0},
+                   {200, cell.c_str(), 0},
+                   {200, turn5.c_str(), 0}};
+  frame_set_model_backend(f, &rm.base);
+
+  /* The engine ended FAILED at the trip (the doom close's failed rc). */
+  EXPECT_EQ(frame_run_loop(f), 1);
+  EXPECT_EQ(frame_is_done(f), 0) << "a failed TOP frame keeps its status";
+  EXPECT_EQ(rm.next, 4u) << "the fifth delivery (the content turn) was never "
+                            "requested — the trip happened on the THIRD "
+                            "identical call, after the retry";
+
+  /* The two real cells ran the remember; the third never did. */
+  char* n = frame_recall(f, "n");
+  ASSERT_NE(n, nullptr);
+  EXPECT_STREQ(n, "1");
+  free(n);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_type(events, "cell.run"), 2u) << "a retry counts as no "
+      "tool call — two real cells ran, the identical count survived them";
+  EXPECT_EQ(count_type(events, "state.remember"), 2u);
+
+  /* The failure seam fired exactly once and reposted (never final): the
+     streak had to survive THIS repost to trip on the third exec(A). */
+  EXPECT_EQ(count_control_kind(events, "model-error"), 1u);
+  EXPECT_EQ(count_control_kind(events, "model-error-final"), 0u);
+
+  /* The breaker's control record landed with the model-visible text. */
+  json_value_t* control = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    if (k != NULL && strcmp(json_as_string(k), "doom-loop") == 0) control = rec;
+  }
+  ASSERT_NE(control, nullptr) << "the breaker's control record is loud — the "
+      "streak counted ACROSS the failed turn";
+  json_value_t* cp = payload_of(control);
+  EXPECT_STREQ(json_as_string(json_get(cp, "text")),
+               "doom-loop guard: the last 3 cells were identical; the turn "
+               "is refused — vary the approach");
+
+  /* The close: the reposted-into turn is still turn 3 (the retry never
+     renumbers), its turn.end {doom-loop, the breaker's text} rides after
+     the control record and is the log's NEWEST record. */
+  json_value_t* te = life_record_of_turn(events, "turn.end", 3);
+  ASSERT_NE(te, nullptr);
+  EXPECT_EQ(turn_end_kind(te), "doom-loop");
+  EXPECT_EQ((long long)json_as_int(json_get(payload_of(te), "turn")), 3);
+  json_value_t* reason = json_get(payload_of(te), "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reason, "text")),
+               "doom-loop guard: the last 3 cells were identical; the turn "
+               "is refused — vary the approach");
+  ASSERT_EQ(json_size(events), rec_seq(te));
+  EXPECT_TRUE(event_is(json_at(events, json_size(events) - 1), "turn.end"))
+      << "the newest record is the doomed turn's close";
+  EXPECT_GT(rec_seq(te), rec_seq(control))
+      << "the close rides the trip's own batch, control first";
+
+  /* Turns 1 and 2 closed completed — the 503's repost stayed turn 2 (the
+     retry never renumbered) and its cell closed that turn normally. */
+  EXPECT_EQ(turn_end_kind(life_record_of_turn(events, "turn.end", 1)),
+            "completed");
+  EXPECT_EQ(turn_end_kind(life_record_of_turn(events, "turn.end", 2)),
+            "completed");
+
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestSteeringAfterRetryResetsTheStreak) {
+  /* The SAME script with one steer: it lands inside the first POST-retry
+     submit (the 1-based call 3 — the repost's model boundary), so the
+     NEXT derive reads the user append as fresh input. Without the reset,
+     call 4's exec(A) would be the threshold-th identical (streak 2 carried
+     across the failed turn + call 3); with it, the post-steer cells run
+     streak 1 then 2. The discriminating pin: FOUR cell.runs, the run
+     completes, no breaker control ever fired — and model-error counts 1,
+     so the retry genuinely happened inside this run. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "steered out through a retry", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string cell =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('n', 1)\"}"}}]}}]})json";
+  std::string done =
+      R"json({"choices":[{"message":{"role":"assistant","content":"the steer cleared it"}}]})json";
+  retry_model_t rm = {};   /* zero-init: the vtable's members set explicitly */
+  rm.base.complete = NULL;
+  rm.base.submit = retry_submit;
+  rm.deliveries = {{200, cell.c_str(), 0},
+                   {503, nullptr, 0},
+                   {200, cell.c_str(), 0},   /* the repost's cell — the steer
+                                                lands at THIS call's boundary */
+                   {200, cell.c_str(), 0},
+                   {200, cell.c_str(), 0},
+                   {200, done.c_str(), 0}};
+  rm.steer_frame = f;
+  rm.steer_text = "steering: vary the approach";
+  rm.steer_on = 3;   /* the first post-retry call */
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  /* All four identical cells ran the remember (the fourth is the proof:
+     without the steer's reset it would have been the threshold-th). */
+  char* n = frame_recall(f, "n");
+  ASSERT_NE(n, nullptr);
+  EXPECT_STREQ(n, "1");
+  free(n);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_type(events, "cell.run"), 4u);
+  EXPECT_EQ(count_type(events, "cell.result"), 4u);
+  EXPECT_EQ(count_control_kind(events, "model-error"), 1u)
+      << "the retry genuinely happened inside this run";
+  EXPECT_EQ(count_control_kind(events, "model-error-final"), 0u);
+
+  /* The steer's user message landed between cell 1 and the repost's cell
+     (the submit's boundary), and no breaker control ever fired. */
+  std::vector<size_t> runs;
+  size_t steer_at = (size_t)-1;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "cell.run")) {
+      runs.push_back(i);
+    } else if (event_is(rec, "msg.append")) {
+      json_value_t* p = json_get(rec, "payload");
+      if (p != NULL &&
+          strcmp(json_as_string(json_get(p, "role")), "user") == 0 &&
+          strcmp(json_as_string(json_get(p, "content")),
+                 "steering: vary the approach") == 0) {
+        steer_at = i;
+      }
+    }
+  }
+  EXPECT_NE(steer_at, (size_t)-1);
+  if (steer_at != (size_t)-1 && runs.size() == 4u) {
+    EXPECT_GT(steer_at, runs[0]) << "the steering landed after cell 1";
+    EXPECT_LT(steer_at, runs[1]) << "the repost's cell audited after it";
+  }
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    EXPECT_TRUE(k == NULL || strcmp(json_as_string(k), "doom-loop") != 0)
+        << "no breaker control fired — the steer's fresh input reset the "
+           "streak across the failed turn";
   }
   json_value_destroy(events);
   frame_destroy(f);
