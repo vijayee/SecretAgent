@@ -127,6 +127,22 @@ typedef struct frame_engine_state_t {
                                   child's quiet-completion report bind, or
                                   the top end consume/free it there */
 
+  /* --- the DOOM-LOOP breaker's streak (guards spec §1) -------------------
+
+     Dispatch-thread domain (the engine state's single-runner discipline —
+     no atomics): written only in the tool path's fold and the derive's
+     user-seq scan. A DEAD engine never carries the streak across a restart
+     (_loop_engine_end clears it — the next run's re-derive relearns the
+     input facts from the log). */
+  uint8_t doom_streak;         /* consecutive byte-identical tool calls (the
+                                  guards module's fold owns the semantics) */
+  char* doom_last_code;        /* the last DISPATCHED cell's code, OWNED
+                                  (freed/replaced each tool path; freed with
+                                  the engine — mirror finish_text) */
+  uint64_t users_seen_seq;     /* the newest user-role msg.append seq the
+                                  derive has seen (the doom reset's input) */
+  uint64_t cell_users_seq;     /* users_seen_seq AT the last cell dispatch */
+
   /* --- the turn-lifecycle envelope's bookkeeping (the turn-lifecycle
      slice's Task 2; spec §3) ------------------------------------------
 

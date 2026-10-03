@@ -696,19 +696,27 @@ TEST(TestLoop, TestTurnLimitFailsLoud) {
   frame_t* f = frame_create(db, NULL, "spiral forever", &cfg);
   ASSERT_NE(f, nullptr);
 
-  /* Always a tool call — an empty queue re-answers the fallback. */
-  std::string fallback =
-      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
-      R"json({"type":"function","function":{"name":"execute",)json"
-      R"json("arguments":"{\"code\":\"pass\"}"}}]}}]})json";
-  std::vector<std::string> replies = {};
+  /* Always a tool call — one BYTE-DISTINCT cell per turn, exactly the cap's
+     count: three byte-IDENTICAL cells would now trip the doom-loop breaker
+     on the third (the breaker refuses the threshold-th identical call
+     BEFORE the cap can), and this test pins the cap's own refusal kind. */
+  std::vector<std::string> replies;
+  const char* codes[3] = {"pass", "pass  # cycle 2", "pass  # cycle 3"};
+  for (int i = 0; i < 3; i++) {
+    char args[256];
+    snprintf(args, sizeof(args),
+             R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+             R"json({"type":"function","function":{"name":"execute",)json"
+             R"json("arguments":"{\"code\":\"%s\"}"}}]}}]})json", codes[i]);
+    replies.push_back(args);
+  }
   scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
   sm.base.complete = scripted_complete;
   sm.replies = &replies;
   sm.steer_frame = NULL;
   sm.steer_text = NULL;
   sm.steer_on = 0;
-  sm.fallback = &fallback;
+  sm.fallback = NULL;
 
   frame_set_loop_turn_cap(f, 3);
   frame_set_model_backend(f, &sm.base);
@@ -1863,6 +1871,230 @@ TEST(TestLoop, TestPooledWatchdogDisarmsAtTheRealResult) {
   frame_destroy(f);
   wave_db_close(db);
   scheduler_pool_destroy(pool);
+}
+
+/* --- the doom-loop breaker (the guards spec §1; task 6) -------------------
+
+   The breaker's loop integration: the tool path folds the streak BEFORE the
+   audit batch composes; the threshold-th byte-identical cell is refused —
+   never dispatched, never audited — and the turn closes {doom-loop} with the
+   engine ended failed. Reset on input: a NEW user-role msg.append between
+   cells (steering) resets the streak before the identity check. */
+
+TEST(TestLoop, TestDoomLoopRefusesTheThirdIdenticalCell) {
+  /* turn1/turn2/turn3 all = execute "import actor\nactor.remember('n', 1)"
+     — byte-identical code, no steering between; turn4 = content "never"
+     (never requested after the trip). */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "doom loop", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string cell =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('n', 1)\"}"}}]}}]})json";
+  std::string turn4 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"never"}}]})json";
+  std::vector<std::string> replies = {cell, cell, cell, turn4};
+
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  /* The engine ended FAILED at the trip (frame_run_loop's failed rc). */
+  EXPECT_EQ(frame_run_loop(f), 1);
+  EXPECT_EQ(frame_is_done(f), 0) << "a failed TOP frame keeps its status";
+  EXPECT_EQ(replies.size(), 1u) << "turn 4 was never requested";
+
+  /* The two real cells ran the remember; the third never did. */
+  char* n = frame_recall(f, "n");
+  ASSERT_NE(n, nullptr);
+  EXPECT_STREQ(n, "1");
+  free(n);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  /* Exactly TWO cell.run records — the third call NEVER ran (and nothing
+     pointless was ever audited). */
+  EXPECT_EQ(count_type(events, "cell.run"), 2u);
+  EXPECT_EQ(count_type(events, "state.remember"), 2u);
+
+  /* The third turn OPENED at its entry (the derive preceded the trip), but
+     NO step.start for it: the audit batch never composed. */
+  EXPECT_EQ(count_turn(events, "turn.start", 3), 1u);
+  EXPECT_EQ(count_turn(events, "step.start", 3), 0u);
+
+  /* The breaker's control record with the model-visible text landed. */
+  json_value_t* control = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    if (k != NULL && strcmp(json_as_string(k), "doom-loop") == 0) control = rec;
+  }
+  ASSERT_NE(control, nullptr) << "the breaker's control record is loud";
+  json_value_t* cp = payload_of(control);
+  EXPECT_STREQ(json_as_string(json_get(cp, "text")),
+               "doom-loop guard: the last 3 cells were identical; the turn "
+               "is refused — vary the approach");
+
+  /* The close: turn 3's turn.end {doom-loop, the breaker's text}, riding
+     AFTER the control record; the turn.end is the NEWEST record in the log
+     (the trip never dispatched, never audited anything after). */
+  json_value_t* te = life_record_of_turn(events, "turn.end", 3);
+  ASSERT_NE(te, nullptr);
+  EXPECT_EQ(turn_end_kind(te), "doom-loop");
+  EXPECT_EQ((long long)json_as_int(json_get(payload_of(te), "turn")), 3);
+  json_value_t* reason = json_get(payload_of(te), "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reason, "text")),
+               "doom-loop guard: the last 3 cells were identical; the turn "
+               "is refused — vary the approach");
+  ASSERT_EQ(json_size(events), rec_seq(te));
+  EXPECT_TRUE(event_is(json_at(events, json_size(events) - 1), "turn.end"))
+      << "the newest record is the doomed turn's close";
+  EXPECT_GT(rec_seq(te), rec_seq(control))
+      << "the close rides the trip's own batch, control first";
+
+  /* Turns 1 and 2 closed completed via their cells' result batches — the
+     breaker touched only the threshold-th call. */
+  EXPECT_EQ(turn_end_kind(life_record_of_turn(events, "turn.end", 1)),
+            "completed");
+  EXPECT_EQ(turn_end_kind(life_record_of_turn(events, "turn.end", 2)),
+            "completed");
+
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestDoomStreakResetsOnSteering) {
+  /* turn1 + turn2 identify; THEN a steer (the scripted steer machinery from
+     TestSteeringBetweenTurnsReordersCells); THEN two MORE identical cells —
+     the 4-cell pattern trips WITHOUT the reset; with it the run completes. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "steered out of the loop", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string cell =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('n', 1)\"}"}}]}}]})json";
+  std::string turn5 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"steered through"}}]})json";
+  std::vector<std::string> replies = {cell, cell, cell, cell, turn5};
+
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = f;
+  sm.steer_text = "steering: try a different approach";
+  sm.steer_on = 2;   /* steer at the SECOND model call — the steer lands
+                        between cell 2 and cell 3, so the THIRD identical
+                        call re-derives from fresh input (the reset's input) */
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  /* All four identical cells ran — the streak reset before the third. */
+  char* n = frame_recall(f, "n");
+  ASSERT_NE(n, nullptr);
+  EXPECT_STREQ(n, "1");
+  free(n);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_type(events, "cell.run"), 4u);
+  EXPECT_EQ(count_type(events, "cell.result"), 4u);
+  /* The steer's user message landed, and no doom control ever fired. */
+  EXPECT_NE(find_msg_append(events, "user", "steering: try a different "
+                            "approach"), nullptr);
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    EXPECT_TRUE(k == NULL || strcmp(json_as_string(k), "doom-loop") != 0)
+        << "no breaker control fired on a steered loop";
+  }
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestDoomStreakResetsOnDifferentCell) {
+  /* A, B, A: the streak never survives a different cell — turn 3 is
+     identical to turn 1 but DIFFERENT from turn 2, so it is streak 1. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "vary the key", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string cell_n =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('n', 1)\"}"}}]}}]})json";
+  std::string cell_m =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('m', 2)\"}"}}]}}]})json";
+  std::string turn4 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"varied"}}]})json";
+  std::vector<std::string> replies = {cell_n, cell_m, cell_n, turn4};
+
+  scripted_model_t sm = {};   /* zero-init: model_backend_t's additive vtable members (submit) default NULL — the sync-scripted shape */
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  /* All three cells ran (both remembers landed). */
+  char* n = frame_recall(f, "n");
+  ASSERT_NE(n, nullptr);
+  EXPECT_STREQ(n, "1");
+  free(n);
+  char* m = frame_recall(f, "m");
+  ASSERT_NE(m, nullptr);
+  EXPECT_STREQ(m, "2");
+  free(m);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_type(events, "cell.run"), 3u);
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    EXPECT_TRUE(k == NULL || strcmp(json_as_string(k), "doom-loop") != 0)
+        << "no breaker control fired on a varied pattern";
+  }
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
 }
 
 #endif /* python gate */

@@ -4221,6 +4221,11 @@ static void _frame_destroy_run(frame_t* f) {
   _frame_sync_slot_reset(f);
   free(f->engine.finish_text);
   f->engine.finish_text = NULL;
+  /* The doom breaker's identity copy dies with the frame (the same owned-
+     engine-state discipline as finish_text above): a destroy mid-streak —
+     the CHILDREN yield included — must not leak the last cell's bytes. */
+  free(f->engine.doom_last_code);
+  f->engine.doom_last_code = NULL;
   if (f->engine.turn_reply != NULL) {
     /* A live engine's in-flight turn reply dies here (a destroy mid-turn —
        the engine state is not the queue's business). */

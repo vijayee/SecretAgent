@@ -772,7 +772,63 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
                                (the FINISH reply that consumed it ran already,
                                or the frame died mid-yield) */
   e->finish_text = NULL;
+  /* The doom breaker's streak dies with the engine too (frame_internal.h's
+     field contract; guards spec §1): a DEAD engine never carries a streak
+     across a restart — the next run's re-derive relearns the input facts
+     from the log and the fresh tool path refolds from zero. */
+  free(e->doom_last_code);
+  e->doom_last_code = NULL;
+  e->doom_streak = 0;
+  e->users_seen_seq = 0;
+  e->cell_users_seq = 0;
   if (failed) e->engine_failed = 1;
+}
+
+/* The doom trip's close (guards spec §1; the guards plan task 6): ONE
+   fire-and-post batch (the control's discipline) — the breaker's control
+   record {kind, text} + turn.end {reason doom-loop}, control FIRST (the
+   store's FIFO puts the model-visible control ahead of the close). No step
+   records ever existed for this turn — the trip refused the call BEFORE the
+   audit batch composed — so the envelope stays in the "opened but stepped
+   nothing" shape the turn-limit refusal's pre-entry refusal uses
+   (turn.start … turn.end{doom-loop}, spec §1). Refusal: loud log and the
+   OPEN tail stays for resume-repair — the terminate still runs (the
+   interrupt's refused-close discipline: never block, never spin on a WAL
+   failure). */
+static int _loop_doom_close(frame_t* f, frame_engine_state_t* e,
+                            uint8_t streak) {
+  char text[160];
+  snprintf(text, sizeof(text),
+           "doom-loop guard: the last %u cells were identical; the turn is "
+           "refused — vary the approach", (unsigned)streak);
+  json_value_t* control_payload = json_new_object();
+  json_value_t* turn_end_payload = NULL;
+  if (control_payload != NULL) {
+    json_object_set(control_payload, "kind", json_new_string("doom-loop"));
+    json_object_set(control_payload, "text", json_new_string(text));
+    turn_end_payload = lifecycle_turn_end_json(e->turn_counter,
+                                               LIFE_REASON_DOOM_LOOP, text);
+  }
+  if (control_payload == NULL || turn_end_payload == NULL) {
+    json_value_destroy(control_payload);
+    json_value_destroy(turn_end_payload);
+    log_error("loop: out of memory composing the doom close at '%s'",
+              frame_sid(f));
+    return -1;
+  }
+  const char* names[2] = {"control", LIFE_EVENT_TURN_END};
+  json_value_t* payloads[2] = {control_payload, turn_end_payload};
+  int rc = _frame_event_batch_post_fire(f, names, payloads, 2, "doom close");
+  if (rc == 0) {
+    e->turn_open = 0;
+    e->step_open = 0;
+  } else {
+    log_error("loop: the doom close of turn %llu at '%s' was refused "
+              "pre-post — the open tail stays for resume-repair; the "
+              "terminate still runs",
+              (unsigned long long)e->turn_counter, frame_sid(f));
+  }
+  return rc;
 }
 
 /* Repost the turn continuation (engine -> itself; never a wait). The
@@ -992,7 +1048,8 @@ static void _loop_post_cell_run(frame_t* f, frame_engine_state_t* e,
   e->turn_reply = reply;
 }
 
-/* The tool path (the model called `execute`): the audit round trip + yield. */
+/* The tool path (the model called `execute`): the doom guard's fold BEFORE
+   the audit batch composes, then the audit round trip + yield. */
 static void _loop_tool_path(frame_t* f, frame_engine_state_t* e,
                             model_reply_t* reply) {
   if (!_loop_python_ready()) {
@@ -1002,6 +1059,47 @@ static void _loop_tool_path(frame_t* f, frame_engine_state_t* e,
     _loop_fail(f, e, "python-missing", "no python runtime in this build");
     return;
   }
+  /* The DOOM GUARD (guards spec §1) runs before anything is audited: the
+     threshold-th byte-identical call is refused — never dispatched, never
+     audited (nothing pointless is ever written to the trail). fresh_input =
+     a user message landed since the last dispatch (the derive's
+     users_seen_seq scan tracked it; the first dispatch of a run always
+     reads fresh — cell_users_seq starts at 0 and the streak folds from
+     zero anyway). The copy of the incoming code happens HERE because the
+     reply's lifetime ends on the trip path below and after the dispatch
+     hand-off — this dispatch is the provable-owner point. */
+  uint8_t identical = (e->doom_last_code != NULL &&
+                       reply->tool_code != NULL &&
+                       strcmp(e->doom_last_code, reply->tool_code) == 0)
+                          ? 1 : 0;
+  uint8_t fresh_input = (e->users_seen_seq != e->cell_users_seq) ? 1 : 0;
+  uint8_t tripped = 0;
+  uint8_t streak = guards_doom_next(e->doom_streak, identical, fresh_input,
+                                    &tripped);
+  if (tripped != 0) {
+    /* THE TRIP: the close rides ONE batch (control + turn.end), the cell
+       never runs, the engine ends failed — the frame stays resumable (the
+       fold's answer carries the final streak count for the close's text). */
+    (void)_loop_doom_close(f, e, streak);
+    model_reply_destroy(reply);
+    _frame_engine_terminate(f, 0,
+                            "doom-loop: the model repeated the same cell "
+                            "too many times");
+    return;
+  }
+  e->doom_streak = streak;
+  free(e->doom_last_code);
+  e->doom_last_code = strdup(reply->tool_code);   /* dispatch-side memory:
+                                                     the reply dies after
+                                                     this path */
+  if (e->doom_last_code == NULL) {
+    /* The copy failed: the identity fact degrades to "never identical"
+       (the streak resets to 1 on a NULL last_code next fold — never a
+       FALSE trip) — log loud and go on (the cell is still run). */
+    log_error("loop: out of memory copying the cell doom identity at '%s'",
+              frame_sid(f));
+  }
+  e->cell_users_seq = e->users_seen_seq;
   _loop_post_cell_run(f, e, reply);
 }
 
@@ -1171,6 +1269,35 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
       continue;
     }
     json_array_append(events, rec);
+  }
+
+  /* --- the doom reset's input (guards spec §1) ---------------------------
+     The newest USER-role msg.append seq this derive saw. RECORD SHAPE (the
+     frozen contract, frame.c's _frame_event_json_full): every event record
+     carries its OWN seq as a JSON int — so seq-based tracking is exact and
+     the count fallback never entered the codebase. The scan takes the MAX
+     (order-proof even though the DOM arrives ascending), skipping
+     malformed records under the render-not-crash rule. */
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (rec == NULL) continue;
+    json_value_t* type_v = json_get(rec, "type");
+    if (type_v == NULL ||
+        strcmp(json_as_string(type_v), "msg.append") != 0) {
+      continue;
+    }
+    json_value_t* payload = json_get(rec, "payload");
+    json_value_t* role = (payload != NULL) ? json_get(payload, "role") : NULL;
+    if (role == NULL || strcmp(json_as_string(role), "user") != 0) {
+      continue;   /* the assistant's own appends are never fresh input */
+    }
+    json_value_t* seq_v = json_get(rec, "seq");
+    if (seq_v == NULL || json_type(seq_v) != JSON_INT ||
+        json_as_int(seq_v) < 0) {
+      continue;
+    }
+    uint64_t seq = (uint64_t)json_as_int(seq_v);
+    if (seq > e->users_seen_seq) e->users_seen_seq = seq;
   }
 
   /* --- THE TURN ENTRY (Task 2 rider 1; spec §3) ---------------------------
@@ -1479,6 +1606,13 @@ int _frame_engine_start(frame_t* f) {
   e->engine_failed = 0;
   e->live_children = 0;
   e->finish_text = NULL;
+  /* The doom breaker's streak never survives a restart either (the
+     _loop_engine_end clear owns the free — a stale copy here would mean a
+     leak the freed-engine discipline never wrote). */
+  e->doom_streak = 0;
+  e->doom_last_code = NULL;
+  e->users_seen_seq = 0;
+  e->cell_users_seq = 0;
   /* The lifecycle envelope's state starts UNKNOWN (the first entry restores
      the counter through the log — the restore discipline; a DEAD engine
      never carries it across a restart, and a restart of a failed engine on

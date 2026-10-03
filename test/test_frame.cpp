@@ -1528,7 +1528,14 @@ TEST(TestFrameTree, TestPooledChildFailureResumesParentWithTheFailure) {
       "import actor\nactor.spawn('spiral forever', None)\nprint('spawned')"));
   gk.queues["parent of failures"].push_back(
       canned_content_body("parent observed the failure"));
+  /* The child cycles tool cells on turns 1..3 — the cells must be
+     BYTE-DISTINCT, not one sticky body: three BYTE-IDENTICAL cells would
+     now trip the doom-loop breaker BEFORE the turn cap (the breaker refuses
+     the threshold-th identical call), and the child's bound report would
+     carry "doom-loop" instead of the cap's "turn-limit" this test pins. */
   gk.queues["spiral forever"].push_back(canned_cell_body("pass"));
+  gk.queues["spiral forever"].push_back(canned_cell_body("pass\n# cycle 2"));
+  gk.queues["spiral forever"].push_back(canned_cell_body("pass\n# cycle 3"));
   frame_set_loop_turn_cap(parent, 3);
   frame_set_model_backend(parent, &gk.base);
 
