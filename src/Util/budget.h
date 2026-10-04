@@ -23,6 +23,11 @@
 /* Listing caps. */
 #define SA_BUDGET_KEYS_MAX 256
 
+/* The sessions listing's row cap (the client-API STORE_LIST_SESSIONS): the
+   store-SIDE clamp — the enumeration stops at the cap and the truncation is
+   logged ONCE, loud, at the store's dispatch. */
+#define SA_BUDGET_SESSIONS_MAX 256
+
 /* The pooled cell's watchdog default (frame_config_t.cell_watchdog_ms;
    0 = disabled). */
 #define SA_FRAME_CELL_WATCHDOG_MS 300000u

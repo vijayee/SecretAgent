@@ -389,6 +389,27 @@ int _frame_sync_batch(frame_t* f, frm_store_op_t* ops, size_t nops,
 /* 1 when the frame has a parent frame (i.e. is a spawned child). */
 uint8_t _frame_is_child(const frame_t* f);
 
+/* --- the client-API handlers' store contract (Task 4; client-api spec §3)
+
+   The SESSIONS listing and the EVENT subscriptions live on the root's store
+   actor (frame.c's _store_behavior):
+
+   - FRM_STORE_LIST_SESSIONS {corr, reply_to}: the reply's records[] carry
+     ONE heap JSON row per session, {"sid","status","goal","created",
+     "depth"}; goal is the empty sentinel (no composer writes a meta/goal
+     key — pinned in the listing case). The reply lands at the SERVER's
+     actor; a FRAME actor receiving it hits the reply router's
+     unmatched-corr loud drop (the standing contract).
+   - FRM_STORE_WATCH / FRM_STORE_UNWATCH {sid_path, watcher}: the store's
+     dispatch thread owns the subscription list (no locks); the watcher
+     actor is BORROWED into every notice and an UNWATCH is the ONLY
+     removal — a connection's teardown MUST send the unwatch before its
+     actor dies (a dead watcher's notices keep posting and dropping loud
+     until it arrives — frame_messages.h's recorded shape).
+   - FRM_STORE_NOTICE {sid_path, seq, record_json}: ONE committed event
+     record under the watched subtree; the store composes self-owned
+     copies, so the payload outlives the batch. */
+
 /* --- the pending-cell plumbing (FRM_CELL_EXECUTE <-> PYRT_RESULT) ----------
 
    State is ONE slot per frame: a cell runs while cell_pending == 1. The

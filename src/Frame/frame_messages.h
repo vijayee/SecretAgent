@@ -50,6 +50,15 @@ typedef enum frame_message_type_e {
                              subtree scan (frm_store_keys_payload_t) — the
                              reply carries KEY NAME tail segments, never a
                              value; see the surface-completion spec §3 */
+  FRM_STORE_LIST_SESSIONS, /* -> store actor: the sessions listing (own
+                              payload; the reply-router at the SERVER's
+                              actor answers — a frame actor receiving the
+                              reply = the standing loud drop) */
+  FRM_STORE_WATCH,        /* -> store actor: subscribe a subtree (the
+                             events' live tail) */
+  FRM_STORE_UNWATCH,      /* -> store actor: drop a subscription */
+  FRM_STORE_NOTICE,       /* store actor -> watcher: a committed matching
+                             event record's shape */
   FRM_STORE_REPLY,        /* store actor -> requester: corr-matched result
                              (frm_store_reply_payload_t) */
   FRM_REPORT_BIND,        /* child frame actor -> parent frame actor: compose
@@ -223,7 +232,36 @@ typedef struct frm_report_bind_payload_t {
   char* text;               /* OWNED; the report text (the parent re-composes its bound event) */
 } frm_report_bind_payload_t;
 
+/* The client-API sessions listing (spec §3): the store enumerates the
+   root's sessions/ first-level entries + each entry's meta/{created,
+   status,depth,goal} and answers via the round-trip reply — records[] =
+   ONE heap JSON row per session, {"sid","status","goal","created","depth"}
+   (goal is the empty sentinel: no composer writes a meta/goal key today).
+   The reply's ROUTER lives at the SERVER's actor (Task 4's
+   ca_session_server); reply_to NULL = refused loud (the listing exists to
+   be answered). */
+typedef struct frm_store_sessions_payload_t { uint64_t corr; actor_t* reply_to; } frm_store_sessions_payload_t;
+
+/* One events subscription (the live tail): the store's dispatch thread
+   owns the subscription list (no locks); `watcher` is BORROWED into every
+   notice. RECORDED SHAPE: an unwatch is the ONLY removal — a watcher
+   destroyed WITHOUT unwatching (a connection torn down before its teardown
+   sent the unwatch) keeps its notices posting, and each post refuses with
+   the dead-target loud drop, until the unwatch arrives. The transports'
+   teardown discipline (unwatch-before-destroy) is the contract. */
+typedef struct frm_store_watch_t { char* sid_path; actor_t* watcher; } frm_store_watch_t;
+
+/* The notice: ONE committed event record under a watched subtree. The
+   store composes it on its own dispatch thread with SELF-OWNED copies
+   (sid_path copied from the key, record_json strduplicated out of the
+   batch's op value BEFORE the reply machinery reclaims it), so the payload
+   survives the batch entirely. */
+typedef struct frm_store_notice_t { char* sid_path; uint64_t seq; char* record_json; } frm_store_notice_t;
+
 void frm_store_batch_payload_destroy(void* p);
+void frm_store_sessions_payload_destroy(void* p);
+void frm_store_watch_destroy(void* p);
+void frm_store_notice_destroy(void* p);
 void frm_store_scan_payload_destroy(void* p);
 void frm_store_recall_payload_destroy(void* p);
 void frm_store_keys_payload_destroy(void* p);

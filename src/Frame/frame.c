@@ -103,6 +103,27 @@ void frm_store_keys_payload_destroy(void* p) {
   free(kp);
 }
 
+void frm_store_sessions_payload_destroy(void* p) {
+  frm_store_sessions_payload_t* lp = (frm_store_sessions_payload_t*)p;
+  if (lp == NULL) return;
+  free(lp);
+}
+
+void frm_store_watch_destroy(void* p) {
+  frm_store_watch_t* wp = (frm_store_watch_t*)p;
+  if (wp == NULL) return;
+  free(wp->sid_path);
+  free(wp);
+}
+
+void frm_store_notice_destroy(void* p) {
+  frm_store_notice_t* np = (frm_store_notice_t*)p;
+  if (np == NULL) return;
+  free(np->sid_path);
+  free(np->record_json);
+  free(np);
+}
+
 void frm_store_reply_payload_destroy(void* p) {
   frm_store_reply_payload_t* rp = (frm_store_reply_payload_t*)p;
   if (rp == NULL) return;
@@ -261,6 +282,19 @@ static const char SA_FRAME_STATUS_DONE[] = "done";
    SHARED bound rides frame_internal.h — frame.c's scans, the store actor's
    scan replies, and the engine's FRM_STORE_SCAN must agree on the number). */
 
+/* One events subscription (client-api spec §3): the store-side watch list.
+   The store actor's dispatch thread is the single writer (watch/unwatch
+   arrive as its own messages; the fan-out reads the list in the same
+   dispatch) — NO locks. sid_path = the watched subtree prefix (e.g.
+   "sessions/<sid>"), OWNED; watcher = the receiving actor, BORROWED (see
+   frm_store_watch_t in frame_messages.h — an unwatch is the ONLY removal;
+   a dead watcher's notices post and drop loud until then). */
+typedef struct store_watch_t {
+  char* sid_path;
+  actor_t* watcher;
+  struct store_watch_t* next;
+} store_watch_t;
+
 struct wave_database_root_t {
   actor_t store_actor;        /* FIRST member (house rule: actor states lead
                                  with actor_t) — the ONE serializer: every
@@ -273,6 +307,9 @@ struct wave_database_root_t {
   ATOMIC(uint64_t) counter;   /* sid uniqueness counter */
   scheduler_pool_t* store_pool;  /* BORROWED; NULL = inline (tests/demo pump
                                     by hand) — the dual-driver rule's knob */
+  store_watch_t* watches;     /* the events subscriptions; the dispatch
+                                 thread's list (single writer; freed at
+                                 wave_db_close after the actor's drain) */
 };
 
 struct frame_t {
@@ -963,6 +1000,176 @@ int _frame_delayed_post(frame_t* f, uint32_t delay_ms) {
        ? (size_t)SA_FRAME_DEBUG_MAX_EVENTS                                    \
        : (size_t)(SA_BUDGET_KEYS_MAX + 1))
 
+/* The store_notify fan-out's key gate (client-api spec §3): parse a batch op
+   key that names a committed EVENT record — the ABSOLUTE root form
+   "sessions/<sid>/events/<20-digit seq>" (the _frame_event_key compose).
+   Returns 0 with the sid's close offset (the '/' at key[sid_end] closes
+   "sessions/<sid>") and the parsed seq (strtoull over the zero-padded
+   digits — the _frame_restore_seq idiom); nonzero for every other key: the
+   meta/state/lineage writes never notify. */
+static int _store_event_key_parse(const char* key, size_t* sid_end,
+                                  uint64_t* seq) {
+  static const char events_seg[] = "/events/";
+  size_t sessions_len = strlen("sessions/");
+  if (key == NULL || strncmp(key, "sessions/", sessions_len) != 0) return -1;
+  size_t p = sessions_len;
+  while (key[p] != '\0' && key[p] != '/') p++;
+  if (p == sessions_len || key[p] != '/') return -1;
+  size_t sid_close = p;
+  if (strncmp(key + p, events_seg, strlen(events_seg)) != 0) return -1;
+  p += strlen(events_seg);
+  if (key[p] == '\0') return -1;
+  char* endp = NULL;
+  *seq = strtoull(key + p, &endp, 10);
+  if (endp == key + p || *endp != '\0') return -1;
+  *sid_end = sid_close;
+  return 0;
+}
+
+/* malloc'd NUL-terminated copy of the identifier's bytes, or NULL (the
+   scan materializations' copy idiom, hoisted for the listing + notice
+   composes). */
+static char* _store_identifier_text(identifier_t* id) {
+  if (id == NULL) return NULL;
+  size_t len = 0;
+  uint8_t* data = identifier_get_data_copy(id, &len);
+  if (data == NULL) return NULL;
+  char* text = (char*)get_memory(len + 1);
+  if (text == NULL) {
+    free(data);
+    return NULL;
+  }
+  memcpy(text, data, len);
+  text[len] = '\0';
+  free(data);
+  return text;
+}
+
+/* File one meta record's value into the sessions listing's capture slots:
+   the record sits in a "meta" dir and its tail name is one of created /
+   status / depth / goal (meta/parent is the resume walk's key — never a
+   listing fact — so it skips honestly). Only the FIRST text lands (the
+   birth metas write once). Returns 0 filed-or-skipped, -1 on OOM. */
+static int _store_meta_file(identifier_t* dir_id, identifier_t* name_id,
+                            identifier_t* value_id, char** created,
+                            char** status, char** depth, char** goal) {
+  char* dir = _store_identifier_text(dir_id);
+  if (dir == NULL) return -1;
+  int rc = 0;
+  int is_meta = (strcmp(dir, "meta") == 0);
+  free(dir);
+  if (!is_meta) return 0;
+  char* name = _store_identifier_text(name_id);
+  if (name == NULL) return -1;
+  char** slot = NULL;
+  if (strcmp(name, "created") == 0) slot = created;
+  else if (strcmp(name, "status") == 0) slot = status;
+  else if (strcmp(name, "depth") == 0) slot = depth;
+  else if (strcmp(name, "goal") == 0) slot = goal;
+  free(name);
+  if (slot == NULL) return 0;   /* an unrelated meta name: the honest skip */
+  if (*slot == NULL) {
+    *slot = _store_identifier_text(value_id);
+    if (*slot == NULL) rc = -1;
+  }
+  return rc;
+}
+
+/* One listing row (client-api spec §3): {"sid","status","goal","created",
+   "depth"} — the json compose the store pays per row (µs, bounded by
+   SA_BUDGET_SESSIONS_MAX rows). json_object_set TAKES the value (destroy
+   only on its refusal), so the puts compose via _store_row_put. Returns
+   the serialized heap text, NULL loud on any compose refusal. */
+static int _store_row_put(json_value_t* row, const char* key,
+                          json_value_t* value) {
+  if (value == NULL || json_object_set(row, key, value) != 1) {
+    json_value_destroy(value);   /* returned 0 = refused WITHOUT taking it */
+    return 0;
+  }
+  return 1;
+}
+
+static char* _store_sessions_row(const char* sid, const char* status,
+                                 const char* goal, const char* created,
+                                 long depth) {
+  json_value_t* row = json_new_object();
+  if (row == NULL) return NULL;
+  char* out = NULL;
+  if (_store_row_put(row, "sid", json_new_string(sid != NULL ? sid : "")) &&
+      _store_row_put(row, "status", json_new_string(status != NULL ? status : "")) &&
+      _store_row_put(row, "goal", json_new_string(goal != NULL ? goal : "")) &&
+      _store_row_put(row, "created", json_new_string(created != NULL ? created : "")) &&
+      _store_row_put(row, "depth", json_new_int((int64_t)depth))) {
+    out = json_serialize(row);
+  }
+  json_value_destroy(row);
+  if (out == NULL) {
+    log_error("store: out of memory composing a sessions listing row");
+  }
+  return out;
+}
+
+/* The store_notify fan-out (client-api spec §3): ONE notice per committed
+   event record per watcher whose sid_path is a PREFIX of the record's key
+   (with the segment-boundary check — "sessions/AB" never matches
+   "sessions/ABC/events/..."). Runs INSIDE the store's batch dispatch (the
+   fan-out's single writer — the watch list's thread domain, no locks), on
+   the SUCCESS path only: a refused batch committed nothing, so nothing
+   notifies. The op values ride the batch's payload — the notices strdip
+   their own copies (the composed event JSON) BEFORE the payload destroy
+   reclaims the ops; a watcher whose actor died refuses the post loud
+   (_frame_post's dead-target log) and keeps doing so until its unwatch
+   arrives. */
+static void _store_notify_watchers(wave_database_root_t* root,
+                                   const frm_store_op_t* ops, size_t nops) {
+  if (root->watches == NULL) return;
+  for (size_t i = 0; i < nops; i++) {
+    if (ops[i].is_delete != 0 || ops[i].value == NULL) continue;
+    size_t sid_end = 0;
+    uint64_t seq = 0;
+    if (_store_event_key_parse(ops[i].key, &sid_end, &seq) != 0) continue;
+    for (store_watch_t* w = root->watches; w != NULL; w = w->next) {
+      /* The path-PREFIX rule: the key starts with the watched subtree AND
+         the prefix ends at the key's own segment boundary — either side
+         carries the boundary '/' (a whole-tree "sessions/" watch ends its
+         own prefix with one), or the key ends exactly there. "sessions/AB"
+         never matches "sessions/ABC/events/...". */
+      size_t wl = strlen(w->sid_path);
+      if (wl == 0 || strncmp(w->sid_path, ops[i].key, wl) != 0) {
+        continue;
+      }
+      uint8_t boundary = (w->sid_path[wl - 1] == '/') ||
+                         (ops[i].key[wl] == '/') || (ops[i].key[wl] == '\0');
+      if (boundary == 0) {
+        continue;
+      }
+      frm_store_notice_t* np =
+          (frm_store_notice_t*)get_clear_memory(sizeof(frm_store_notice_t));
+      if (np != NULL) {
+        np->sid_path = (char*)get_memory(sid_end + 1);
+        np->seq = seq;
+        np->record_json = (char*)get_memory(ops[i].value_len + 1);
+        if (np->sid_path != NULL) {
+          memcpy(np->sid_path, ops[i].key, sid_end);
+          np->sid_path[sid_end] = '\0';
+        }
+        if (np->record_json != NULL) {
+          memcpy(np->record_json, ops[i].value, ops[i].value_len);
+          np->record_json[ops[i].value_len] = '\0';
+        }
+      }
+      if (np == NULL || np->sid_path == NULL || np->record_json == NULL) {
+        log_error("store: out of memory composing the event notice for '%s' "
+                  "— the watcher misses this record", ops[i].key);
+        frm_store_notice_destroy(np);
+        continue;
+      }
+      _frame_post(w->watcher, (uint32_t)FRM_STORE_NOTICE, np,
+                  frm_store_notice_destroy, "store notice");
+    }
+  }
+}
+
 static void _store_reply_send(actor_t* reply_to, uint64_t corr, int rc,
                               char** records, size_t n) {
   if (reply_to == NULL) {
@@ -1325,9 +1532,16 @@ static void _store_behavior(void* state, message_t* msg) {
         if (rc != 0) {
           log_error("store: batch '%s' failed (%d) at the root — nothing "
                     "committed", bp->op_name != NULL ? bp->op_name : "?", rc);
-        } else if (bp->reply_to == NULL) {
-          log_info("store: batch '%s' committed (fire-and-post)",
-                   bp->op_name != NULL ? bp->op_name : "?");
+        } else {
+          /* The commit pokes the watch list (the store_notify fan-out)
+             BEFORE the payload destroy reclaims the ops' values — the
+             notices carry their own copies. Refused batches committed
+             nothing: no notice. */
+          _store_notify_watchers(root, bp->ops, bp->nops);
+          if (bp->reply_to == NULL) {
+            log_info("store: batch '%s' committed (fire-and-post)",
+                     bp->op_name != NULL ? bp->op_name : "?");
+          }
         }
       }
       actor_t* reply_to = bp->reply_to;         /* borrowed; survives the free */
@@ -1631,7 +1845,302 @@ static void _store_behavior(void* state, message_t* msg) {
       frm_store_keys_payload_destroy(kp);
       break;
     }
+    case FRM_STORE_LIST_SESSIONS: {
+      /* The client-API sessions listing (spec §3), run INSIDE this dispatch
+         = the one serialized read. The bounded enumeration of the root's
+         sessions/ FIRST-LEVEL entries (distinct second key segments — the
+         sids) + each entry's meta/{created,status,depth} — and meta/goal
+         when it ever appears (TODAY no composer writes a goal meta: frame_
+         create's birth batch carries created/status/depth[/parent] only, so
+         the row's "goal" is the empty sentinel, the wire's ""; the read
+         stays future-proof). The walk is the keys case's FORWARD-scan
+         idiom (absolute root-level composed bounds — "sessions/" ..
+         "sessions0"), bounded by SA_BUDGET_SESSIONS_MAX DISTINCT sids: a
+         257th first-level entry stops the walk and logs the truncation
+         ONCE, loud. Membership: a subtree with no meta/created is not a
+         session (the birth record is the resume gate — frame.c's resume
+         contract; birth batches are atomic, so partial sids do not exist
+         in honest stores). Reply: records[] = ONE heap JSON row per
+         session, {"sid","status","goal","created","depth"} (created is the
+         ISO birth text; depth the parsed meta value, 0 when absent); the
+         reply's ROUTER lives at the requesting SERVER's actor (Task 4's
+         ca_session_server) — a frame actor receiving this reply hits the
+         router's unmatched-corr loud drop. An empty root: rc 0 with NO
+         records — the empty answer, like the keys scan. */
+      frm_store_sessions_payload_t* lp =
+          (frm_store_sessions_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (lp == NULL) {
+        log_error("store: FRM_STORE_LIST_SESSIONS with no payload — "
+                  "dropping loud");
+        break;
+      }
+      if (lp->reply_to == NULL) {
+        /* The listing exists to be answered: no reply target = the walk
+           never runs. */
+        log_error("store: FRM_STORE_LIST_SESSIONS with no reply target — "
+                  "refused loud");
+        frm_store_sessions_payload_destroy(lp);
+        break;
+      }
+      int rc = 0;
+      size_t n = 0;
+      char** records = NULL;
+      char* lo = get_memory(strlen("sessions/") + 1);
+      char* hi = get_memory(strlen("sessions0") + 1);
+      if (lo == NULL || hi == NULL) {
+        log_error("store: out of memory composing the sessions scan bounds");
+        free(lo);
+        free(hi);
+        rc = -1;
+      } else {
+        snprintf(lo, strlen("sessions/") + 1, "sessions/");
+        snprintf(hi, strlen("sessions0") + 1, "sessions0");
+        path_t* start = path_create_from_raw(lo, strlen(lo), '/', 0);
+        path_t* end = path_create_from_raw(hi, strlen(hi), '/', 0);
+        free(lo);   /* the bounds' TEXT dies here; the paths ride the scan */
+        free(hi);
+        if (start == NULL || end == NULL) {
+          log_error("store: sessions scan 'sessions/'..'sessions0' — bound "
+                    "composition failed");
+          if (start != NULL) path_destroy(start);
+          if (end != NULL) path_destroy(end);
+          rc = -1;
+        } else {
+          database_iterator_t* iter =
+              database_scan_start(root->db, start, end);
+          if (iter == NULL) {
+            log_error("store: sessions scan failed — refusing the listing "
+                      "reply");
+            rc = -1;
+          } else {
+            /* Pass 1: the DISTINCT sids + the meta texts, in one bounded
+               forward pass (non-meta values are destroyed unread — the
+               listing reads the meta only). */
+            char* sids[SA_BUDGET_SESSIONS_MAX] = {NULL};
+            char* m_created[SA_BUDGET_SESSIONS_MAX] = {NULL};
+            char* m_status[SA_BUDGET_SESSIONS_MAX] = {NULL};
+            char* m_depth[SA_BUDGET_SESSIONS_MAX] = {NULL};
+            char* m_goal[SA_BUDGET_SESSIONS_MAX] = {NULL};
+            size_t nsids = 0;
+            uint8_t truncated = 0;
+            uint8_t oom = 0;
+            while (truncated == 0 && oom == 0) {
+              path_t* k = NULL;
+              identifier_t* v = NULL;
+              int src = database_scan_next(iter, &k, &v);
+              if (src != 0) {
+                if (src < -1) {
+                  log_error("store: sessions scan failed mid-pass (%d) — "
+                            "the reply carries the rows gathered so far",
+                            src);
+                }
+                break;
+              }
+              if (k != NULL && path_length(k) >= 2) {
+                char* hex = _store_identifier_text(path_get(k, 1));
+                if (hex == NULL) {
+                  oom = 1;
+                } else {
+                  /* The listing's sid is the FULL path ("sessions/<hex>") —
+                     the wire's sid shape (the watch payloads' sid_path). */
+                  size_t full_len = strlen("sessions/") + strlen(hex);
+                  char* full = (char*)get_memory(full_len + 1);
+                  if (full == NULL) {
+                    oom = 1;
+                  } else {
+                    snprintf(full, full_len + 1, "sessions/%s", hex);
+                    size_t idx = nsids;
+                    for (size_t j = 0; j < nsids; j++) {
+                      if (strcmp(sids[j], full) == 0) {
+                        idx = j;
+                        break;
+                      }
+                    }
+                    if (idx == nsids && nsids == SA_BUDGET_SESSIONS_MAX) {
+                      /* One entry PAST the cap exists: the walk stops and
+                         the truncation logs ONCE, loud (after scan_end). */
+                      truncated = 1;
+                    } else if (idx == nsids) {
+                      sids[idx] = full;
+                      idx = nsids++;
+                      full = NULL;
+                    }
+                    /* The meta texts of an ENUMERATED sid: the "meta" dir's
+                       records, first write wins (the birth metas are written
+                       once; meta/parent is the resume walk's key — never a
+                       listing fact). */
+                    if (idx < nsids && path_length(k) >= 4) {
+                      if (_store_meta_file(path_get(k, 2), path_get(k, 3), v,
+                                           &m_created[idx], &m_status[idx],
+                                           &m_depth[idx], &m_goal[idx]) != 0) {
+                        oom = 1;
+                      }
+                    }
+                    free(full);
+                  }
+                  free(hex);
+                }
+              } else {
+                log_error("store: sessions scan record lost its key");
+                oom = 1;
+              }
+              path_destroy(k);
+              identifier_destroy(v);
+            }
+            database_scan_end(iter);
+            /* The scan consumed the bounds' lifetime (they are not
+               destroyed again on this path). */
+            if (truncated != 0) {
+              log_error("store: the sessions listing clamped at %u rows — "
+                        "the walk stopped loud (truncated)",
+                        (unsigned)SA_BUDGET_SESSIONS_MAX);
+            }
+            if (oom != 0) {
+              log_error("store: sessions scan materialization hit a bound — "
+                        "the listing refuses rather than shrinks its answer");
+              rc = -1;
+            }
+            /* Pass 2: compose one JSON row per BORN session (the
+               meta/created presence is the birth gate); the walk's scratch
+               texts die here, the heap rows ride the reply. */
+            if (rc == 0) {
+              for (size_t i = 0; i < nsids && rc == 0; i++) {
+                if (m_created[i] == NULL) continue;   /* not a session */
+                long depth = (m_depth[i] != NULL)
+                    ? strtol(m_depth[i], NULL, 10) : 0;
+                char* text = _store_sessions_row(
+                    sids[i],
+                    (m_status[i] != NULL) ? m_status[i] : "",
+                    (m_goal[i] != NULL) ? m_goal[i] : "",
+                    m_created[i], depth);
+                if (text == NULL) {
+                  rc = -1;
+                } else {
+                  char** grown = (char**)realloc(records, (n + 1) * sizeof(char*));
+                  if (grown == NULL) {
+                    free(text);
+                    rc = -1;
+                  } else {
+                    records = grown;
+                    records[n++] = text;
+                  }
+                }
+              }
+            }
+            /* The scratch texts die regardless (the rows carry their own
+               copies); on an rc != 0 the rows array dies with them. */
+            for (size_t i = 0; i < nsids; i++) {
+              free(sids[i]);
+              free(m_created[i]);
+              free(m_status[i]);
+              free(m_depth[i]);
+              free(m_goal[i]);
+            }
+            if (rc != 0) {
+              for (size_t i = 0; i < n; i++) free(records[i]);
+              free(records);
+              records = NULL;
+              n = 0;
+            }
+          }
+        }
+      }
+      if (rc != 0 && records != NULL) {
+        for (size_t i = 0; i < n; i++) free(records[i]);
+        free(records);
+        records = NULL;
+        n = 0;
+      }
+      _store_reply_send(lp->reply_to, lp->corr, rc, records,
+                        records != NULL ? n : 0);
+      frm_store_sessions_payload_destroy(lp);
+      break;
+    }
+    case FRM_STORE_WATCH: {
+      /* One subscription join (spec §3): the dispatch thread's list, no
+         locks — the fan-out reads it in the SAME dispatch the batches run
+         in. Duplicate (watcher, sid_path) = idempotent (never a duplicate
+         node: one record, one notice). Fire-and-post: no reply — the
+         notices are the observable. */
+      frm_store_watch_t* wp = (frm_store_watch_t*)msg->payload;
+      msg->payload = NULL;
+      if (wp == NULL || wp->sid_path == NULL || wp->watcher == NULL ||
+          strncmp(wp->sid_path, "sessions/", strlen("sessions/")) != 0) {
+        log_error("store: watch request needs a sessions/ subtree and a "
+                  "watcher actor — refused loud");
+        if (wp != NULL) frm_store_watch_destroy(wp);
+        break;
+      }
+      uint8_t known = 0;
+      for (store_watch_t* w = root->watches; w != NULL; w = w->next) {
+        if (w->watcher == wp->watcher &&
+            strcmp(w->sid_path, wp->sid_path) == 0) {
+          known = 1;
+          break;
+        }
+      }
+      if (known != 0) {
+        log_info("store: watch '%s' already subscribed — idempotent",
+                 wp->sid_path);
+        frm_store_watch_destroy(wp);
+        break;
+      }
+      store_watch_t* w = (store_watch_t*)get_clear_memory(sizeof(store_watch_t));
+      if (w != NULL) {
+        w->sid_path = strdup(wp->sid_path);
+        if (w->sid_path != NULL) {
+          w->watcher = wp->watcher;   /* BORROWED */
+          w->next = root->watches;
+          root->watches = w;
+        } else {
+          free(w);
+          log_error("store: out of memory registering the watch '%s' — "
+                    "refused loud", wp->sid_path);
+        }
+      } else {
+        log_error("store: out of memory registering the watch '%s' — "
+                  "refused loud", wp->sid_path);
+      }
+      frm_store_watch_destroy(wp);
+      break;
+    }
+    case FRM_STORE_UNWATCH: {
+      /* One subscription drop (spec §3): the removal by (watcher,
+         sid_path) — the ONLY way a subscription leaves the list. A drop
+         for no such subscription refuses loud (a double teardown or a dead
+         client's late unwatch is a routing fact worth the log). */
+      frm_store_watch_t* wp = (frm_store_watch_t*)msg->payload;
+      msg->payload = NULL;
+      if (wp == NULL || wp->sid_path == NULL || wp->watcher == NULL) {
+        log_error("store: unwatch request needs a sid path and a watcher "
+                  "actor — refused loud");
+        if (wp != NULL) frm_store_watch_destroy(wp);
+        break;
+      }
+      uint8_t removed = 0;
+      store_watch_t** link = &root->watches;
+      while (*link != NULL) {
+        if ((*link)->watcher == wp->watcher &&
+            strcmp((*link)->sid_path, wp->sid_path) == 0) {
+          store_watch_t* dead = *link;
+          *link = dead->next;
+          free(dead->sid_path);
+          free(dead);
+          removed = 1;
+        } else {
+          link = &(*link)->next;
+        }
+      }
+      if (removed == 0) {
+        log_error("store: unwatch for no such subscription ('%s') — "
+                  "dropping loud", wp->sid_path);
+      }
+      frm_store_watch_destroy(wp);
+      break;
+    }
     case FRM_STORE_REPLY:   /* replies LEAVE the store; arriving = routing bug */
+    case FRM_STORE_NOTICE:  /* notices LEAVE too; arriving = routing bug */
     default:
       if (msg->payload_destroy != NULL && msg->payload != NULL) {
         msg->payload_destroy(msg->payload);
@@ -3052,8 +3561,14 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
     case FRM_STORE_SCAN:
     case FRM_STORE_RECALL:
     case FRM_STORE_KEYS:
+    case FRM_STORE_LIST_SESSIONS:
+    case FRM_STORE_WATCH:
+    case FRM_STORE_UNWATCH:
+    case FRM_STORE_NOTICE:
       /* Store OPERATIONS at a frame actor: a routing bug (they belong at the
-         root's store actor). Loud drop; the payload retires here. */
+         root's store actor; only the SERVER's actor consumes the sessions
+         reply/watch corrs and the watchers receive FRM_STORE_NOTICE). Loud
+         drop; the payload retires here. */
       log_error("frame: a store operation arrived at the FRAME actor of '%s' "
                 "— store ops belong at the root's store actor; dropping loud",
                 f->sid_path);
@@ -3586,6 +4101,20 @@ void wave_db_close(wave_database_root_t* root) {
      caller order: stop the pool, then close the db, then destroy the pool).
      Inline: no-op waits, then the drain. */
   actor_destroy(&root->store_actor);
+  /* The watch list dies after the actor's drain: any in-flight watch/
+     unwatch payload already retired via its destroyer above, and no more
+     dispatches exist to touch the list (the dispatch thread's teardown —
+     the watchers are BORROWED actors, never freed here). */
+  {
+    store_watch_t* w = root->watches;
+    while (w != NULL) {
+      store_watch_t* dead = w;
+      w = w->next;
+      free(dead->sid_path);
+      free(dead);
+    }
+    root->watches = NULL;
+  }
   if (root->lineage != NULL) {
     /* Layer teardown: schema snapshot + drop the layer's lineage-subtree
        reference. It never destroys the shared database (subtree mode). */

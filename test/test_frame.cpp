@@ -881,6 +881,337 @@ TEST(TestFrame, TestStoreBatchCarriesDeleteOpsAtomic) {
   wave_db_close(db);
 }
 
+/* The sessions-listing reply capture: the store actor answers a RAW
+   FRM_STORE_LIST_SESSIONS at the requester actor directly (a test double —
+   the production reply target is Task 4's ca_session_server actor), and the
+   frame router's corr slots do not cover a raw listing probe (an unrelated
+   corr drops loud — the router's contract). Same shape as scan_capture_t. */
+typedef struct sessions_capture_t {
+  actor_t actor;
+  std::vector<int64_t> rcs;
+  std::vector<size_t> counts;
+  std::vector<std::vector<std::string>> records_per_reply;
+} sessions_capture_t;
+
+static void sessions_capture_dispatch(void* state, message_t* msg) {
+  sessions_capture_t* cap = (sessions_capture_t*)state;
+  if (msg->type != (uint32_t)FRM_STORE_REPLY) return;
+  frm_store_reply_payload_t* r = (frm_store_reply_payload_t*)msg->payload;
+  msg->payload = NULL;   /* consumed — payload_destroy must not free it twice */
+  if (r == NULL) return;
+  cap->rcs.push_back(r->rc);
+  cap->counts.push_back(r->n);
+  std::vector<std::string> recs;
+  for (size_t i = 0; i < r->n; i++)
+    recs.emplace_back(r->records[i] != NULL ? r->records[i] : "");
+  cap->records_per_reply.push_back(recs);
+  frm_store_reply_payload_destroy(r);
+}
+
+/* The notice capture: the watcher actor double — one FRM_STORE_NOTICE per
+   committed matching event record, consumed here on the test's pump. */
+typedef struct notice_capture_t {
+  actor_t actor;
+  std::vector<std::string> sids;
+  std::vector<uint64_t> seqs;
+  std::vector<std::string> records;
+} notice_capture_t;
+
+static void notice_capture_dispatch(void* state, message_t* msg) {
+  notice_capture_t* cap = (notice_capture_t*)state;
+  if (msg->type != (uint32_t)FRM_STORE_NOTICE) return;
+  frm_store_notice_t* np = (frm_store_notice_t*)msg->payload;
+  msg->payload = NULL;
+  if (np == NULL) return;
+  cap->sids.emplace_back(np->sid_path != NULL ? np->sid_path : "");
+  cap->seqs.push_back(np->seq);
+  cap->records.emplace_back(np->record_json != NULL ? np->record_json : "");
+  frm_store_notice_destroy(np);
+}
+
+TEST(TestStore, TestStoreListsSessionsAndTheirMeta) {
+  /* The client-API sessions listing (Task 3; spec §3): TWO TOP frames (one
+     left running; one marked done; a spawned CHILD's subtree nests at
+     "sessions/<parent>/frames/<hex>" — never a first-level entry) — the
+     listing enumerates the root's sessions/ first-level entries and answers
+     ONE heap JSON row per session with the meta the store actually holds:
+     status, created, depth. GOAL: no composer writes a meta/goal key today
+     (frame_create's batch carries created/status/depth[/parent] only) — the
+     row's "goal" is the empty sentinel (the wire's ""), the pinned
+     what-exists shape. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  actor_t* store = wave_db_store_actor(db);
+  ASSERT_NE(store, nullptr);
+  frame_config_t cfg = test_config();
+  frame_t* running = frame_create(db, NULL, "top goal", &cfg);
+  frame_t* done = frame_create(db, NULL, "second goal", &cfg);
+  ASSERT_NE(running, nullptr);
+  ASSERT_NE(done, nullptr);
+  EXPECT_EQ(_frame_set_status_done(done), 0) << "the second frame ends done";
+
+  sessions_capture_t cap;
+  actor_init(&cap.actor, &cap, sessions_capture_dispatch, NULL);
+  frm_store_sessions_payload_t* lp =
+      (frm_store_sessions_payload_t*)get_clear_memory(sizeof(*lp));
+  lp->corr = 5511;
+  lp->reply_to = &cap.actor;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_LIST_SESSIONS;
+  m.payload = lp;
+  m.payload_destroy = frm_store_sessions_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &m));
+  wave_db_pump(db);                     /* the store actor walks + answers */
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);
+
+  ASSERT_EQ(cap.rcs.size(), 1u);
+  ASSERT_EQ(cap.rcs[0], 0);
+  ASSERT_EQ(cap.counts[0], 2u) << "two first-level sessions/ entries";
+
+  /* Find + read each row (the handlers parse the same rows in Task 4). */
+  int saw_running = 0, saw_done = 0;
+  for (size_t i = 0; i < cap.counts[0]; i++) {
+    const std::string& row = cap.records_per_reply[0][i];
+    json_value_t* j = json_parse(row.c_str(), row.size(), NULL);
+    ASSERT_NE(j, nullptr) << "row " << i << " composes as JSON: " << row;
+    const char* sid = json_as_string(json_get(j, "sid"));
+    ASSERT_NE(sid, nullptr);
+    int64_t depth = json_as_int(json_get(j, "depth"));
+    std::string status = json_as_string(json_get(j, "status"));
+    std::string created = json_as_string(json_get(j, "created"));
+    std::string goal = json_as_string(json_get(j, "goal"));
+    if (std::string(sid) == frame_sid(running)) {
+      EXPECT_EQ(status, "running") << "the frame stamps running at birth";
+      saw_running = 1;
+    } else if (std::string(sid) == frame_sid(done)) {
+      EXPECT_EQ(status, "done") << "the frame was marked done";
+      saw_done = 1;
+    } else {
+      ADD_FAILURE() << "an unknown session row: " << sid;
+    }
+    EXPECT_EQ(depth, 0) << "a top frame's depth";
+    EXPECT_FALSE(created.empty()) << "every born session carries meta/created";
+    EXPECT_EQ(goal, "") << "pinned: no composer writes a meta/goal key today";
+    json_value_destroy(j);
+  }
+  EXPECT_EQ(saw_running, 1);
+  EXPECT_EQ(saw_done, 1);
+
+  actor_destroy(&cap.actor);
+  frame_destroy(done);
+  frame_destroy(running);
+  wave_db_close(db);
+}
+
+TEST(TestStore, TestStoreNotifyWatchesASubtree) {
+  /* The events' subscription fan-out (Task 3; spec §3): a watcher on
+     sessions/<f1> sees ONLY f1's committed EVENT records — another sid's
+     batch and a meta write under the watched sid stay silent; unwatch =
+     the subscription's only removal (then silent). */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  actor_t* store = wave_db_store_actor(db);
+  ASSERT_NE(store, nullptr);
+  frame_config_t cfg = test_config();
+  frame_t* f1 = frame_create(db, NULL, NULL, &cfg);
+  frame_t* f2 = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f1, nullptr);
+  ASSERT_NE(f2, nullptr);
+  std::string sid1 = frame_sid(f1);
+
+  notice_capture_t cap;
+  actor_init(&cap.actor, &cap, notice_capture_dispatch, NULL);
+  frm_store_watch_t* wp = (frm_store_watch_t*)get_clear_memory(sizeof(*wp));
+  wp->sid_path = strdup(sid1.c_str());
+  wp->watcher = &cap.actor;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_WATCH;
+  m.payload = wp;
+  m.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &m));
+  wave_db_pump(db);                     /* the subscription registers */
+
+  /* A batch under ANOTHER sid: no notice. */
+  EXPECT_EQ(frame_remember_local(f2, "other", "\"v\""), 0);
+  EXPECT_EQ(cap.seqs.size(), 0u) << "other sids' events stay silent";
+
+  /* A NOT-events write under the watched sid (the meta/status put): no
+     notice — the fan-out filters committed event records. */
+  EXPECT_EQ(_frame_set_status_done(f1), 0);
+  EXPECT_EQ(cap.seqs.size(), 0u) << "meta writes stay silent";
+
+  /* A committed EVENT record under the watched sid: ONE notice with the
+     record's {sid, seq} and its exact committed text. */
+  EXPECT_EQ(frame_remember_local(f1, "wkey", "\"v\""), 0);
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);
+  ASSERT_EQ(cap.seqs.size(), 1u);
+  EXPECT_EQ(cap.sids[0], sid1);
+  json_value_t* rec = json_parse(cap.records[0].c_str(), cap.records[0].size(), NULL);
+  ASSERT_NE(rec, nullptr) << "the notice carries the committed record JSON";
+  EXPECT_EQ(json_as_int(json_get(rec, "seq")), (int64_t)cap.seqs[0])
+      << "the notice's seq matches its record's seq";
+  EXPECT_STREQ(json_as_string(json_get(rec, "type")), "state.remember");
+  json_value_destroy(rec);
+  EXPECT_GT(cap.seqs[0], 0u);
+  cap.sids.clear(); cap.seqs.clear(); cap.records.clear();
+
+  /* Unwatch: the subscription's ONLY removal. */
+  frm_store_watch_t* up = (frm_store_watch_t*)get_clear_memory(sizeof(*up));
+  up->sid_path = strdup(sid1.c_str());
+  up->watcher = &cap.actor;
+  message_t m2;
+  m2.type = (uint32_t)FRM_STORE_UNWATCH;
+  m2.payload = up;
+  m2.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &m2));
+  wave_db_pump(db);
+  EXPECT_EQ(frame_remember_local(f1, "wkey2", "\"v2\""), 0);
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);
+  EXPECT_EQ(cap.seqs.size(), 0u) << "the unwatched watcher is silent";
+
+  /* The DEAD-watcher shape (frame_messages.h's recorded contract): a watch
+     whose watcher was destroyed WITHOUT an unwatch — its future notices
+     keep posting and refuse loud at the post (the payload dies there;
+     valgrind watches this), until the unwatch still removes the entry. */
+  notice_capture_t dead;
+  actor_init(&dead.actor, &dead, notice_capture_dispatch, NULL);
+  frm_store_watch_t* dwp = (frm_store_watch_t*)get_clear_memory(sizeof(*dwp));
+  dwp->sid_path = strdup(sid1.c_str());
+  dwp->watcher = &dead.actor;
+  message_t dm;
+  dm.type = (uint32_t)FRM_STORE_WATCH;
+  dm.payload = dwp;
+  dm.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &dm));
+  wave_db_pump(db);
+  actor_destroy(&dead.actor);       /* dies UNWATCHED */
+  EXPECT_EQ(frame_remember_local(f1, "wkey3", "\"v3\""), 0);
+  /* The refused-notice post already happened inside the commit's pump. The
+     teardown unwatch removes the entry for good. */
+  frm_store_watch_t* dup2 = (frm_store_watch_t*)get_clear_memory(sizeof(*dup2));
+  dup2->sid_path = strdup(sid1.c_str());
+  dup2->watcher = &dead.actor;
+  message_t dm2;
+  dm2.type = (uint32_t)FRM_STORE_UNWATCH;
+  dm2.payload = dup2;
+  dm2.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &dm2));
+  wave_db_pump(db);
+
+  actor_destroy(&cap.actor);
+  frame_destroy(f1);
+  frame_destroy(f2);
+  wave_db_close(db);
+}
+
+TEST(TestStore, TestStoreNoticeCarriesTheCommittedRecord) {
+  /* The notice's record_json is the batch op's committed value bytes — the
+     EXACT text, strduplicated by the fan-out before the payload destroy
+     reclaims the ops. A raw batch with one events op (a synthetic seq key)
+     + one state op rides ONE notice; a DUPLICATE watch (idempotent) never
+     doubles it. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  actor_t* store = wave_db_store_actor(db);
+  ASSERT_NE(store, nullptr);
+  frame_config_t cfg = test_config();
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+
+  notice_capture_t cap;
+  actor_init(&cap.actor, &cap, notice_capture_dispatch, NULL);
+  for (int i = 0; i < 2; i++) {          /* the second watch is idempotent */
+    frm_store_watch_t* wp =
+        (frm_store_watch_t*)get_clear_memory(sizeof(*wp));
+    wp->sid_path = strdup(sid.c_str());
+    wp->watcher = &cap.actor;
+    message_t m;
+    m.type = (uint32_t)FRM_STORE_WATCH;
+    m.payload = wp;
+    m.payload_destroy = frm_store_watch_destroy;
+    ASSERT_TRUE(actor_send(store, &m));
+  }
+  /* The whole-tree watcher: "sessions/" ends its own prefix boundary, so it
+     sees every event record. The half-sid watcher ("sessions/<4hex>"): the
+     prefix does NOT end at a segment boundary — the sid is 8 hex — so it
+     stays silent. */
+  notice_capture_t tree;
+  actor_init(&tree.actor, &tree, notice_capture_dispatch, NULL);
+  frm_store_watch_t* twp = (frm_store_watch_t*)get_clear_memory(sizeof(*twp));
+  twp->sid_path = strdup("sessions/");
+  twp->watcher = &tree.actor;
+  message_t tm;
+  tm.type = (uint32_t)FRM_STORE_WATCH;
+  tm.payload = twp;
+  tm.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &tm));
+  notice_capture_t half;
+  actor_init(&half.actor, &half, notice_capture_dispatch, NULL);
+  frm_store_watch_t* hwp = (frm_store_watch_t*)get_clear_memory(sizeof(*hwp));
+  hwp->sid_path = strdup((sid.substr(0, strlen("sessions/") + 4)).c_str());
+  hwp->watcher = &half.actor;
+  message_t hm;
+  hm.type = (uint32_t)FRM_STORE_WATCH;
+  hm.payload = hwp;
+  hm.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &hm));
+  wave_db_pump(db);
+
+  const char record_text[] =
+      "{\"seq\":21,\"type\":\"state.remember\",\"frame\":\"probe\","
+      "\"corr\":null,\"at\":\"2026-10-03T00:00:00Z\",\"cause\":null,"
+      "\"payload\":{\"key\":\"probe\",\"value\":\"42\"}}";
+  std::string event_key = sid + "/events/00000000000000000021";
+  std::string state_key = sid + "/state/local/probe";
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*bp));
+  bp->ops = (frm_store_op_t*)get_clear_memory(2 * sizeof(frm_store_op_t));
+  bp->nops = 2;
+  bp->ops[0].key = strdup(event_key.c_str());
+  bp->ops[0].value = (uint8_t*)strdup(record_text);
+  bp->ops[0].value_len = strlen(record_text);
+  bp->ops[1].key = strdup(state_key.c_str());
+  bp->ops[1].value = (uint8_t*)strdup("42");
+  bp->ops[1].value_len = strlen("42");
+  bp->op_name = "notify probe";
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_BATCH;
+  m.payload = bp;
+  m.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &m));
+  wave_db_pump(db);
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);
+
+  ASSERT_EQ(cap.seqs.size(), 1u)
+      << "one events op + an idempotent watch = ONE notice (no duplicates)";
+  EXPECT_EQ(cap.seqs[0], 21u) << "the seq parses from the key's tail digits";
+  EXPECT_EQ(cap.sids[0], sid);
+  EXPECT_STREQ(cap.records[0].c_str(), record_text)
+      << "the notice's record_json is the committed record's EXACT text";
+
+  /* The boundary rule's both sides: the whole-tree watcher saw exactly the
+     one record; the half-sid watcher saw nothing. */
+  actor_run(&tree.actor, ACTOR_BATCH_SIZE);
+  ASSERT_EQ(tree.seqs.size(), 1u) << "the 'sessions/' watch rides every record";
+  EXPECT_STREQ(tree.records[0].c_str(), record_text);
+  EXPECT_EQ(half.seqs.size(), 0u)
+      << "a non-boundary prefix never matches ('sessions/<4hex>' is not a "
+         "subtree)";
+
+  /* The state op committed too — the store saw the whole batch. */
+  char* recalled = frame_recall(f, "probe");
+  ASSERT_NE(recalled, nullptr);
+  EXPECT_STREQ(recalled, "42");
+  free(recalled);
+
+  actor_destroy(&cap.actor);
+  actor_destroy(&tree.actor);
+  actor_destroy(&half.actor);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestFrame, TestSyncScanAndBatchRefuseOnPooledStore) {
   /* The two NEW sync store helpers refuse LOUD on a POOLED store — the same
      inline-only rule as wave_db_pump's pump refusal (no hang, no mailbox
