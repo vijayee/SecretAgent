@@ -223,24 +223,28 @@ void unix_transport_destroy(unix_transport_t* transport) {
     platform_socket_destroy(transport->listen_sock);
     transport->listen_sock = NULL;
   }
-  /* The connection teardown pass: the loop is stopped (the server thread is
-     joined above), so each connection's watcher and fd tear down directly —
-     no actor round trip, no destroy stack. THE ORDER MATTERS twice over:
-     (1) this pass runs BEFORE pd_loop_destroy — the loop's own destroy frees
-     every watcher still registered in it, so a connection freeing later
-     (deferred, below) may not touch its watcher again; and (2) the server's
-     purge hook (ca_session_conn_closed) fires while the server is still
-     reachable — it drops this connection's subscriptions and pending store
-     round trips, releasing the refs the server pinned. */
+  /* THE CONNECTION TEARDOWN PASSES (liboffs's unix_transport_destroy order,
+     mapped 1:1 — its first pass marks closing, closes the fd and drops the
+     transport link; it touches NO watcher):
+     (1) THE CLOSED WINDOW: every conn-watcher stop/destroy happens AFTER the
+     idle wait below, riding the final free pass (inside
+     unix_connection_destroy). NOT here, in this first pass: a conn dispatch
+     that already cleared the is_closing entry gate — a queued WRITE, say —
+     can call _connection_update_watcher, which loads the watcher and queues
+     UNIX_SERVER_UPDATE_WATCHER; destroyed here, that message lands on a dead
+     pd_watcher_t. Destroyed after scheduler_pool_wait_for_idle, every conn
+     dispatch has returned — the window is empty. liboffs's own free loop
+     also sits after its wait; same window closed there. (The update path is
+     additionally gated by conn->transport == NULL, which this pass sets.)
+     (2) the server's purge hook (ca_session_conn_closed) fires HERE — the
+     last point where the server is still reachable (liboffs has no server to
+     purge, so this is ours-only). It drops this connection's subscriptions
+     and pending store round trips, releasing the refs the server pinned so
+     the final pass's dereference-to-free lands at zero — by the lifetime
+     contract it must run BEFORE the free, which is exactly where it sits. */
   for (int i = 0; i < transport->connections.length; i++) {
     unix_connection_t* conn = transport->connections.data[i];
-    conn->is_closing = 1;
-    atomic_fetch_sub(&transport->active_connections, 1);
-    pd_watcher_t* watcher = ATOMIC_EXCHANGE(&conn->watcher, NULL);
-    if (watcher != NULL) {
-      pd_watcher_stop(watcher);
-      pd_watcher_destroy(watcher);
-    }
+    ATOMIC_STORE(&conn->is_closing, 1);
     if (conn->sock != NULL) {
       platform_socket_destroy(conn->sock);
       conn->sock = NULL;
@@ -258,15 +262,23 @@ void unix_transport_destroy(unix_transport_t* transport) {
   if (!atomic_load_explicit(&transport->pool->terminate, memory_order_acquire)) {
     scheduler_pool_wait_for_idle(transport->pool);
   }
+  /* THE FREE PASS (liboffs's final loop, also post-wait): idle now, so the
+     watcher teardown inside unix_connection_destroy races nothing — this is
+     the closed window above, realized. liboffs's decrement of
+     active_connections lives in its final loop too; ours rides here because
+     unix_connection_destroy only decrements when the transport link is still
+     set (it is NULL for every conn in this pass). */
   for (int i = transport->connections.length - 1; i >= 0; i--) {
     unix_connection_t* conn = transport->connections.data[i];
+    atomic_fetch_sub(&transport->active_connections, 1);
     /* THE RELEASE-BASED FREE (the ca_session_conn_t's lifetime contract):
        the vec held the base ref; the destroy's dereference frees at zero.
        A connection still pinned by a server ref (a subscription or an
        in-flight closure that outlived the teardown pass) frees at THAT
-       last release — ca_session_server_destroy's unrefs — with its
-       watcher/fd already gone (the pass above), so the deferred free can
-       touch none of the loop's machinery. */
+       last release — ca_session_server_destroy's unrefs — with its fd
+       already gone (the first pass above) and, should a deferred free ever
+       arise despite the purge, with its watcher stop/destroy riding inside
+       itself on the transportless direct path. */
     unix_connection_destroy(conn);
   }
   vec_deinit(&transport->connections);

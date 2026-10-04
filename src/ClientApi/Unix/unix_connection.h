@@ -78,7 +78,9 @@ typedef struct unix_connection_t {
   stream_framer_t* framer;
   buffer_t* write_buffer;
   uint8_t write_pending;
-  uint8_t is_closing;
+  /* atomic, not plain: the teardown thread stores it while scheduler
+     workers load it at the dispatch's entry gate (see unix_connection.c) */
+  ATOMIC(uint8_t) is_closing;
   unix_transport_t* transport;
   ca_session_server_t* server;   /* borrowed from the transport; the dispatch
                                     hands it every decoded frame */

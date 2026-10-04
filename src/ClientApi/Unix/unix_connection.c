@@ -177,7 +177,7 @@ static void _connection_close_fd(unix_connection_t* connection) {
   if (sock != NULL) {
     platform_socket_destroy(sock);
   }
-  connection->is_closing = 1;
+  ATOMIC_STORE(&connection->is_closing, 1);
   /* The handlers' teardown hook (handlers.h: the transports call it on every
      connection close — from any thread; it marshals). Fires BEFORE the
      transport reference is dropped by the destroy pass, so the server can
@@ -230,7 +230,15 @@ static void _unix_dispatch_frame(unix_connection_t* conn, cbor_item_t* frame) {
 void unix_connection_dispatch(void* state, message_t* msg) {
   unix_connection_t* connection = (unix_connection_t*)state;
 
-  if (connection->is_closing) {
+  /* The ENTRY GATE: reads the closing flag as this dispatch picks its work
+     up. It is atomic — the teardown thread stores it while workers load it.
+     But it gates NEW work only: a dispatch already past this line still runs
+     (a queued WRITE, say), which is exactly the in-flight window the
+     teardown closes by ORDER — its conn-watcher stop/destroy waits until the
+     pool goes idle, so an in-flight _connection_update_watcher can never
+     touch a dead pd_watcher_t. liboffs's gate is the same first-line check;
+     ours additionally reads it well-defined. */
+  if (ATOMIC_LOAD(&connection->is_closing)) {
     return;
   }
 
@@ -404,7 +412,7 @@ void unix_connection_dispatch(void* state, message_t* msg) {
           DESTROY(connection->write_buffer, buffer);
           connection->write_buffer = NULL;
           connection->write_pending = 0;
-          if (connection->is_closing) {
+          if (ATOMIC_LOAD(&connection->is_closing)) {
             if (connection->sock != NULL) {
               platform_socket_shutdown(connection->sock, PLATFORM_SHUT_WR);
             }
@@ -437,7 +445,7 @@ void unix_connection_dispatch(void* state, message_t* msg) {
 
     case UNIX_CONNECTION_CLOSE: {
       if (connection->write_pending) {
-        connection->is_closing = 1;
+        ATOMIC_STORE(&connection->is_closing, 1);
         _connection_update_watcher(connection, PD_EVENT_READ | PD_EVENT_WRITE);
         break;
       }
@@ -561,7 +569,7 @@ unix_connection_t* unix_connection_create(unix_transport_t* transport,
   connection->sock = sock;
   connection->write_buffer = NULL;
   connection->write_pending = 0;
-  connection->is_closing = 0;
+  ATOMIC_STORE(&connection->is_closing, 0);
   connection->framer = stream_framer_create();
   /* the handlers' view of this connection: the send machinery above, the
      refcounter pair for the lifetime */
