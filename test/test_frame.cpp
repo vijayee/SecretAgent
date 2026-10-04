@@ -1212,6 +1212,99 @@ TEST(TestStore, TestStoreNoticeCarriesTheCommittedRecord) {
   wave_db_close(db);
 }
 
+TEST(TestStore, TestStoreNotifySeesNestedChildEvents) {
+  /* The store_notify parse's NESTED shape: a spawned CHILD frame commits
+     events under its OWN subtree "sessions/<parent>/frames/<hex>/events/
+     <seq>" (frame_spawn's sid_path compose; the batch is hand-composed to
+     pin the PARSE). A watcher on the PARENT's sid (a multi-segment prefix
+     across the frames/ boundary) and a watcher on the CHILD's own path each
+     see the notice: notice sid == "sessions/<parent>/frames/<hex>", seq
+     exact, the record text exact. An events key with extra segments after
+     the seq, and a non-digit tail, never notify. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  actor_t* store = wave_db_store_actor(db);
+  ASSERT_NE(store, nullptr);
+  frame_config_t cfg = test_config();
+  frame_t* parent = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(parent, nullptr);
+  std::string pid = frame_sid(parent);
+  /* The child subtree path compose (frame_spawn's _frame_alloc):
+     "<parent full path>/frames/<8hex>". */
+  std::string child = pid + "/frames/deadbeef";
+
+  notice_capture_t cap;
+  actor_init(&cap.actor, &cap, notice_capture_dispatch, NULL);
+  frm_store_watch_t* wp = (frm_store_watch_t*)get_clear_memory(sizeof(*wp));
+  wp->sid_path = strdup(pid.c_str());
+  wp->watcher = &cap.actor;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_WATCH;
+  m.payload = wp;
+  m.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &m));
+  notice_capture_t childcap;
+  actor_init(&childcap.actor, &childcap, notice_capture_dispatch, NULL);
+  frm_store_watch_t* cwp = (frm_store_watch_t*)get_clear_memory(sizeof(*cwp));
+  cwp->sid_path = strdup(child.c_str());
+  cwp->watcher = &childcap.actor;
+  message_t cm;
+  cm.type = (uint32_t)FRM_STORE_WATCH;
+  cm.payload = cwp;
+  cm.payload_destroy = frm_store_watch_destroy;
+  ASSERT_TRUE(actor_send(store, &cm));
+  wave_db_pump(db);                     /* the subscriptions register */
+
+  const char record_text[] =
+      "{\"seq\":7,\"type\":\"state.remember\",\"frame\":\"probe\","
+      "\"corr\":null,\"at\":\"2026-10-03T00:00:00Z\",\"cause\":null,"
+      "\"payload\":{\"key\":\"probe\",\"value\":\"42\"}}";
+  std::string event_key = child + "/events/00000000000000000007";
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*bp));
+  bp->ops = (frm_store_op_t*)get_clear_memory(3 * sizeof(frm_store_op_t));
+  bp->nops = 3;
+  bp->ops[0].key = strdup(event_key.c_str());
+  bp->ops[0].value = (uint8_t*)strdup(record_text);
+  bp->ops[0].value_len = strlen(record_text);
+  /* An events key with EXTRA segments after the seq: no notice ever. */
+  bp->ops[1].key = strdup((child + "/events/7/extra").c_str());
+  bp->ops[1].value = (uint8_t*)strdup("junk");
+  bp->ops[1].value_len = strlen("junk");
+  /* A non-digit seq tail: no notice ever. */
+  bp->ops[2].key = strdup((child + "/events/7th").c_str());
+  bp->ops[2].value = (uint8_t*)strdup("junk2");
+  bp->ops[2].value_len = strlen("junk2");
+  bp->op_name = "nested notify probe";
+  message_t bm;
+  bm.type = (uint32_t)FRM_STORE_BATCH;
+  bm.payload = bp;
+  bm.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(store, &bm));
+  wave_db_pump(db);
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);
+  actor_run(&childcap.actor, ACTOR_BATCH_SIZE);
+
+  ASSERT_EQ(cap.seqs.size(), 1u)
+      << "the parent's watch sees the nested child event (ONE notice)";
+  EXPECT_EQ(cap.seqs[0], 7u) << "the seq parses from the nested key's tail";
+  EXPECT_EQ(cap.sids[0], child)
+      << "the notice's sid is the child's FULL subtree path";
+  EXPECT_STREQ(cap.records[0].c_str(), record_text)
+      << "the notice's record_json is the committed record's EXACT text";
+
+  ASSERT_EQ(childcap.seqs.size(), 1u)
+      << "the child's own-path watch sees its commit too";
+  EXPECT_EQ(childcap.seqs[0], 7u);
+  EXPECT_EQ(childcap.sids[0], child);
+  EXPECT_STREQ(childcap.records[0].c_str(), record_text);
+
+  actor_destroy(&cap.actor);
+  actor_destroy(&childcap.actor);
+  frame_destroy(parent);
+  wave_db_close(db);
+}
+
 TEST(TestFrame, TestSyncScanAndBatchRefuseOnPooledStore) {
   /* The two NEW sync store helpers refuse LOUD on a POOLED store — the same
      inline-only rule as wave_db_pump's pump refusal (no hang, no mailbox

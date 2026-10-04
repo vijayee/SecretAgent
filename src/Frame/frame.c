@@ -1001,28 +1001,33 @@ int _frame_delayed_post(frame_t* f, uint32_t delay_ms) {
        : (size_t)(SA_BUDGET_KEYS_MAX + 1))
 
 /* The store_notify fan-out's key gate (client-api spec §3): parse a batch op
-   key that names a committed EVENT record — the ABSOLUTE root form
-   "sessions/<sid>/events/<20-digit seq>" (the _frame_event_key compose).
-   Returns 0 with the sid's close offset (the '/' at key[sid_end] closes
-   "sessions/<sid>") and the parsed seq (strtoull over the zero-padded
-   digits — the _frame_restore_seq idiom); nonzero for every other key: the
+   key that names a committed EVENT record — ANY events-leaf form under the
+   sessions tree: "<sessions prefix>/events/<20-digit seq>". The prefix is
+   the _frame_event_key compose's sid_path: a top frame's "sessions/<sid>"
+   or a spawned CHILD frame's own subtree "sessions/<sid>/frames/<hex>". The
+   gate is GENERIC — it scans the key's segments for the FIRST "/events/"
+   boundary and never special-cases "frames": sid_path is everything before
+   it, the tail after "events/" must be exactly ONE all-digit segment (the
+   zero-padded seq, strtoull — the _frame_restore_seq idiom). Returns 0 with
+   the sid's close offset (the '/' at key[sid_end] closes the prefix) and
+   the parsed seq; nonzero for every other key (no events segment, extra
+   tail segments, non-digit tails, an empty first segment): the
    meta/state/lineage writes never notify. */
 static int _store_event_key_parse(const char* key, size_t* sid_end,
                                   uint64_t* seq) {
   static const char events_seg[] = "/events/";
   size_t sessions_len = strlen("sessions/");
   if (key == NULL || strncmp(key, "sessions/", sessions_len) != 0) return -1;
-  size_t p = sessions_len;
-  while (key[p] != '\0' && key[p] != '/') p++;
-  if (p == sessions_len || key[p] != '/') return -1;
-  size_t sid_close = p;
-  if (strncmp(key + p, events_seg, strlen(events_seg)) != 0) return -1;
-  p += strlen(events_seg);
-  if (key[p] == '\0') return -1;
+  const char* hit = strstr(key + sessions_len, events_seg);
+  if (hit == NULL) return -1;
+  size_t ev_open = (size_t)(hit - key);
+  if (ev_open == sessions_len) return -1;   /* an empty first segment */
+  const char* tail = key + ev_open + strlen(events_seg);
+  if (*tail == '\0' || strchr(tail, '/') != NULL) return -1;
   char* endp = NULL;
-  *seq = strtoull(key + p, &endp, 10);
-  if (endp == key + p || *endp != '\0') return -1;
-  *sid_end = sid_close;
+  *seq = strtoull(tail, &endp, 10);
+  if (endp == tail || *endp != '\0') return -1;
+  *sid_end = ev_open;
   return 0;
 }
 
@@ -1115,7 +1120,7 @@ static char* _store_sessions_row(const char* sid, const char* status,
    "sessions/ABC/events/..."). Runs INSIDE the store's batch dispatch (the
    fan-out's single writer — the watch list's thread domain, no locks), on
    the SUCCESS path only: a refused batch committed nothing, so nothing
-   notifies. The op values ride the batch's payload — the notices strdip
+   notifies. The op values ride the batch's payload — the notices strdups
    their own copies (the composed event JSON) BEFORE the payload destroy
    reclaims the ops; a watcher whose actor died refuses the post loud
    (_frame_post's dead-target log) and keeps doing so until its unwatch
