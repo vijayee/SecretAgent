@@ -460,16 +460,22 @@ TEST(TestSaClient, TestEventsCallbackReentryRefusedImmediately) {
     EXPECT_EQ(rec.prompt_status[1], 0u);
     EXPECT_EQ(rec.err_status.size(), 0u)
         << "the refusal returns -1 silently (no error channel either)";
-    bool saw_trigger = false;
+  }
+  /* The trigger record's DELIVERY raced the assert under valgrind's
+     slowdown: the refusal's wait returns on the first post-arm record (a
+     replayed one may carry it), while the steer's msg.append commits
+     milliseconds later on a slowed reader. Wait for the record itself. */
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
     for (size_t i = 0; i < rec.ev_json.size(); i++) {
       if (rec.ev_seq[i] > 0 &&
           rec.ev_json[i].find("steer under the reentry") != std::string::npos) {
-        saw_trigger = true;
+        return true;
       }
     }
-    EXPECT_TRUE(saw_trigger)
-        << "the record whose callback attempted the reentry was delivered";
-  }
+    return false;
+  }))
+      << "the record whose callback attempted the reentry was delivered";
 
   /* THE SUBSCRIPTION CONTINUES past the refusal: the unsubscribe's terminal
      marker still rides the same events callback */
@@ -761,6 +767,10 @@ TEST(TestSaClientTcp, TestAuthedPromptRoundTripOverTcp) {
   rec_t rec;
   sa_client_config_t cfg = client_config(&fx);
   cfg.transport = SA_CLIENT_TRANSPORT_TCP;
+  /* the TCP config's honest shape (the demo CLI's client mode): the socket
+     path rides the unix fixture's helper — NULLed here, pinning that a TCP
+     connect never demands a socket_path */
+  cfg.socket_path = NULL;
   cfg.host = "127.0.0.1";
   cfg.port = fixture_tcp_port(&fx);
   cfg.api_key = FIXTURE_API_KEY;
@@ -804,6 +814,7 @@ TEST(TestSaClientTcp, TestBadKeyConnectRefused) {
   rec_t rec;
   sa_client_config_t cfg = client_config(&fx);
   cfg.transport = SA_CLIENT_TRANSPORT_TCP;
+  cfg.socket_path = NULL;   /* the honest TCP shape (the demo CLI's) */
   cfg.host = "127.0.0.1";
   cfg.port = fixture_tcp_port(&fx);
   cfg.api_key = "not-the-key";

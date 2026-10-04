@@ -1508,7 +1508,13 @@ sa_client_t* sa_client_connect(const sa_client_config_t* config) {
   c->wake = platform_condvar_create();
   ATOMIC_STORE(&c->running, 1);
   c->next_req_id = 0;
-  if (c->socket_path == NULL || c->lock == NULL || c->wake == NULL ||
+  /* The endpoint's own field: UNIX wants socket_path, TCP wants host (a
+     NULL socket_path on a TCP config is the honest shape — the demo CLI's
+     client mode carries it). */
+  if ((config->transport == SA_CLIENT_TRANSPORT_UNIX &&
+       c->socket_path == NULL) ||
+      (config->transport == SA_CLIENT_TRANSPORT_TCP && c->host == NULL) ||
+      c->lock == NULL || c->wake == NULL ||
       (config->api_key != NULL && c->api_key == NULL) ||
       (config->transport == SA_CLIENT_TRANSPORT_TCP && !_key_in_bounds(c))) {
     log_error("sa_client_connect: the client's own setup failed");
