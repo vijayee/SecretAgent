@@ -143,6 +143,14 @@ void frm_report_bind_payload_destroy(void* p) {
   free(bp);
 }
 
+void frm_steer_payload_destroy(void* p) {
+  frm_steer_payload_t* sp = (frm_steer_payload_t*)p;
+  if (sp == NULL) return;
+  free(sp->role);
+  free(sp->text);
+  free(sp);
+}
+
 #ifdef SA_HAS_WDB
 
 #include "model.h"
@@ -2699,6 +2707,21 @@ static int _frame_remember_sync(frame_t* f, const char* key, const char* json_va
   return rc;
 }
 
+/* The msg.append payload compose (the {role, content} object both the sync
+   append and the FRM_STEER dispatch build). */
+static json_value_t* _frame_msg_append_payload(const char* role,
+                                               const char* content) {
+  json_value_t* payload = json_new_object();
+
+  if (payload == NULL) {
+    log_error("frame: out of memory building msg.append payload");
+    return NULL;
+  }
+  json_object_set(payload, "role", json_new_string(role));
+  json_object_set(payload, "content", json_new_string(content));
+  return payload;
+}
+
 /* msg.append = the conversation-turn event in ONE root batch (the general
    event write, with the {role, content} payload). */
 static int _frame_append_msg(frame_t* f, const char* role, const char* content) {
@@ -2711,15 +2734,8 @@ static int _frame_append_msg(frame_t* f, const char* role, const char* content) 
     return -1;
   }
 
-  json_value_t* payload = json_new_object();   /* {role, content} */
-  if (payload == NULL) {
-    log_error("frame: out of memory building msg.append payload");
-    return -1;
-  }
-  json_object_set(payload, "role", json_new_string(role));
-  json_object_set(payload, "content", json_new_string(content));
-
-  return _frame_event_write(f, "msg.append", payload);
+  return _frame_event_write(f, "msg.append",
+                            _frame_msg_append_payload(role, content));
 }
 
 /* The TOP-frame report variant (documented loop decision: a report marks the
@@ -3588,6 +3604,32 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       frm_report_bind_payload_t* b = (frm_report_bind_payload_t*)msg->payload;
       msg->payload = NULL;
       _frame_report_bind_compose(f, b);
+      break;
+    }
+    case FRM_STEER: {
+      /* The posted steer (frame_internal.h's _frame_steer_post contract):
+         the durable msg.append composed IN the frame's own dispatch — the
+         seq's single writer. Fire-and-post (corr 0, reply_to NULL): the
+         store's FIFO commits it, and nothing on the handler's loop thread
+         awaits — the response answered QUEUED, not committed. Validation is
+         frame_append_msg's own (role/content non-NULL; the WAL cap applies
+         at the compose) — a hand-crafted payload that fails it is dropped
+         loud with nothing committed. A steer arriving AFTER the frame ended
+         (done) still appends when it slipped past the handler's refusal —
+         the log stays appendable; the handler layer owns the done-refusal. */
+      frm_steer_payload_t* sp = (frm_steer_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (sp == NULL || sp->role == NULL || sp->text == NULL) {
+        log_error("frame: FRM_STEER needs role and text at '%s' — dropped "
+                  "loud, nothing committed", f->sid_path);
+        frm_steer_payload_destroy(sp);
+        break;
+      }
+      json_value_t* payload = _frame_msg_append_payload(sp->role, sp->text);
+      if (payload != NULL) {
+        _frame_event_post_fire(f, "msg.append", payload);
+      }
+      frm_steer_payload_destroy(sp);
       break;
     }
     case FRM_INT:
@@ -4689,6 +4731,32 @@ void frame_interrupt(frame_t* f) {
     return;
   }
   _frame_post(&f->actor, (uint32_t)FRM_INT, NULL, NULL, "interrupt");
+}
+
+int _frame_steer_post(frame_t* f, const char* role, const char* content) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: steer post on a dead frame");
+    return -1;
+  }
+  if (role == NULL || content == NULL) {
+    log_error("frame: steer post needs role and content");
+    return -1;
+  }
+  /* The compose rides the FRAME'S dispatch (the FRM_STEER case) — the seq's
+     single writer is the frame's own thread, so the post carries only the
+     texts. Ownership of both HEAP fields transfers with the payload. */
+  frm_steer_payload_t* sp =
+      (frm_steer_payload_t*)get_clear_memory(sizeof(frm_steer_payload_t));
+  sp->role = strdup(role);
+  sp->text = strdup(content);
+  if (sp->role == NULL || sp->text == NULL) {
+    log_error("frame: out of memory composing a steer for '%s'", f->sid_path);
+    frm_steer_payload_destroy(sp);
+    return -1;
+  }
+  _frame_post(&f->actor, (uint32_t)FRM_STEER, sp, frm_steer_payload_destroy,
+              "wire steer");
+  return 0;
 }
 
 scheduler_pool_t* frame_pool(const frame_t* f) {

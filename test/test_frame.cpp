@@ -220,6 +220,75 @@ static void debug_event_count(frame_t* f, size_t* count_out) {
   free(json);
 }
 
+/* The steer test's pre-refusal gate: 1 when the frame's log is empty. */
+static int debug_event_count_is_zero(frame_t* f) {
+  size_t n = 0;
+  debug_event_count(f, &n);
+  return n == 0;
+}
+
+/* The audit-trail surface (test_loop.cpp's helpers, verbatim): load
+   frame_debug_events and search it. */
+static json_value_t* load_events(frame_t* f) {
+  char* json = frame_debug_events(f);
+  EXPECT_NE(json, nullptr);
+  if (json == NULL) return nullptr;
+  char* err = NULL;
+  json_value_t* arr = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  EXPECT_NE(arr, nullptr);
+  if (arr != nullptr) EXPECT_EQ(json_type(arr), JSON_ARRAY);
+  if (arr == nullptr || json_type(arr) != JSON_ARRAY) {
+    if (arr != nullptr) json_value_destroy(arr);
+    return nullptr;
+  }
+  return arr;
+}
+
+static bool event_is(json_value_t* rec, const char* type_name) {
+  json_value_t* type_v = json_get(rec, "type");
+  return type_v != NULL && strcmp(json_as_string(type_v), type_name) == 0;
+}
+
+TEST(TestFrame, TestSteerComposesMsgAppendFromOutside) {
+  /* The posted steer (client-api spec §3): _frame_steer_post is the
+     thread-legal shape of frame_append_msg for a caller NOT on the frame's
+     thread — ONE FRM_STEER into the frame's own mailbox, whose dispatch
+     composes the durable msg.append fire-and-post (the sync append would
+     refuse loud on a POOLED store; this is the handler's route). The steer
+     commits; the pre-post validation refusals commit nothing. */
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+
+  EXPECT_EQ(_frame_steer_post(f, NULL, "roleless"), -1)
+      << "validation refuses pre-post: no role, no post";
+  EXPECT_EQ(_frame_steer_post(NULL, "user", "frameless"), -1);
+  EXPECT_EQ(debug_event_count_is_zero(f), 1)
+      << "the refusals committed nothing";
+
+  EXPECT_EQ(_frame_steer_post(f, "user", "hello from the wire"), 0);
+  _frame_pump(f);   /* the FRM_STEER compose + the store batch's round trip */
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(json_size(events), 1u) << "exactly ONE msg.append committed";
+  json_value_t* rec = json_at(events, 0);
+  ASSERT_TRUE(event_is(rec, "msg.append"));
+  json_value_t* payload = json_get(rec, "payload");
+  ASSERT_NE(payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(payload, "role")), "user");
+  EXPECT_STREQ(json_as_string(json_get(payload, "content")),
+               "hello from the wire");
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestFrame, TestSpawnAdmissionOnlyAndDepthCap) {
   frame_config_t cfg = test_config();
   cfg.max_depth = 1;
@@ -364,30 +433,6 @@ static message_t bridge_request(frame_message_type_e type, uint64_t corr,
   msg.payload = rp;
   msg.payload_destroy = frm_remember_payload_destroy;
   return msg;
-}
-
-/* The audit-trail surface (test_loop.cpp's helpers, verbatim): load
-   frame_debug_events and search it. */
-static json_value_t* load_events(frame_t* f) {
-  char* json = frame_debug_events(f);
-  EXPECT_NE(json, nullptr);
-  if (json == NULL) return nullptr;
-  char* err = NULL;
-  json_value_t* arr = json_parse(json, strlen(json), &err);
-  if (err != NULL) free(err);
-  free(json);
-  EXPECT_NE(arr, nullptr);
-  if (arr != nullptr) EXPECT_EQ(json_type(arr), JSON_ARRAY);
-  if (arr == nullptr || json_type(arr) != JSON_ARRAY) {
-    if (arr != nullptr) json_value_destroy(arr);
-    return nullptr;
-  }
-  return arr;
-}
-
-static bool event_is(json_value_t* rec, const char* type_name) {
-  json_value_t* type_v = json_get(rec, "type");
-  return type_v != NULL && strcmp(json_as_string(type_v), type_name) == 0;
 }
 
 /* Load the frame's debug events and locate the FIRST state.remember payload.

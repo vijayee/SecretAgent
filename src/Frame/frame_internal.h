@@ -204,6 +204,20 @@ frame_engine_state_t* _frame_engine_state(frame_t* f);
    its callers. */
 void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut, const char* reason_text);
 
+/* The POSTED steer (the client-api handlers' shape; client-api spec §3):
+   ONE FRM_STEER {role, text} into the frame's own mailbox; the frame's
+   dispatch composes the durable msg.append fire-and-post there (the seq's
+   single writer is the frame's thread — the handler on the loop thread
+   could never pre-allocate one honestly). This is the thread-legal shape of
+   a steer from OUTSIDE the frame's thread: frame_append_msg is a
+   synchronous store API (pump-wait, inline-store-only) and refuses loud on
+   the real server's pooled store. Legal from ANY thread (frame_interrupt's
+   posted precedent). Returns 0 once POSTED — never a commit confirmation
+   (the store's FIFO anchors the causality; the caller's response answers
+   QUEUED, not committed) — nonzero loud on the pre-post refusals (a dead
+   frame, NULL fields, OOM). */
+int _frame_steer_post(frame_t* f, const char* role, const char* content);
+
 /* The synchronous cell refusal's PAIRED cell.result text (frame.c's poison
    knowledge; the ENGINE's refusal composer in loop.c reads it): NULL = the
    generic refusal wording applies; the poisoned runtime's own wording

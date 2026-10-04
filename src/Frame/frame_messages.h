@@ -73,12 +73,23 @@ typedef enum frame_message_type_e {
                              listing (frm_remember_payload_t; `key` carries
                              the CLOSED-SET scope "local" | "ctx" — anything
                              else is the fail-loud refusal before any post) */
-  FRM_CELL_WATCHDOG       /* the POOLED cell's deadline fired: the SAME
+  FRM_CELL_WATCHDOG,       /* the POOLED cell's deadline fired: the SAME
                              interrupt synthesis runs under the watchdog
                              wording (arm_cut = 0 — a deadline never arms a
                              cut). Payload = the frame.c-private watchdog
                              struct, handed off whole; its destroyer frees
                              it on the frame's thread — see frame.c */
+  FRM_STEER                /* wire/server -> the frame's OWN mailbox: compose
+                             the durable msg.append fire-and-post in the
+                             frame's dispatch (frm_steer_payload_t). The
+                             POSTED shape of the steer: frame_append_msg is
+                             a synchronous store API (pump-wait) and is
+                             therefore inline-store-only — a caller NOT on
+                             the frame's thread (the client-api handlers on
+                             the loop thread) posts the compose instead.
+                             frame.h's frame_interrupt is the posted-verb
+                             precedent; like it, the post is legal from any
+                             thread. */
 } frame_message_type_e;
 
 /* Event types (stored at sessions/<sid>/events/<seq>, JSON, %020d seq). ONLY
@@ -232,6 +243,13 @@ typedef struct frm_report_bind_payload_t {
   char* text;               /* OWNED; the report text (the parent re-composes its bound event) */
 } frm_report_bind_payload_t;
 
+/* The posted steer (FRM_STEER): one durable msg.append composed by the
+   frame's OWN dispatch (the seq's single writer is the frame's thread — the
+   handler could never pre-allocate honestly from the loop thread). Role and
+   text HEAP+OWNED, transfer with the message; NULL fields refuse loud at
+   the dispatch (same validation as frame_append_msg). */
+typedef struct frm_steer_payload_t { char* role; char* text; } frm_steer_payload_t;
+
 /* The client-API sessions listing (spec §3): the store enumerates the
    root's sessions/ first-level entries + each entry's meta/{created,
    status,depth,goal} and answers via the round-trip reply — records[] =
@@ -267,6 +285,7 @@ void frm_store_recall_payload_destroy(void* p);
 void frm_store_keys_payload_destroy(void* p);
 void frm_store_reply_payload_destroy(void* p);
 void frm_report_bind_payload_destroy(void* p);
+void frm_steer_payload_destroy(void* p);
 
 /* JSON event record shape (authoritative):
    {"seq":<int>,"type":"<event-name>","frame":"<sid-path>","corr":<int|null>,
