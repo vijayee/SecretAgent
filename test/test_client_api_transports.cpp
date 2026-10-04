@@ -397,6 +397,7 @@ static ca_auth_request_t* auth_req_heap(uint64_t req_id, const char* key) {
       (ca_auth_request_t*)get_clear_memory(sizeof(*req));
   req->req_id = req_id;
   req->api_key = strdup(key);
+  req->key_len = strlen(key);   /* the destroy's scrub rides the length */
   return req;
 }
 
@@ -1034,8 +1035,36 @@ TEST(TestClientApiUnix, TestInterruptPostsOverTheSocket) {
   std::string sid = prompt_create_sid(&client, 1, "interrupt me");
   ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
 
-  /* Give the cell its run: the pyrt boot + the sleep's first phase. */
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  frame_t* f = ca_session_server_frame(fx.server, sid.c_str());
+  ASSERT_NE(f, nullptr);
+
+  /* The interrupt must land on an OPEN turn (the poll, not a blind sleep:
+     under ASan a fixed wait raced the frame's boot — an FRM_INT before
+     turn.start ever hit the log is the case-3 boundary cut, which
+     synthesizes nothing). Poll the frame's events until the turn's first
+     lifecycle record is on the log (deadline 10 s; 5 ms between reads). */
+  bool turn_open = false;
+  for (int i = 0; i < 2000 && !turn_open; i++) {
+    char* json = frame_debug_events(f);
+    ASSERT_NE(json, nullptr);
+    char* err = NULL;
+    json_value_t* events = json_parse(json, strlen(json), &err);
+    if (err != NULL) free(err);
+    free(json);
+    ASSERT_NE(events, nullptr);
+    for (size_t j = 0; j < json_size(events); j++) {
+      json_value_t* rec = json_at(events, j);
+      json_value_t* t_v = json_get(rec, "type");
+      if (t_v == NULL) continue;
+      const char* t = json_as_string(t_v);
+      if (strcmp(t, "turn.start") == 0 || strcmp(t, "step.start") == 0) {
+        turn_open = true;
+      }
+    }
+    json_value_destroy(events);
+    if (!turn_open) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(turn_open) << "the frame's turn opened before the interrupt";
 
   ca_interrupt_request_t* req = interrupt_req_heap(2, sid.c_str());
   ASSERT_EQ(client_send_frame(&client, CA_INTERRUPT_REQUEST, req), 0);
@@ -1055,8 +1084,6 @@ TEST(TestClientApiUnix, TestInterruptPostsOverTheSocket) {
   }
 
   /* The synthesis's durable shape: the open turn's aborted turn.end. */
-  frame_t* f = ca_session_server_frame(fx.server, sid.c_str());
-  ASSERT_NE(f, nullptr);
   bool saw_abort = false;
   for (int i = 0; i < 800 && !saw_abort; i++) {
     char* json = frame_debug_events(f);

@@ -573,6 +573,10 @@ static int _decode_auth_request(cbor_item_t* frame, uint64_t req_id,
   item = cbor_array_get(frame, 2);
   rc = item == NULL ? -1 : 0;
   if (rc == 0) req->api_key = _decode_string(item, CA_WIRE_KEY_MAX);
+  /* The copy's length rides with the struct (the decode copied the CBOR
+     string's FULL byte length — the destroy scrubs by the same length;
+     strlen would stop at the first embedded NUL the string carried). */
+  if (req->api_key != NULL) req->key_len = cbor_string_length(item);
   cbor_decref(&item);
   if (rc != 0 || req->api_key == NULL) {
     ca_wire_payload_destroy(CA_AUTH_REQUEST, req);
@@ -829,10 +833,12 @@ void ca_wire_payload_destroy(uint64_t type, void* payload) {
     }
     case CA_AUTH_REQUEST: {
       /* liboffs's client_api_auth_request_destroy shape: the key's memory is
-         scrubbed before its free — a presented key never lingers. */
+         scrubbed before its free — a presented key never lingers. The scrub
+         runs by the DECODED byte length: strlen would stop at the first
+         embedded NUL a CBOR string carried and leave its tail unscrubbed. */
       ca_auth_request_t* req = (ca_auth_request_t*)payload;
       if (req->api_key != NULL) {
-        memset(req->api_key, 0, strlen(req->api_key));
+        memset(req->api_key, 0, req->key_len);
         free(req->api_key);
       }
       free(req);

@@ -177,6 +177,9 @@ typedef struct ca_auth_request_t {
   uint64_t req_id;
   char* api_key;    /* heap; the presented key (bcrypt-checked against the
                        transport's hash) */
+  size_t key_len;   /* the key's DECODED byte length (a CBOR string may
+                       carry embedded NULs — strlen cannot see past the
+                       first one; the destroy scrubs by this length) */
 } ca_auth_request_t;
 
 typedef struct ca_auth_response_t {

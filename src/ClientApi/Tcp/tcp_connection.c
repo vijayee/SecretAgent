@@ -244,7 +244,10 @@ static void _tcp_handle_auth(tcp_connection_t* conn,
   /* The presented key is bcrypt-verified against the transport's hash
      (liboffs's exact call — bcrypt_check == 0 on match). The transport
      carries the AUTHORITY: its hash is the only store of the server's key
-     identity, and the connection caches no verdict except its own flip. */
+     identity, and the connection caches no verdict except its own flip.
+     bcrypt's deliberate slowness bounds an unauthenticated peer's cheap
+     burns (one verify, then close) — a cost-policy fact for exposed
+     deployments. */
   if (bcrypt_check(auth->api_key, conn->transport->api_key_hash) == 0) {
     conn->is_authenticated = 1;
     _tcp_connection_send_auth_response(conn, auth->req_id, 0);
