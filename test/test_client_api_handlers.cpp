@@ -344,6 +344,141 @@ static std::string prompt_create_and_sid(fixture_t* fx, conn_double_t* conn,
   return sid;
 }
 
+/* --- the events-channel reader (the doubles' recorded stream, filtered to
+   ONE channel's req_id — the decode's out-param is the routing key) --------- */
+
+struct chan_ev_t {
+  uint64_t seq;              /* 0 = a transition marker, not a record */
+  std::string record_json;   /* "" for the marker */
+  std::string steer_content; /* the msg.append user content, else "" */
+};
+
+/* The recorded events frames of ONE channel (the req_id match), decoded ONCE
+   into the light shape. The caller's channel views are order-stable: the
+   handlers stream ascending and never rewrite history. */
+static std::vector<chan_ev_t> conn_channel(conn_double_t* d,
+                                           uint64_t want_req_id) {
+  std::vector<chan_ev_t> out;
+  std::vector<std::vector<uint8_t>> candidates;
+
+  platform_mutex_lock(d->lock);
+  for (const recorded_frame_t& f : d->frames) {
+    if (f.type == (uint64_t)CA_EVENTS_RESPONSE) {
+      candidates.push_back(f.bytes);
+    }
+  }
+  platform_mutex_unlock(d->lock);
+
+  for (const std::vector<uint8_t>& bytes : candidates) {
+    uint64_t t = 0, rid = 0;
+    void* p = NULL;
+    uint8_t st = 0;
+    if (ca_wire_decode_bytes(bytes.data(), bytes.size(), &t, &p, &rid,
+                             &st) != 0) {
+      continue;
+    }
+    ca_events_response_t* ev = (ca_events_response_t*)p;
+    if (rid == want_req_id) {
+      chan_ev_t e;
+      e.seq = ev->seq;
+      if (ev->record_json != NULL) {
+        e.record_json = ev->record_json;
+        json_value_t* rec =
+            json_parse(ev->record_json, strlen(ev->record_json), NULL);
+        if (rec != NULL) {
+          json_value_t* t_v = json_get(rec, "type");
+          if (t_v != NULL && json_type(t_v) == JSON_STRING &&
+              strcmp(json_as_string(t_v), "msg.append") == 0) {
+            json_value_t* rp = json_get(rec, "payload");
+            json_value_t* role = (rp != NULL) ? json_get(rp, "role") : NULL;
+            json_value_t* content =
+                (rp != NULL) ? json_get(rp, "content") : NULL;
+            if (role != NULL && json_type(role) == JSON_STRING &&
+                strcmp(json_as_string(role), "user") == 0 &&
+                content != NULL && json_type(content) == JSON_STRING) {
+              e.steer_content = json_as_string(content);
+            }
+          }
+          json_value_destroy(rec);
+        }
+      }
+      out.push_back(e);
+    }
+    ca_wire_payload_destroy(CA_EVENTS_RESPONSE, p);
+  }
+  return out;
+}
+
+/* The channel's highest forwarded seq (0 when nothing has arrived yet) —
+   the RESUME-AT cursor's honest read (markers carry seq 0 and never
+   advance it). */
+static uint64_t chan_max_seq(conn_double_t* d) {
+  uint64_t max_seq = 0;
+  std::vector<std::vector<uint8_t>> candidates;
+  platform_mutex_lock(d->lock);
+  for (const recorded_frame_t& f : d->frames) {
+    if (f.type == (uint64_t)CA_EVENTS_RESPONSE) candidates.push_back(f.bytes);
+  }
+  platform_mutex_unlock(d->lock);
+  for (const std::vector<uint8_t>& bytes : candidates) {
+    uint64_t t = 0, rid = 0;
+    void* p = NULL;
+    uint8_t st = 0;
+    if (ca_wire_decode_bytes(bytes.data(), bytes.size(), &t, &p, &rid,
+                             &st) != 0) {
+      continue;
+    }
+    ca_events_response_t* ev = (ca_events_response_t*)p;
+    if (ev->seq > max_seq) max_seq = ev->seq;
+    ca_wire_payload_destroy(CA_EVENTS_RESPONSE, p);
+  }
+  return max_seq;
+}
+
+/* Waits until the channel carries a transition marker (seq 0, `op` echoed)
+   — the replay's live marker or the unsubscribe's terminal one. */
+static bool chan_wait_marker(conn_double_t* d, uint64_t want_req_id,
+                             uint8_t op, int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    std::vector<std::vector<uint8_t>> candidates;
+    platform_mutex_lock(d->lock);
+    for (const recorded_frame_t& f : d->frames) {
+      if (f.type == (uint64_t)CA_EVENTS_RESPONSE) {
+        candidates.push_back(f.bytes);
+      }
+    }
+    platform_mutex_unlock(d->lock);
+    for (const std::vector<uint8_t>& bytes : candidates) {
+      uint64_t t = 0, rid = 0;
+      void* p = NULL;
+      uint8_t st = 0;
+      if (ca_wire_decode_bytes(bytes.data(), bytes.size(), &t, &p, &rid,
+                               &st) != 0) {
+        continue;
+      }
+      ca_events_response_t* ev = (ca_events_response_t*)p;
+      bool hit = (rid == want_req_id && ev->seq == 0 && ev->op == op);
+      ca_wire_payload_destroy(CA_EVENTS_RESPONSE, p);
+      if (hit) return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
+/* Waits until the channel delivers ONE msg.append user record whose content
+   is `text` (racing steer / live tail's arrival). */
+static bool chan_wait_text(conn_double_t* d, uint64_t want_req_id,
+                           const char* text, int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    for (const chan_ev_t& e : conn_channel(d, want_req_id)) {
+      if (e.seq > 0 && e.steer_content == text) return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
 /* --- the five (plus the two decided) pins ----------------------------------- */
 
 TEST(TestClientApiHandlers, TestPromptStartsATopFrameAndAnswersItsSid) {
@@ -984,6 +1119,301 @@ TEST(TestClientApiHandlers, TestServerActorSurvivesFrameDone) {
   EXPECT_EQ(conn.refs.load(), 0)
       << "the server's held connection references all released";
   conn_double_destroy(&conn);
+}
+
+TEST(TestClientApiHandlers, TestDuplicateSubscribeRefused) {
+  /* The zombie's fix pinned: a same-(conn, sid) re-subscribe while one
+     exists refuses ONE CA_ERROR ("already subscribed") — under the old
+     shape the second sub joined the list and the scan reply's
+     `_ca_sub_find` routed to the OLD head, so the new channel never went
+     live while holding notices until destroy. NOTHING rides the refused
+     req_id, and the ORIGINAL channel keeps working. */
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup(&fx, NULL), 0);
+  conn_double_t conn;
+  conn_double_init(&conn);
+
+  std::string sid = prompt_create_and_sid(&fx, &conn, 1, "one channel per pair");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+
+  /* The FIRST subscribe is mid-replay when the second arrives (back to
+     back, no waits — the exact zombie window: the first sub exists, its
+     scan is in flight). */
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(2, sid.c_str(), CA_EVENTS_REPLAY_THEN_LIVE, 0),
+                    &conn.iface);
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(3, sid.c_str(), CA_EVENTS_REPLAY_THEN_LIVE, 0),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 3, 600)) << "the refusal answers";
+  {
+    /* The refusal found BY req_id, not by position — the original's replay
+       records may stream around it. */
+    bool saw = false;
+    for (size_t j = 1; j < conn_count(&conn) && !saw; j++) {
+      void* p = NULL;
+      uint64_t t = 0, rid = 0;
+      uint8_t st = 0;
+      ASSERT_TRUE(conn_decode(&conn, j, &t, &p, &rid, &st));
+      if (t == (uint64_t)CA_ERROR && rid == 3u) {
+        ca_error_t* err = (ca_error_t*)p;
+        ASSERT_NE(err->text, nullptr);
+        EXPECT_NE(std::string(err->text).find("already subscribed"),
+                  std::string::npos)
+            << "the refusal tells the truth: " << err->text;
+        saw = true;
+      }
+      ca_wire_payload_destroy(t, p);
+    }
+    ASSERT_TRUE(saw) << "the re-subscribe refuses loud (one CA_ERROR, "
+                        "req_id echoed)";
+  }
+
+  /* The FIRST sub's replay + marker ride ITS req_id; the refused req_id 3
+     carries NOTHING — no zombie channel, no second marker ever. */
+  ASSERT_TRUE(chan_wait_marker(&conn, 2, CA_EVENTS_REPLAY_THEN_LIVE, 600))
+      << "the original channel went live";
+  for (const chan_ev_t& e : conn_channel(&conn, 3)) {
+    ADD_FAILURE() << "the refused re-subscribe delivered a frame (seq "
+                  << e.seq << ") — the zombie lives";
+  }
+
+  /* The original channel's live tail: the post-refusal steer arrives under
+     req_id 2 exactly once. */
+  ca_session_handle(fx.server, CA_PROMPT_REQUEST,
+                    prompt_req(4, sid.c_str(), "still alive"), &conn.iface);
+  ASSERT_TRUE(chan_wait_text(&conn, 2, "still alive", 600))
+      << "the original channel still delivers";
+  {
+    size_t n = 0;
+    for (const chan_ev_t& e : conn_channel(&conn, 2)) {
+      if (e.steer_content == "still alive") n++;
+    }
+    EXPECT_EQ(n, 1u) << "exactly one delivery on the surviving channel";
+  }
+
+  /* After the unsubscribe the pair is free again: a fresh subscribe is
+     LEGAL (the refusal binds only while a sub exists). */
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(5, sid.c_str(), CA_EVENTS_UNSUBSCRIBE, 0),
+                    &conn.iface);
+  ASSERT_TRUE(chan_wait_marker(&conn, 5, CA_EVENTS_UNSUBSCRIBE, 600))
+      << "the unsub's terminal marker";
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(6, sid.c_str(), CA_EVENTS_LIVE_ONLY, 0),
+                    &conn.iface);
+  ASSERT_TRUE(chan_wait_marker(&conn, 6, CA_EVENTS_LIVE_ONLY, 600))
+      << "the fresh subscribe is legal after the pair freed";
+  for (const chan_ev_t& e : conn_channel(&conn, 3)) {
+    ADD_FAILURE() << "a late zombie frame (seq " << e.seq << ")";
+  }
+
+  fixture_teardown(&fx);
+  /* The ref discipline proved: the refusal released its own conn ref — the
+     server holds nothing for the refused channel. */
+  EXPECT_EQ(conn.refs.load(), 0)
+      << "the server's held connection references all released";
+  conn_double_destroy(&conn);
+}
+
+TEST(TestClientApiHandlers, TestConnClosedMidReplayPurges) {
+  /* A connection closing while its replay is still streaming: the purge
+     drops the subscription (and any parked holds) — a subsequent live
+     commit delivers NOTHING on the closed double, the refs balance, and
+     the survivors' channels keep running (the unwatch correctly skips —
+     another subscriber remains on the sid). */
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup(&fx, NULL), 0);
+  conn_double_t a, b;
+  conn_double_init(&a);
+  conn_double_init(&b);
+
+  std::string sid = prompt_create_and_sid(&fx, &a, 1, "the replay purge");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+
+  /* A's live channel anchors the watch at the store; the bulk steers
+     commit through it — the log B's replay will carry is LARGE (40 user
+     records plus the turns' own riders). */
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(2, sid.c_str(), CA_EVENTS_LIVE_ONLY, 0),
+                    &a.iface);
+  ASSERT_TRUE(conn_wait_count(&a, 2, 600)) << "the live marker";
+  for (int i = 0; i < 40; i++) {
+    char text[32];
+    snprintf(text, sizeof(text), "bulk-%02d", i);
+    ca_session_handle(fx.server, CA_PROMPT_REQUEST,
+                      prompt_req(10 + (uint64_t)i, sid.c_str(), text),
+                      &a.iface);
+    ASSERT_TRUE(chan_wait_text(&a, 2, text, 600)) << "steer " << text;
+  }
+
+  /* B subscribes the FULL replay and closes MID-REPLAY — the purge closure
+     enqueues immediately after the work closure, before any post-close
+     commit's notice can. Whichever way the scan reply races the purge
+     (routed first or routing to a dead sub), the outcome below is the
+     same shape. */
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(200, sid.c_str(), CA_EVENTS_REPLAY_THEN_LIVE, 0),
+                    &b.iface);
+  ca_session_conn_closed(fx.server, &b.iface);
+
+  /* The teardown settles; every trace of B is gone and every held conn ref
+     released (the sub's, the pending round trip's, the closure's own). */
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  ASSERT_EQ(b.refs.load(), 0)
+      << "the mid-replay teardown leaves no connection ref behind";
+  const size_t b_settled = conn_count(&b);
+
+  /* The proof: a commit AFTER the close reaches A (the machinery runs; the
+     purge's unwatch correctly skipped — A is still subscribed) and reaches
+     B with NOTHING — the subscription is gone, no zombie, no held
+     notices. */
+  ca_session_handle(fx.server, CA_PROMPT_REQUEST,
+                    prompt_req(300, sid.c_str(), "postclose"), &a.iface);
+  ASSERT_TRUE(chan_wait_text(&a, 2, "postclose", 600))
+      << "the surviving subscriber keeps receiving";
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_EQ(conn_count(&b), b_settled)
+      << "a post-close commit delivers nothing on the closed connection";
+
+  /* The log really was large (the replay's honest subject): A carried all
+     forty user records. */
+  {
+    size_t n = 0;
+    for (const chan_ev_t& e : conn_channel(&a, 2)) {
+      if (e.steer_content.rfind("bulk-", 0) == 0) n++;
+    }
+    ASSERT_GE(n, 40u) << "the replay's subject is a loaded log";
+  }
+
+  fixture_teardown(&fx);
+  /* The ref discipline proved (the fixture's existing backstop). */
+  EXPECT_EQ(a.refs.load(), 0);
+  EXPECT_EQ(b.refs.load(), 0);
+  conn_double_destroy(&a);
+  conn_double_destroy(&b);
+}
+
+TEST(TestClientApiHandlers, TestHoldGapFlushesRacingCommitsExactlyOnce) {
+  /* The replay-gap buffer's honest pin, ten rounds: commits racing a fresh
+     REPLAY subscription (fired unawaited just before it joins) land in
+     every position the buffer exists for — already in the store's scan
+     (replayed), racing the watch→scan adjacency (HELD, flushed
+     post-replay), or after the live marker (live tail) — and the channel's
+     contract is exact: every covered record EXACTLY ONCE, strictly
+     ascending by seq, one marker, the unsubscribe releases the pair for
+     the next round.
+     THE HOLD-CAP FINDING (recorded here because this suite must tell the
+     truth): reaching _CA_HOLD_MAX's overflow (> 256 pre-live notices) is
+     NOT honestly constructible — the hold window is bounded by the
+     store's scan round trip, and the store's FIFO keeps racing commits
+     either in the replay or behind the reply; a synthetic hook (an
+     exported test hold-injector) was refused. The overflow branch stays
+     the code's defensive floor — and a no-loss floor: any record the
+     cap drops is by construction also in the replay (a held record always
+     committed before the scan read), so the dedup'd channel never loses
+     it. */
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup(&fx, NULL), 0);
+  conn_double_t a, b;
+  conn_double_init(&a);
+  conn_double_init(&b);
+
+  std::string sid = prompt_create_and_sid(&fx, &a, 1, "the hold gap");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+
+  /* A's live channel anchors the store's watch from the start — the
+     notices exist for every commit that follows. */
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(2, sid.c_str(), CA_EVENTS_LIVE_ONLY, 0),
+                    &a.iface);
+  ASSERT_TRUE(conn_wait_count(&a, 2, 600)) << "the live marker";
+
+  for (int round = 0; round < 10; round++) {
+    const uint64_t rid = 100 + (uint64_t)round;
+    const uint64_t from = chan_max_seq(&b);   /* B's own cursor: resume-at */
+
+    /* The burst fires UNAWAITED and the replay joins immediately: the three
+       steers race the subscription's scan. */
+    char texts[3][32];
+    for (int j = 0; j < 3; j++) {
+      snprintf(texts[j], sizeof(texts[j]), "race%02d-x%d", round, j);
+      ca_session_handle(fx.server, CA_PROMPT_REQUEST,
+                        prompt_req(rid * 10 + (uint64_t)j, sid.c_str(),
+                                   texts[j]),
+                        &a.iface);
+    }
+    ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                      events_req(rid, sid.c_str(), CA_EVENTS_REPLAY_THEN_LIVE,
+                                 from),
+                      &b.iface);
+    ASSERT_TRUE(chan_wait_marker(&b, rid, CA_EVENTS_REPLAY_THEN_LIVE, 600))
+        << "round " << round << ": the live marker";
+
+    /* The live tail after the marker, then the unsub frees the (conn, sid)
+       pair for the next round. */
+    char tail[32];
+    snprintf(tail, sizeof(tail), "tail%02d", round);
+    ca_session_handle(fx.server, CA_PROMPT_REQUEST,
+                      prompt_req(970 + (uint64_t)round, sid.c_str(), tail),
+                      &a.iface);
+    ASSERT_TRUE(chan_wait_text(&b, rid, tail, 600))
+        << "round " << round << ": the post-marker tail is live";
+
+    /* The channel is final now (the unsub joins after its marker): the
+       shape is [ascending records..., ONE marker, ascending tail...] under
+       last_seq's gate — and each raced commit delivered EXACTLY ONCE. */
+    {
+      std::vector<chan_ev_t> ch = conn_channel(&b, rid);
+      bool saw_marker = false;
+      for (size_t i = 0; i < ch.size(); i++) {
+        if (ch[i].seq != 0) {
+          ASSERT_GT(ch[i].seq, from)
+              << "round " << round << ": the cursor is honored (i " << i
+              << ")";
+          if (i > 0 && ch[i].seq <= ch[i - 1].seq) {
+            ADD_FAILURE() << "round " << round
+                          << ": not strictly ascending at i " << i
+                          << " (replay then flush, deduplicated)";
+          }
+        } else {
+          ASSERT_FALSE(saw_marker) << "round " << round << ": one marker";
+          saw_marker = true;
+        }
+      }
+      ASSERT_TRUE(saw_marker) << "round " << round << ": the marker";
+      for (int j = 0; j < 3; j++) {
+        size_t n = 0;
+        for (const chan_ev_t& e : ch) {
+          if (e.steer_content == texts[j]) n++;
+        }
+        ASSERT_EQ(n, 1u)
+            << "round " << round << ": the racing commit '" << texts[j]
+            << "' delivered EXACTLY ONCE (replayed, held, or live)";
+      }
+      size_t n_tail = 0;
+      for (const chan_ev_t& e : ch) {
+        if (e.steer_content == tail) n_tail++;
+      }
+      ASSERT_EQ(n_tail, 1u) << "round " << round
+                            << ": the tail delivered exactly once";
+    }
+
+    ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                      events_req(500 + (uint64_t)round, sid.c_str(),
+                                 CA_EVENTS_UNSUBSCRIBE, 0),
+                      &b.iface);
+    ASSERT_TRUE(chan_wait_marker(&b, 500 + (uint64_t)round,
+                                 CA_EVENTS_UNSUBSCRIBE, 600))
+        << "round " << round << ": the unsub's terminal marker";
+  }
+
+  fixture_teardown(&fx);
+  /* The ref discipline proved (the fixture's existing backstop). */
+  EXPECT_EQ(a.refs.load(), 0);
+  EXPECT_EQ(b.refs.load(), 0);
+  conn_double_destroy(&a);
+  conn_double_destroy(&b);
 }
 
 #endif /* SA_HAS_WDB && SA_HAS_STREAMS */

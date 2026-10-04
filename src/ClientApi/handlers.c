@@ -344,7 +344,8 @@ static void _ca_post_unwatch(ca_session_server_t* server, const char* sid) {
 }
 
 /* The pending entry joins (its conn ref is taken here) and its corr is the
-   return value — never 0. */
+   return value — never 0. NULL = the sid's dup refused (the CALLER refunds
+   the request — no conn ref was taken, nothing to clean here). */
 static ca_session_pending_t* _ca_pending_add(ca_session_server_t* server,
                                              ca_pending_kind_e kind,
                                              uint64_t req_id, uint8_t op,
@@ -353,11 +354,22 @@ static ca_session_pending_t* _ca_pending_add(ca_session_server_t* server,
   ca_session_pending_t* pe =
       (ca_session_pending_t*)get_clear_memory(sizeof(*pe));
 
+  if (sid != NULL) {
+    pe->sid = strdup(sid);
+    if (pe->sid == NULL) {
+      /* A NULL sid under CA_PENDING_EVENTS_SCAN would crash the reply's
+         routing (_ca_sub_find's strcmp) — the round trip refuses instead
+         of routing a corrupted entry. */
+      log_error("ca: the pending round trip's sid dup failed — the request "
+                "refuses rather than routing a NULL-sid entry");
+      free(pe);
+      return NULL;
+    }
+  }
   pe->corr = ++server->corr_seq;   /* never 0 — the router's rule */
   pe->kind = kind;
   pe->req_id = req_id;
   pe->op = op;
-  pe->sid = (sid != NULL) ? strdup(sid) : NULL;
   pe->conn = iface->conn;
   pe->iface = iface;
   _ca_conn_ref(iface);
@@ -574,6 +586,15 @@ static void _ca_sessions_respond(ca_session_pending_t* pe,
                  ? (rp->n <= CA_WIRE_SESSIONS_MAX ? rp->n
                                                   : (size_t)CA_WIRE_SESSIONS_MAX)
                  : 0;
+  if (rp->records != NULL && rp->n > (size_t)CA_WIRE_SESSIONS_MAX) {
+    /* The wire's row cap clamps the listing — the cut logs ONCE, loud
+       (the budget table's discipline: budget.h's SA_BUDGET_SESSIONS_MAX
+       clamp at the store normally stops the walk first, so this only
+       fires when the store and the wire's caps ever disagree). */
+    log_error("ca: the sessions listing clamped at %u of %zu rows — the "
+              "wire's row cap",
+              (unsigned)CA_WIRE_SESSIONS_MAX, rp->n);
+  }
   if (n > 0) {
     res->records = (ca_sessions_record_t*)get_clear_memory(
         n * sizeof(ca_sessions_record_t));
@@ -633,6 +654,16 @@ static void _ca_events_scan_respond(ca_session_server_t* server,
     log_error("ca: the events scan reply for '%s' routed to a dead "
               "subscription — dropped loud", pe->sid);
     return;
+  }
+  if (rp->n >= SA_FRAME_DEBUG_MAX_EVENTS) {
+    /* The replay filled its window cap (the scan posted with the
+       SA_FRAME_DEBUG_MAX_EVENTS limit): the log may carry more records
+       than the window returned — the honest cut logs ONCE, loud, and the
+       client resumes past the last delivered seq with a fresh cursor. */
+    log_error("ca: the events replay for '%s' carried %zu records — the "
+              "window cap (%u); the log may run longer, resume past the "
+              "last delivered seq", pe->sid, rp->n,
+              (unsigned)SA_FRAME_DEBUG_MAX_EVENTS);
   }
   for (size_t i = 0; i < rp->n; i++) {
     const char* text = rp->records[i];
@@ -878,7 +909,19 @@ static void _ca_on_prompt(ca_session_server_t* server, void* payload_raw,
     if (server->shared_backend != NULL) {
       frame_set_model_backend(f, server->shared_backend);
     }
-    _ca_reg_add(server, strdup(frame_sid(f)), f);
+    char* reg_sid = strdup(frame_sid(f));
+    if (reg_sid == NULL) {
+      /* A NULL-sid registry entry would crash _ca_reg_find's strcmp — the
+         half-made session tears down instead of joining a corrupted
+         registry. */
+      log_error("ca: the new session's registry sid dup failed — the "
+                "session tears down instead of a NULL-sid registry entry");
+      frame_destroy(f);
+      _ca_send_error(iface, req_id, 1,
+                     "the session refused to start (out of memory)");
+      return;
+    }
+    _ca_reg_add(server, reg_sid, f);
     if (frame_start(f) != 0) {
       /* A fresh frame's start cannot refuse; when it does anyway, tear the
          half-made session down and refuse loud — never a half-answer. */
@@ -1019,6 +1062,19 @@ static void _ca_on_events(ca_session_server_t* server, void* payload_raw,
                    (unsigned)req->op);
     return;
   }
+  if (_ca_sub_find(server, iface->conn, req->sid) != NULL) {
+    /* The duplicate-subscribe refusal: a same-(conn, sid) re-subscribe
+       while one exists would find the OLD sub in the scan reply's routing
+       (`_ca_sub_find` walks the newest head first) — the old sub would
+       never see its replay answer and its holds would park until destroy,
+       while every fresh request's routing data was ignored. ONE channel
+       per (conn, sid); a re-subscribe is the peer's mistake — refused
+       loud, the existing channel untouched. */
+    log_error("ca: a duplicate events subscription for '%s' on one "
+              "connection — refused loud (already subscribed)", req->sid);
+    _ca_send_error(iface, req_id, 1, "already subscribed to '%s'", req->sid);
+    return;
+  }
   frame_t* f = _ca_reg_find(server, req->sid);
   if (f == NULL) {
     /* The registry is the session's in-memory truth (the recorded
@@ -1030,6 +1086,17 @@ static void _ca_on_events(ca_session_server_t* server, void* payload_raw,
     return;
   }
 
+  /* The subscription's sid dups FIRST (before the watch joins): a NULL-sid
+     sub would crash the coverage matches (_ca_sid_covers's strcmp) — the
+     request refuses instead of joining a corrupted channel set. */
+  char* sub_sid = strdup(req->sid);
+  if (sub_sid == NULL) {
+    log_error("ca: the events subscription's sid dup failed — the request "
+              "refuses rather than creating a NULL-sid sub");
+    _ca_send_error(iface, req_id, 1,
+                   "the events request was refused (out of memory)");
+    return;
+  }
   /* The watch joins FIRST — before the scan reaches the store's dispatch —
      so the store's FIFO anchors the delivery: a record committed after the
      watch joins but before the scan reads arrives as an in-flight notice
@@ -1039,7 +1106,7 @@ static void _ca_on_events(ca_session_server_t* server, void* payload_raw,
   ca_session_sub_t* sub = (ca_session_sub_t*)get_clear_memory(sizeof(*sub));
   sub->req_id = req->req_id;
   sub->op = req->op;
-  sub->sid = strdup(req->sid);
+  sub->sid = sub_sid;
   sub->conn = iface->conn;
   sub->iface = iface;
   sub->live = (uint8_t)(req->op == CA_EVENTS_LIVE_ONLY);
@@ -1057,6 +1124,24 @@ static void _ca_on_events(ca_session_server_t* server, void* payload_raw,
   ca_session_pending_t* pe =
       _ca_pending_add(server, CA_PENDING_EVENTS_SCAN, req->req_id, req->op,
                       req->sid, iface);
+  if (pe == NULL) {
+    /* The sid's dup refused: the sub dies with its never-answerable replay
+       (the same shape the cursor-past-end cleanup below keeps). */
+    for (ca_session_sub_t** sp = &server->subs; *sp != NULL; sp = &(*sp)->next) {
+      if (*sp == sub) {
+        *sp = sub->next;
+        break;
+      }
+    }
+    if (!_ca_sid_subscribed(server, sub->sid)) {
+      _ca_post_unwatch(server, sub->sid);
+    }
+    _ca_sub_free(sub);
+    _ca_conn_unref(iface);
+    _ca_send_error(iface, req_id, 1,
+                   "the events request was refused (out of memory)");
+    return;
+  }
   if (_ca_post_events_scan(server, pe, req->from_seq) != 0) {
     /* The cursor was past its end: the pending entry dies here, the sub
        dies with it (a replay that can never leave is not a subscription). */
@@ -1122,10 +1207,21 @@ static void _ca_on_sessions(ca_session_server_t* server, void* payload_raw,
                             ca_session_conn_t* iface) {
   ca_sessions_request_t* req = (ca_sessions_request_t*)payload_raw;
 
+  ca_session_pending_t* pe =
+      _ca_pending_add(server, CA_PENDING_SESSIONS, req->req_id, 0, NULL,
+                      iface);
+  if (pe == NULL) {
+    /* The sid-less listing cannot trip the dup's refusal, but the
+       caller's shape stays total (the type can refuse). */
+    log_error("ca: the sessions listing's round trip refused to join — "
+              "refused loud");
+    _ca_send_error(iface, req->req_id, 1,
+                   "the sessions listing was refused (out of memory)");
+    return;
+  }
   frm_store_sessions_payload_t* lp =
       (frm_store_sessions_payload_t*)get_clear_memory(sizeof(*lp));
-  lp->corr = _ca_pending_add(server, CA_PENDING_SESSIONS, req->req_id, 0,
-                             NULL, iface)->corr;
+  lp->corr = pe->corr;
   lp->reply_to = &server->actor;   /* the reply's ROUTER is the server actor */
   _frame_post(wave_db_store_actor(server->root),
               (uint32_t)FRM_STORE_LIST_SESSIONS, lp,
