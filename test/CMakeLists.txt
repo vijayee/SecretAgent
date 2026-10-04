@@ -79,6 +79,14 @@ if (BUILD_TESTING)
         ${WDB_BUILD}/deps/libcbor
         ${WDB_BUILD}/deps/libcbor/src
         ${WDB_ROOT}/deps/hashmap/include)
+      # The client-api wire suite (Task 2): PURE over libcbor — no store, no
+      # streams — but it does NOT ride the plain gate: the wire's only dep is
+      # libcbor, and in this ecosystem libcbor arrives through the wavedb gate
+      # (wavedb-ext builds deps/wavedb's vendored copy; the OFF build with
+      # SA_ENABLE_WDB=OFF has neither the include dirs nor the archive). So
+      # the suite registers here on the WDB gate and shares the cbor include
+      # dirs the reopen probe above pulls in.
+      target_sources(testsecretagent PRIVATE test_client_api_wire.cpp)
       # The refine slice rides the same WDB gate as test_frame (its types live
       # on frame.h's surface); the review-call tests also need the streams
       # gate, added with Task 4's step.
