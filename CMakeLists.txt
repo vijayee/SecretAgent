@@ -388,7 +388,9 @@ endif()
 # the model client; the python bridge arrives through the same library link.
 # SA_HAS_WDB/SA_HAS_PYTHON propagate from the PUBLIC compile definitions of
 # secretagent; the executable's main.c reaches py_agent_init through the
-# bare-extern idiom so it needs no CPython include dirs.
+# bare-extern idiom so it needs no CPython include dirs. The serve/client
+# modes (the client-api slice) reach <cbor.h> through client_api_wire.h the
+# same way the test TUs do — the wire's WDB-gated include dirs mirror here.
 if(SA_ENABLE_WDB)
   add_executable(frame-demo tools/frame-demo/main.c)
   target_link_libraries(frame-demo PRIVATE secretagent)
@@ -396,7 +398,10 @@ if(SA_ENABLE_WDB)
     target_link_libraries(frame-demo PRIVATE pthread)
   endif()
   target_include_directories(frame-demo PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${WDB_ROOT}/deps/libcbor/src
+    ${WDB_BUILD}/deps/libcbor
+    ${WDB_BUILD}/deps/libcbor/src)
 
   # Match the sanitizer gates from test/CMakeLists.txt: the library's
   # INTERFACE link option pulls the runtime in, but main.c itself stays

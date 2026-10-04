@@ -14,21 +14,46 @@
 // surface in the post-loop audit dump below, alongside the final assistant
 // content.
 //
-// CTRL-C: pyrt_interrupt exists for python cells, but the frame layer owns
-// its pyrt privately — frame_t exposes NO interrupt entry point, and a
-// signal handler cannot safely post FRM_STOP through frame_dispatch (it
-// allocates and takes locks). The plan's sanctioned path (print a notice,
-// exit cleanly) applies; committed state is durable in the store.
+// CTRL-C on the direct mode: _demo_on_sigint sets ONE flag (a raw handler
+// can post or allocate nothing), and a 50 ms watcher thread — armed only
+// around frame_run_loop — picks the flag up and calls frame_interrupt, the
+// surface slice's real interrupt entry point (posts the FRM_INT mailbox
+// message; safely callable from another thread while the caller stays
+// blocked in the loop run). On the paths without a running loop
+// (refine/rollback) or in the serve/client modes the flag IS the shutdown:
+// those paths poll it (the daemon's main thread) or fall back to the
+// documented exit — a SIGINT on an unwatched path still exits the process,
+// leaving committed state durable in the store. Over the wire the interrupt
+// enters through the client-api's CA_INTERRUPT_REQUEST instead (the client
+// mode's sa_client_interrupt); the same frame_interrupt posts it.
 //
 // REFINE (the refine slice): --refine/--refine-global review a run's
 // trajectory after the loop and apply evidence-backed supplemental lessons;
 // --refine-sid resumes a PAST session's subtree instead (no turn loop);
 // --refine-rollback rolls one stored refinement back. The library never
 // prints — every summary rides out of the demo here, verbatim.
+//
+// SERVE (the client-api slice): `frame-demo serve` IS the runtime's daemon —
+// one scheduler pool (the store's AND the frames'), one streams loop, the
+// client-api session server over the frames' store, and the transports:
+// unix ALWAYS on --socket-path (the socket file's permission is the auth),
+// TCP only when --tcp-port AND --api-key are given together (the api key's
+// bcrypt hash rides the transport; the plaintext key never leaves the
+// daemon). CTRL-C stops accepting and tears down in handlers.h's pinned
+// order, exit 0.
+//
+// CLIENT (the client-api slice): `frame-demo client` rides
+// src/ClientLibs/c/sa_client — prompt the goal as a NEW session (sid NULL),
+// print the response's sid + status, subscribe the session's event channel,
+// and stream every committed store record VERBATIM (one JSON line per
+// record, the seq prefixed; the client never re-parses a record) until
+// CTRL-C tears the client down.
 
 #include "../../src/Frame/frame.h"
 #include "../../src/Frame/loop.h"
 #include "../../src/Frame/refine.h"
+#include "../../src/Platform/platform.h"
+#include "../../src/Scheduler/scheduler.h"
 #include "../../src/Util/json.h"
 #include "../../src/Util/log.h"
 
@@ -40,6 +65,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* The client-api surface (the serve/client modes) rides BOTH gates — the
+   frames/store (WaveDB) and the loop thread (streams). A build without
+   either compiles nothing here (the handlers' empty-TU idiom carried up into
+   the demo): the mode entry points below refuse loud and return 2. */
+#if defined(SA_HAS_WDB) && defined(SA_HAS_STREAMS)
+#define SA_DEMO_HAS_CLIENT_API 1
+#include "../../src/ClientApi/client_api_wire.h"
+#include "../../src/ClientApi/handlers.h"
+#include "../../src/ClientApi/Tcp/tcp_transport.h"
+#include "../../src/ClientApi/Unix/unix_transport.h"
+#include "../../src/ClientLibs/c/sa_client.h"
+#include "../../src/Platform/platform_socket.h"
+#include "../../src/Streams/loop_thread.h"
+#include "../../src/Util/bcrypt.h"
+#include <stdint.h>
+#else
+#define SA_DEMO_HAS_CLIENT_API 0
+#endif
 
 /* The aliased WaveDB logger (see the family-shared symbol aliasing block in
    the root CMakeLists.txt) carries its OWN quiet flag — the demo's
@@ -77,6 +121,36 @@ static const char SA_DEMO_USAGE[] =
     "harness-log seq (append-only: a NEW rollback record)\n"
     "  --refine and --refine-rollback are mutually exclusive\n";
 
+static const char SA_DEMO_SERVE_USAGE[] =
+    "usage: frame-demo serve --socket-path <path> --model <tag>\n"
+    "                    [--location <dir>] [--base-url <url>]\n"
+    "                    [--tcp-port <port> --api-key <text>]\n"
+    "  --location     WaveDB root directory (default ./sa-demo-db; created if "
+    "absent)\n"
+    "  --base-url     OpenAI-compatible endpoint (default "
+    "http://127.0.0.1:11434)\n"
+    "  --model        model tag, required (e.g. llama3)\n"
+    "  --socket-path  the daemon's AF_UNIX listen socket, required\n"
+    "  --tcp-port     ALSO listen on 127.0.0.1:<port> — REQUIRES --api-key\n"
+    "  --api-key      the TCP listeners' api key (bcrypt-hashed here; the "
+    "client passes\n"
+    "                 the SAME plaintext) — REQUIRES --tcp-port\n"
+    "CTRL-C stops accepting and shuts the daemon down (exit 0).\n";
+
+static const char SA_DEMO_CLIENT_USAGE[] =
+    "usage: frame-demo client (--socket-path <path> | --tcp-port <port> "
+    "--tcp-host <host> --api-key <text>) --goal \"<text>\"\n"
+    "  --socket-path  the daemon's AF_UNIX socket (the plain shape — the "
+    "socket file's\n"
+    "                 own permission is the auth)\n"
+    "  --tcp-host/--tcp-port/--api-key  connect over TCP instead (ALL THREE "
+    "required\n"
+    "                 together; the key must match the daemon's --api-key)\n"
+    "  --goal         goal text, required — posted as a NEW session\n"
+    "Prints the session's sid + the streamed store records (one JSON line "
+    "per record,\n"
+    "the seq prefixed) live, until CTRL-C tears the client down.\n";
+
 /* Log-hook formatter: one line per event ("<level> <message>"), flushed so
    the stream is live even with stdout piped. */
 static void _demo_log_line(log_Event* ev) {
@@ -86,14 +160,66 @@ static void _demo_log_line(log_Event* ev) {
   fflush(stdout);
 }
 
+/* --- CTRL-C machinery -------------------------------------------------------
+ * ONE flag, set by the handler; nothing else is async-signal-safe here
+ * (frame_interrupt posts and allocates — a raw handler may never call it).
+ * Who polls the flag:
+ *   - the DIRECT loop: _demo_interrupt_watchdog, a 50 ms thread armed around
+ *     frame_run_loop (it calls frame_interrupt when the flag rises);
+ *   - SERVE/CLIENT: the mode's own main-thread wait loop;
+ *   - an UNWATCHED path (refine/rollback; interrupted before the watcher was
+ *     armed): the legacy documented exit — notice + 130, committed state is
+ *     already durable. */
+static volatile sig_atomic_t g_demo_sigint;    /* the handler's ONLY write */
+static volatile sig_atomic_t g_demo_sigint_watched;   /* set 1: somebody polls */
+
 static void _demo_on_sigint(int sig) {
   (void)sig;
   static const char notice[] =
-      "\nframe-demo: interrupt requested — the frame layer has no interrupt "
-      "entry point; exiting (committed state is already durable)\n";
+      "\nframe-demo: interrupt requested\n";
   ssize_t printed = write(STDERR_FILENO, notice, sizeof(notice) - 1);
   (void)printed;
-  _exit(130);
+  g_demo_sigint = 1;
+  if (!g_demo_sigint_watched) {
+    static const char exit_note[] =
+        "frame-demo: nothing is polling interrupts on this path — exiting "
+        "(committed state is already durable)\n";
+    printed = write(STDERR_FILENO, exit_note, sizeof(exit_note) - 1);
+    (void)printed;
+    _exit(130);
+  }
+}
+
+static frame_t* g_demo_watch_frame;   /* armed around the direct loop read */
+
+/* The DIRECT loop's interrupt watcher: a 50 ms tick converts the flag into
+   the real interrupt. The frame stays valid from the arm to the disarm's
+   join (the audit dump and destroy happen strictly after it), so the one
+   post it may make never races the frame's teardown; if the loop ended on
+   its own before the flag rose, the disarm's g_demo_watch_stop makes it
+   exit post-less. */
+static volatile sig_atomic_t g_demo_watch_stop;
+
+static void* _demo_interrupt_watchdog(void* arg) {
+  (void)arg;
+  while (!g_demo_sigint && !g_demo_watch_stop) usleep(50000);
+  if (g_demo_sigint) frame_interrupt(g_demo_watch_frame);
+  return NULL;
+}
+
+/* Disarm + join the DIRECT loop's watchdog before ANY frame teardown:
+   g_demo_watch_stop releases a loop that ended on its own; a flag already
+   risen still fires its one frame_interrupt — on the frame the loop was
+   driving (valid until this join returned, and an extra mailbox post on an
+   ended frame is harmless — destroy drains it). */
+static void _demo_watchdog_disarm(platform_thread_t** watchdog) {
+  if (*watchdog != NULL) {
+    g_demo_watch_stop = 1;
+    platform_thread_join(*watchdog);
+    *watchdog = NULL;
+    g_demo_watch_frame = NULL;
+    g_demo_watch_stop = 0;
+  }
 }
 
 /* The audit dump: prints every stored event line, then the OUTCOME — the
@@ -227,7 +353,457 @@ static int _demo_refine_sid_path(const char* refine_sid, const char** path_out,
   return 0;
 }
 
+#if SA_DEMO_HAS_CLIENT_API
+
+/* --- SERVE: the daemon (the client-api slice) ------------------------------- */
+
+typedef struct {
+  const char* socket_path;
+  const char* tcp_port;   /* the TCP listener: set ONLY WITH tcp_key */
+  const char* tcp_key;    /* (required together — refused loud otherwise) */
+  const char* location;
+  const char* base_url;
+  const char* model;
+} demo_serve_args_t;
+
+/* Parses a uint16 port text (digits only, no ranges, ERANGE caught). */
+static int _demo_parse_port(const char* text, uint16_t* out) {
+  char* end = NULL;
+  errno = 0;
+  unsigned long port = strtoul(text, &end, 10);
+  if (!isdigit((unsigned char)text[0]) || end == text || *end != '\0' ||
+      errno == ERANGE || port > 65535u) {
+    return -1;
+  }
+  *out = (uint16_t)port;
+  return 0;
+}
+
+/* Returns 0 = parsed; 1 = a bad/incomplete argument printed (exit 2's
+   path). *tcp_port_out carries the parsed port (0 when absent). */
+static int _demo_parse_serve(int argc, char** argv, demo_serve_args_t* a,
+                             uint16_t* tcp_port_out) {
+  memset(a, 0, sizeof(*a));
+  a->location = "sa-demo-db";
+  a->base_url = "http://127.0.0.1:11434";
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--socket-path") == 0 && i + 1 < argc) {
+      a->socket_path = argv[++i];
+    } else if (strcmp(argv[i], "--location") == 0 && i + 1 < argc) {
+      a->location = argv[++i];
+    } else if (strcmp(argv[i], "--base-url") == 0 && i + 1 < argc) {
+      a->base_url = argv[++i];
+    } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+      a->model = argv[++i];
+    } else if (strcmp(argv[i], "--api-key") == 0 && i + 1 < argc) {
+      a->tcp_key = argv[++i];
+    } else if (strcmp(argv[i], "--tcp-port") == 0 && i + 1 < argc) {
+      a->tcp_port = argv[++i];
+    } else {
+      fprintf(stderr, "frame-demo: unknown or incomplete argument '%s'\n%s",
+              argv[i], SA_DEMO_SERVE_USAGE);
+      return 1;
+    }
+  }
+  if (a->socket_path == NULL) {
+    fprintf(stderr, "frame-demo serve: --socket-path is required\n%s",
+            SA_DEMO_SERVE_USAGE);
+    return 1;
+  }
+  /* TCP is opt-IN and needs the key: --tcp-port and --api-key are required
+     together (a network listener never rides unauthenticated, and a key
+     without a TCP port would ride silently ignored). Refused BEFORE the
+     --model check — the specific refusal names the real problem. */
+  if ((a->tcp_port != NULL) != (a->tcp_key != NULL)) {
+    fprintf(stderr, "frame-demo serve: --tcp-port and --api-key are "
+            "required together\n%s", SA_DEMO_SERVE_USAGE);
+    return 1;
+  }
+  if (a->model == NULL) {
+    fprintf(stderr, "frame-demo serve: --model is required\n%s",
+            SA_DEMO_SERVE_USAGE);
+    return 1;
+  }
+  if (a->tcp_port != NULL &&
+      _demo_parse_port(a->tcp_port, tcp_port_out) != 0) {
+    fprintf(stderr, "frame-demo serve: --tcp-port needs a numeric port "
+            "0..65535 (got '%s')\n%s", a->tcp_port, SA_DEMO_SERVE_USAGE);
+    return 1;
+  }
+  return 0;
+}
+
+/* The serve teardown: handlers.h's PINNED order verbatim — the transports
+   first (each transport's destroy closes every connection; each teardown
+   calls ca_session_conn_closed — "cons closed"), then the server destroy
+   while the pool still runs, then pool stop, db close, pool destroy, loop
+   destroy. Runs on BOTH the natural path and SIGINT's (the flag's main-
+   thread poll). */
+static void _demo_serve_teardown(tcp_transport_t* tcp_transport,
+                                 unix_transport_t* unix_transport,
+                                 ca_session_server_t* server,
+                                 scheduler_pool_t* pool,
+                                 wave_database_root_t* db,
+                                 streams_loop_thread_t* loop) {
+  if (tcp_transport != NULL) tcp_transport_destroy(tcp_transport);
+  if (unix_transport != NULL) unix_transport_destroy(unix_transport);
+  if (server != NULL) ca_session_server_destroy(server);
+  if (pool != NULL) scheduler_pool_stop(pool);
+  if (db != NULL) wave_db_close(db);
+  if (pool != NULL) scheduler_pool_destroy(pool);
+  if (loop != NULL) streams_loop_destroy(loop);
+}
+
+/* The serve run: the runtime + the client-api stack wired the tests'
+   fixture's shape — ONE scheduler pool (the store's AND every api-created
+   frame's; a pooled frame requires a pooled store, handlers.h's note), ONE
+   streams loop (the server's one marshal loop), the session server built
+   with a NULL shared backend (every api-created frame builds its OWN
+   model_http_backend_create from the template's wiring, exactly the direct
+   mode's per-frame default). */
+static int _demo_serve_run(int argc, char** argv) {
+  demo_serve_args_t a;
+  uint16_t tcp_port = 0;
+  if (_demo_parse_serve(argc, argv, &a, &tcp_port) == 1) return 2;
+
+  /* The daemon's SIGINT: the flag rides this mode's main-thread wait loop
+     (below); the handler itself still only sets the flag. */
+  signal(SIGINT, _demo_on_sigint);
+  g_demo_sigint_watched = 1;
+
+  scheduler_pool_t* pool = NULL;
+  wave_database_root_t* db = NULL;
+  streams_loop_thread_t* loop = NULL;
+  ca_session_server_t* server = NULL;
+  unix_transport_t* unix_transport = NULL;
+  tcp_transport_t* tcp_transport = NULL;
+
+  /* The stderr surface goes quiet; the hook below is the stream surface. */
+  log_set_quiet(true);
+  if (log_add_callback(_demo_log_line, NULL, LOG_INFO) != 0) {
+    fprintf(stderr,
+            "frame-demo: log callback table is full — running degraded "
+            "(loop progress will not stream)\n");
+  }
+  wavedb_log_set_quiet(true);
+#ifdef SA_HAS_PYTHON
+  py_agent_init();
+#endif
+
+  pool = scheduler_pool_create(2);
+  if (pool == NULL) {
+    fprintf(stderr, "frame-demo serve: cannot create the scheduler pool\n");
+    return 1;
+  }
+  scheduler_pool_start(pool);
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = a.location;   /* REAL disk (create-if-absent) — the daemon
+                                  serves the SAME subtrees a restart re-opens
+                                  (wave_db_open_config's POOLED shape; the
+                                  engine's workers pace it) */
+  sc.store_pool = pool;
+  db = wave_db_open_config(&sc);
+  if (db == NULL) {
+    fprintf(stderr, "frame-demo serve: cannot open the root db at '%s'\n",
+            a.location);
+    _demo_serve_teardown(NULL, NULL, NULL, pool, db, loop);
+    return 1;
+  }
+  loop = streams_loop_create();
+  if (loop == NULL) {
+    fprintf(stderr, "frame-demo serve: cannot create the streams loop\n");
+    _demo_serve_teardown(NULL, NULL, NULL, pool, db, loop);
+    return 1;
+  }
+  frame_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.model_base_url = a.base_url;
+  cfg.model_name = a.model;
+  cfg.max_depth = 4;
+  server = ca_session_server_create(db, pool, loop, &cfg, NULL);
+  if (server == NULL) {
+    fprintf(stderr, "frame-demo serve: cannot create the session server\n");
+    _demo_serve_teardown(NULL, NULL, NULL, pool, db, loop);
+    return 1;
+  }
+  unix_transport = unix_transport_create(pool, server, a.socket_path);
+  if (unix_transport == NULL) {
+    fprintf(stderr, "frame-demo serve: cannot listen on the unix socket "
+            "'%s'\n", a.socket_path);
+    _demo_serve_teardown(NULL, NULL, server, pool, db, loop);
+    return 1;
+  }
+  unix_transport_start(unix_transport);
+  printf("frame-demo serve: serving sessions over unix at %s\n"
+         "                model %s at %s, store %s\n",
+         a.socket_path, a.model, a.base_url, a.location);
+  if (a.tcp_port != NULL) {
+    /* The api key's BCRYPT HASH rides the transport (the wire auth's
+       presented key verify = bcrypt_check against it — the same machinery
+       auth_middleware.c drives); the plaintext stays in the daemon's argv
+       only. bcrypt_generate's RNG draw is platform_random_bytes. */
+    char hash[64];
+    if (bcrypt_generate(a.tcp_key, 12, hash, sizeof(hash)) != 0) {
+      fprintf(stderr, "frame-demo serve: cannot bcrypt the api key\n");
+      _demo_serve_teardown(NULL, unix_transport, server, pool, db, loop);
+      return 1;
+    }
+    platform_address_t bound;
+    memset(&bound, 0, sizeof(bound));
+    tcp_transport = tcp_transport_create(pool, server, "127.0.0.1", tcp_port,
+                                         hash, &bound);
+    memset(hash, 0, sizeof(hash));   /* the hash copy dies with the
+                                        transport; scrub this stack copy */
+    if (tcp_transport == NULL) {
+      fprintf(stderr, "frame-demo serve: cannot listen on tcp 127.0.0.1:%u\n",
+              (unsigned)tcp_port);
+      _demo_serve_teardown(NULL, unix_transport, server, pool, db, loop);
+      return 1;
+    }
+    tcp_transport_start(tcp_transport);
+    /* The platform prefers a dual-stack bind (the listen helper): the real
+       port sits in the family's own member (the inet6 member overlaps the
+       union). */
+    unsigned bound_port = (bound.family == PLATFORM_AF_INET6)
+                              ? (unsigned)bound.inet6.port
+                              : (unsigned)bound.inet.port;
+    printf("frame-demo serve: also listening on tcp 127.0.0.1:%u "
+           "(api-key authed)\n", bound_port);
+  }
+  printf("frame-demo serve: ready — Ctrl-C shuts down cleanly\n");
+  fflush(stdout);
+
+  /* The daemon's main thread does nothing but wait: the transports' accept
+     threads, the pool workers and the server's loop thread carry the work.
+     The 50 ms poll IS this mode's SIGINT path (no watcher thread needed —
+     nothing here is blocked). */
+  g_demo_sigint_watched = 1;
+  while (!g_demo_sigint) usleep(50000);
+  fprintf(stderr, "frame-demo serve: shutting down (the pinned teardown "
+          "order: transports, then the server, then the pools)\n");
+
+  _demo_serve_teardown(tcp_transport, unix_transport, server, pool, db, loop);
+  fprintf(stderr, "frame-demo serve: down\n");
+  return 0;
+}
+
+/* --- CLIENT: sa_client over the served wire --------------------------------- */
+
+typedef struct {
+  const char* socket_path;
+  const char* tcp_host;   /* default 127.0.0.1; requires tcp_port + api_key */
+  const char* tcp_port;
+  const char* api_key;
+  const char* goal;
+} demo_client_args_t;
+
+/* Returns 0 = parsed; 1 = a bad/incomplete argument printed. The transport
+   choice is an honest XOR: a socket path OR the tcp trio (--tcp-port and
+   --api-key required together; --tcp-host defaults to loopback) — both sets
+   at once is refused loud. */
+static int _demo_parse_client(int argc, char** argv, demo_client_args_t* a,
+                              uint16_t* tcp_port_out) {
+  memset(a, 0, sizeof(*a));
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--socket-path") == 0 && i + 1 < argc) {
+      a->socket_path = argv[++i];
+    } else if (strcmp(argv[i], "--tcp-host") == 0 && i + 1 < argc) {
+      a->tcp_host = argv[++i];
+    } else if (strcmp(argv[i], "--tcp-port") == 0 && i + 1 < argc) {
+      a->tcp_port = argv[++i];
+    } else if (strcmp(argv[i], "--api-key") == 0 && i + 1 < argc) {
+      a->api_key = argv[++i];
+    } else if (strcmp(argv[i], "--goal") == 0 && i + 1 < argc) {
+      a->goal = argv[++i];
+    } else if (strcmp(argv[i], "--location") == 0 && i + 1 < argc) {
+      /* the client holds NO store (the daemon owns it) — refused loud so the
+         flag never rides silently ignored */
+      fprintf(stderr, "frame-demo client: --location is the daemon's flag "
+              "(the client opens no store)\n%s", SA_DEMO_CLIENT_USAGE);
+      return 1;
+    } else {
+      fprintf(stderr, "frame-demo: unknown or incomplete argument '%s'\n%s",
+              argv[i], SA_DEMO_CLIENT_USAGE);
+      return 1;
+    }
+  }
+  if (a->goal == NULL) {
+    fprintf(stderr, "frame-demo client: --goal is required\n%s",
+            SA_DEMO_CLIENT_USAGE);
+    return 1;
+  }
+  if (a->socket_path != NULL && a->tcp_port != NULL) {
+    fprintf(stderr, "frame-demo client: --socket-path and --tcp-port are "
+            "mutually exclusive (one transport per connection)\n%s",
+            SA_DEMO_CLIENT_USAGE);
+    return 1;
+  }
+  if (a->socket_path == NULL && (a->tcp_port == NULL || a->api_key == NULL)) {
+    fprintf(stderr, "frame-demo client: --socket-path, or --tcp-port with "
+            "--api-key (and --tcp-host), is required\n%s",
+            SA_DEMO_CLIENT_USAGE);
+    return 1;
+  }
+  if (a->tcp_port != NULL) {
+    if (_demo_parse_port(a->tcp_port, tcp_port_out) != 0) {
+      fprintf(stderr, "frame-demo client: --tcp-port needs a numeric port "
+              "0..65535 (got '%s')\n%s", a->tcp_port, SA_DEMO_CLIENT_USAGE);
+      return 1;
+    }
+    if (a->tcp_host == NULL) a->tcp_host = "127.0.0.1";
+  }
+  return 0;
+}
+
+typedef struct {
+  uint8_t status;
+  char sid[CA_WIRE_SID_MAX + 1];
+  int called;
+  sa_client_t* client;   /* release_payload's target */
+} demo_prompt_result_t;
+
+static void _demo_prompt_cb(void* ctx, uint8_t status, const char* sid) {
+  demo_prompt_result_t* r = (demo_prompt_result_t*)ctx;
+  r->called = 1;
+  r->status = status;
+  if (sid != NULL) {
+    snprintf(r->sid, sizeof(r->sid), "%s", sid);   /* copied BEFORE the
+                                                      release below */
+    sa_client_release_payload(r->client, (void*)sid);
+  }
+}
+
+/* The event stream: ONE record per stdout line — the seq prefixed, the
+   record's store JSON VERBATIM (the client never re-parses a record; this
+   is the plain surface the daemon's events ride). A marker line (seq 0, no
+   record) names the transition. Payloads release immediately after the
+   line (the stream is unbounded; destroy only catches the races). */
+static void _demo_events_cb(void* ctx, const char* sid, uint64_t seq,
+                            uint8_t op, const char* record_json) {
+  demo_prompt_result_t* r = (demo_prompt_result_t*)ctx;
+  (void)sid;
+  if (record_json != NULL) {
+    printf("%llu: %s\n", (unsigned long long)seq, record_json);
+  } else {
+    printf("[live] the replay closed (op %u) — tailing live\n", (unsigned)op);
+  }
+  fflush(stdout);
+  sa_client_release_payload(r->client, (void*)sid);
+  if (record_json != NULL) {
+    sa_client_release_payload(r->client, (void*)record_json);
+  }
+}
+
+static void _demo_client_error_cb(void* ctx, uint64_t req_id, uint8_t status,
+                                  const char* text) {
+  (void)ctx;
+  fprintf(stderr, "frame-demo client: error (req %llu, status %u): %s\n",
+          (unsigned long long)req_id, (unsigned)status,
+          (text != NULL) ? text : "");
+  fflush(stderr);
+}
+
+static int _demo_client_run(int argc, char** argv) {
+  demo_client_args_t a;
+  uint16_t tcp_port = 0;
+  if (_demo_parse_client(argc, argv, &a, &tcp_port) == 1) return 2;
+
+  /* The client's SIGINT: the flag rides this mode's main-thread wait loop;
+     installed HERE (not just main's direct path — a backgrounded client
+     inherits SIGINT's SIG_IGN disposition from the shell, so the explicit
+     catch is what re-arms it). */
+  signal(SIGINT, _demo_on_sigint);
+  g_demo_sigint_watched = 1;   /* the SIGINT flag is THIS mode's shutdown */
+
+  sa_client_config_t c = sa_client_config_default();
+  if (a.socket_path != NULL) {
+    c.transport = SA_CLIENT_TRANSPORT_UNIX;
+    c.socket_path = a.socket_path;
+  } else {
+    c.transport = SA_CLIENT_TRANSPORT_TCP;
+    c.host = a.tcp_host;
+    c.port = tcp_port;
+    c.api_key = a.api_key;
+  }
+  sa_client_t* client = sa_client_connect(&c);
+  if (client == NULL) {
+    fprintf(stderr, "frame-demo client: cannot connect (the daemon is not "
+            "listening there, or the tcp auth exchange failed)\n");
+    return 1;
+  }
+
+  demo_prompt_result_t pr;
+  memset(&pr, 0, sizeof(pr));
+  pr.client = client;
+  int prompt_rc = sa_client_prompt(client, NULL, a.goal, _demo_prompt_cb, &pr);
+  if (prompt_rc != 0 || !pr.called) {
+    fprintf(stderr, "frame-demo client: the prompt was refused outright "
+            "(rc %d)\n", prompt_rc);
+    sa_client_destroy(client);
+    return 1;
+  }
+  if (pr.status != 0 || pr.sid[0] == '\0') {
+    fprintf(stderr, "frame-demo client: the daemon refused or the session "
+            "carried no sid (status %u)\n", (unsigned)pr.status);
+    sa_client_destroy(client);
+    return 1;
+  }
+  printf("frame-demo client: session %s started (status 0) — streaming the "
+         "event records:\n", pr.sid);
+  fflush(stdout);
+
+  /* Subscribe: the WHOLE log replays (from seq 0), then the live marker,
+     then tailing. BLOCKS until the marker (or the refusal — delivered
+     through the error callback, rc 0). */
+  if (sa_client_subscribe_events(client, pr.sid, _demo_events_cb, &pr) != 0) {
+    fprintf(stderr, "frame-demo client: cannot subscribe the events (the "
+            "error channel carries the reason)\n");
+    sa_client_destroy(client);
+    return 1;
+  }
+  fprintf(stderr, "frame-demo client: live — Ctrl-C tears the client down\n");
+
+  while (!g_demo_sigint) usleep(50000);
+  fprintf(stderr, "frame-demo client: tearing down (records stay committed "
+          "in the daemon's store)\n");
+  sa_client_destroy(client);
+  return 0;
+}
+
+/* The gated modes' entry (the parse errors above print their own usages). */
+static int _demo_mode_entry(const char* mode, int argc, char** argv) {
+  if (strcmp(mode, "serve") == 0) return _demo_serve_run(argc, argv);
+  return _demo_client_run(argc, argv);
+}
+
+#else   /* SA_DEMO_HAS_CLIENT_API */
+
+/* A build without the client-api surface (no streams / no libcbor): the
+   modes refuse loud — nothing to talk to was compiled in. */
+static int _demo_mode_entry(const char* mode, int argc, char** argv) {
+  (void)argc;
+  (void)argv;
+  fprintf(stderr,
+          "frame-demo: this build has no client-api surface (streams or "
+          "wavedb off) — serve/client modes are unavailable\n");
+  return 2;
+}
+
+#endif  /* SA_DEMO_HAS_CLIENT_API */
+
 int main(int argc, char** argv) {
+  /* The mode keyword (argv[1] ONLY — the direct mode never sees it, so its
+     parse below stays byte-identical: --goal "serve" still rides today).
+     The modes skip the direct mode's flag validation entirely. */
+  if (argc > 1 && strcmp(argv[1], "serve") == 0) {
+    /* argv+1: the sub-parses loop from i=1, which is the first real flag */
+    return _demo_mode_entry("serve", argc - 1, argv + 1);
+  }
+  if (argc > 1 && strcmp(argv[1], "client") == 0) {
+    return _demo_mode_entry("client", argc - 1, argv + 1);
+  }
+
   const char* location = "sa-demo-db";
   const char* base_url = "http://127.0.0.1:11434";
   const char* model = NULL;
@@ -398,9 +974,28 @@ int main(int argc, char** argv) {
     return rc;
   }
 
+  /* The turn loop is ONE blocking call on this thread; SIGINT reaches it
+     through the interrupt watcher below (the handler only sets the flag and
+     cannot post/allocate — see _demo_on_sigint). Armed HERE, around the
+     single frame_run_loop call; refine/rollback above stay on the
+     unwatched-path handler contract. */
+  g_demo_sigint_watched = 1;
+  g_demo_watch_frame = f;
+  platform_thread_t* watchdog = platform_thread_create(
+      _demo_interrupt_watchdog, NULL);
+  if (watchdog == NULL) {
+    /* No watcher can convert the flag into the interrupt: fall back to the
+       unwatched-path contract (the handler's own exit) rather than promise
+       an interrupt that cannot reach the frame. */
+    g_demo_sigint_watched = 0;
+    fprintf(stderr, "frame-demo: cannot arm the interrupt watcher — SIGINT "
+            "exits instead\n");
+  }
   int loop_rc = frame_run_loop(f);
+
   int outcome_rc = _demo_print_outcome(f);
   int rc = (loop_rc == 0 && outcome_rc == 0) ? 0 : 1;
+  _demo_watchdog_disarm(&watchdog);   /* joined BEFORE any frame teardown */
 
   /* --refine: review THIS run's trajectory (instructions NULL = the
      built-in review contract) after the loop, whatever the loop's exit. */
