@@ -101,6 +101,11 @@ if (BUILD_TESTING)
       if(SA_HAS_STREAMS)
         target_sources(testsecretagent PRIVATE
                        test_client_api_transports.cpp)
+        # The typed C client's suite (Task 7): the REAL transports + handlers
+        # server in-proc driven by sa_client over the REAL socket — the same
+        # BOTH gate as the transports' suite (the module self-gates its
+        # library TU identically, so the OFF build needs no regex).
+        target_sources(testsecretagent PRIVATE test_sa_client.cpp)
       endif()
       # The refine slice rides the same WDB gate as test_frame (its types live
       # on frame.h's surface); the review-call tests also need the streams
