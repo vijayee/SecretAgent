@@ -231,6 +231,11 @@ static void _connection_close_fd(tcp_connection_t* connection) {
 
 /* --- the auth exchange (liboffs's _tcp_handle_auth, adapted) --------------- */
 
+/* (The inbound wire bytes that carried the presented key — the socket's
+   read scratch and the framer's reassemble — are transient and free
+   un-scrubbed; the decoded copy is the scrubbed one, at the dispatch's
+   destroy after this returns. A byte-exact purge of the transit buffers is
+   a recorded hardening candidate.) */
 static void _tcp_handle_auth(tcp_connection_t* conn,
                              ca_auth_request_t* auth) {
   /* liboffs's head guard verbatim: a transportless connection, or a

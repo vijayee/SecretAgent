@@ -389,11 +389,13 @@ static void _ca_pending_free(ca_session_pending_t* pe) {
 
 /* One events response frame: a committed record (seq > 0, the record's OWN
    sid path — a spawned child's subtree nests beneath the subscribed root),
-   or the LIVE-TRANSITION marker (seq 0, the op echoed, no record). */
-static void _ca_send_events_record(ca_session_conn_t* iface,
-                                   uint64_t req_id, uint8_t op,
-                                   const char* sid, uint64_t seq,
-                                   const char* record_json) {
+   or the LIVE-TRANSITION marker (seq 0, the op echoed, no record). Returns
+   0 delivered, -1 refused (the connection took no frame — the record never
+   left): the record's caller owns the cursor decision. */
+static int _ca_send_events_record(ca_session_conn_t* iface,
+                                  uint64_t req_id, uint8_t op,
+                                  const char* sid, uint64_t seq,
+                                  const char* record_json) {
   ca_events_response_t* res =
       (ca_events_response_t*)get_clear_memory(sizeof(*res));
 
@@ -406,7 +408,7 @@ static void _ca_send_events_record(ca_session_conn_t* iface,
     res->record_json = (char*)get_memory(strlen(record_json) + 1);
     strcpy(res->record_json, record_json);
   }
-  (void)_ca_send(iface, CA_EVENTS_RESPONSE, res);
+  return _ca_send(iface, CA_EVENTS_RESPONSE, res);
 }
 
 /* One store record's "seq" field (the record's key truth echoed in the JSON
@@ -471,7 +473,10 @@ static void _ca_sub_hold(ca_session_sub_t* sub, uint64_t seq,
 /* Flush the held notices after a replay: only records the replay did not
    cover (seq > last_seq) forward, in FIFO order; the replay was the oldest
    truth, so the store's mid-flight commits land after it, deduplicated by
-   last_seq. last_seq advances with every forwarded record. */
+   last_seq. The cursor advances only on delivered records — an undelivered
+   record replays on resume (exactly-once survives OOM). A refused send
+   stops the flush: nothing later than an undelivered record may forward
+   past it (the client's resume cursor rides the records it RECEIVES). */
 static void _ca_sub_flush_holds(ca_session_sub_t* sub) {
   ca_hold_t* h = sub->hold;
 
@@ -482,11 +487,12 @@ static void _ca_sub_flush_holds(ca_session_sub_t* sub) {
     ca_hold_t* next = h->next;
     if (h->seq > sub->last_seq) {
       char* record_sid = _ca_record_frame(h->record_json);
-      _ca_send_events_record(sub->iface, sub->req_id, sub->op,
-                             record_sid != NULL ? record_sid : sub->sid,
-                             h->seq, h->record_json);
-      sub->last_seq = h->seq;
+      int delivered = _ca_send_events_record(
+          sub->iface, sub->req_id, sub->op,
+          record_sid != NULL ? record_sid : sub->sid, h->seq, h->record_json);
       free(record_sid);
+      if (delivered == 0) sub->last_seq = h->seq;
+      else break;   /* the undelivered record replays on resume */
     }
     free(h->record_json);
     free(h);
@@ -676,16 +682,21 @@ static void _ca_events_scan_respond(ca_session_server_t* server,
       continue;
     }
     char* record_sid = _ca_record_frame(text);
-    _ca_send_events_record(sub->iface, sub->req_id, sub->op,
-                           record_sid != NULL ? record_sid : sub->sid, seq,
-                           text);
-    sub->last_seq = seq;
+    int delivered = _ca_send_events_record(
+        sub->iface, sub->req_id, sub->op,
+        record_sid != NULL ? record_sid : sub->sid, seq, text);
     free(record_sid);
+    /* the cursor advances only on delivered records — an undelivered record
+       replays on resume (exactly-once survives OOM). A refused send stops
+       the replay: nothing later may forward past an undelivered record. */
+    if (delivered != 0) break;
+    sub->last_seq = seq;
   }
   _ca_sub_flush_holds(sub);
   /* The live-transition marker: seq 0, the op echoed, no record (the
      wire's signal shape). */
-  _ca_send_events_record(sub->iface, sub->req_id, sub->op, sub->sid, 0, NULL);
+  (void)_ca_send_events_record(sub->iface, sub->req_id, sub->op, sub->sid, 0,
+                               NULL);
   sub->live = 1;
 }
 
@@ -756,8 +767,12 @@ static void _ca_store_notice_route(ca_session_server_t* server,
          the flush, deduplicated by last_seq). */
       _ca_sub_hold(sub, np->seq, np->record_json);
     } else if (np->seq > sub->last_seq) {
-      _ca_send_events_record(sub->iface, sub->req_id, sub->op,
-                             np->sid_path, np->seq, np->record_json);
+      if (_ca_send_events_record(sub->iface, sub->req_id, sub->op,
+                                 np->sid_path, np->seq, np->record_json) != 0) {
+        continue;   /* the record never left — the cursor stays AT it */
+      }
+      /* the cursor advances only on delivered records — an undelivered
+         record replays on resume (exactly-once survives OOM) */
       sub->last_seq = np->seq;
     }
   }
@@ -1051,8 +1066,8 @@ static void _ca_on_events(ca_session_server_t* server, void* payload_raw,
     }
     /* The unsubscribe's terminal marker: seq 0 + the op echoed — the same
        signal shape the live-tail channels carry. */
-    _ca_send_events_record(iface, req_id, CA_EVENTS_UNSUBSCRIBE, req->sid, 0,
-                           NULL);
+    (void)_ca_send_events_record(iface, req_id, CA_EVENTS_UNSUBSCRIBE, req->sid,
+                                 0, NULL);
     return;
   }
   if (req->op != CA_EVENTS_REPLAY_THEN_LIVE && req->op != CA_EVENTS_LIVE_ONLY) {
@@ -1118,7 +1133,8 @@ static void _ca_on_events(ca_session_server_t* server, void* payload_raw,
   if (req->op == CA_EVENTS_LIVE_ONLY) {
     /* The live marker NOW (no replay precedes it): from_seq's resume rule
        rides last_seq — records at/below the cursor never forward. */
-    _ca_send_events_record(iface, req->req_id, req->op, req->sid, 0, NULL);
+    (void)_ca_send_events_record(iface, req->req_id, req->op, req->sid, 0,
+                                 NULL);
     return;
   }
   ca_session_pending_t* pe =

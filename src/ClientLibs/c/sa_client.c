@@ -298,7 +298,11 @@ static void _error_local(sa_client_t* c, uint64_t rid, uint8_t status,
 /* Sends ONE framed request. Returns 0 = sent; -1 = the SOCKET refused the
    send (the channel's fate is unknown — the reader sorts the drop out);
    -2 = the encode failed BEFORE a byte was sent (a purely LOCAL failure:
-   the wire never saw the request — never report it as a disconnect). */
+   the wire never saw the request — never report it as a disconnect).
+   (An auth frame's serialized copies — the cbor buffer and its framed wrap
+   — carry the key as transient wire bytes and free un-scrubbed; the decoded
+   key copies are the scrubbed ones (the wire's destroy, CA6). A byte-exact
+   purge of the transit buffers is a recorded hardening candidate.) */
 static int _send_framed(sa_client_t* c, uint64_t type, void* payload) {
   uint8_t* raw = NULL;
   size_t raw_len = 0;
