@@ -157,6 +157,13 @@ typedef struct rec_t {
      (unreleased-at-destroy), release first, then double-release */
   bool hold_payloads = false;
   std::vector<void*> kept;
+  /* the re-entry harness (armed by one test): the events callback's FIRST
+     record delivery calls sa_client_prompt — the client must refuse it
+     immediately (return -1, no callback, the subscription keeps flowing) */
+  std::atomic<int> attempt_reentry{0};
+  std::atomic<int> reentry_attempts{0};
+  std::atomic<int> reentry_rc{-2};
+  std::atomic<int> reentry_ms{-1};
 } rec_t;
 
 static void rec_release(rec_t* r, void* p) {
@@ -205,13 +212,28 @@ static void rec_sessions(void* ctx, uint8_t status,
 static void rec_events(void* ctx, const char* sid, uint64_t seq, uint8_t op,
                        const char* record_json) {
   rec_t* r = (rec_t*)ctx;
-  std::lock_guard<std::mutex> g(r->m);
-  (void)sid;
-  r->ev_seq.push_back(seq);
-  r->ev_op.push_back(op);
-  r->ev_json.push_back(record_json ? record_json : "");
-  rec_release(r, (void*)sid);
-  rec_release(r, (void*)record_json);
+  {
+    std::lock_guard<std::mutex> g(r->m);
+    (void)sid;
+    r->ev_seq.push_back(seq);
+    r->ev_op.push_back(op);
+    r->ev_json.push_back(record_json ? record_json : "");
+    rec_release(r, (void*)sid);
+    rec_release(r, (void*)record_json);
+  }
+  /* THE RE-ENTRY (armed by the re-entry test): the first RECORD delivery
+     calls a blocking op from inside the callback — on the reader thread.
+     The client must refuse it immediately (return -1 with no callback), so
+     this measurement lands the moment the call returns. */
+  if (r->attempt_reentry.load(std::memory_order_relaxed) == 1 && seq > 0 &&
+      r->reentry_attempts.fetch_add(1, std::memory_order_relaxed) == 0) {
+    auto t0 = std::chrono::steady_clock::now();
+    int rc = sa_client_prompt(r->client, NULL, "the reentry", rec_prompt, r);
+    int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    r->reentry_rc.store(rc, std::memory_order_relaxed);
+    r->reentry_ms.store(ms, std::memory_order_relaxed);
+  }
 }
 
 static void rec_error(void* ctx, uint64_t rid, uint8_t status,
@@ -383,6 +405,82 @@ TEST(TestSaClient, TestSteerAndEventsStreamWithMarkers) {
     }
     EXPECT_TRUE(seen);
   }
+
+  sa_client_destroy(cl);
+  fixture_teardown(&fx);
+}
+
+/* THE RE-ENTRY (the header's blocking-op contract): an events callback runs
+   on the reader thread — a blocking op it calls can never see its response
+   routed (a guaranteed TIMEOUT over a daemon that actually committed). The
+   client refuses the call IMMEDIATELY (return -1, no callback fires) and the
+   subscription keeps flowing. */
+TEST(TestSaClient, TestEventsCallbackReentryRefusedImmediately) {
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup(&fx), 0);
+  rec_t rec;
+  sa_client_config_t cfg = client_config(&fx);
+  cfg.error_ctx = &rec;
+  sa_client_t* cl = sa_client_connect(&cfg);
+  ASSERT_NE(cl, nullptr);
+  rec.client = cl;
+
+  /* the session the watcher subscribes to */
+  ASSERT_EQ(sa_client_prompt(cl, NULL, "the reentry watcher", rec_prompt,
+                             &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.prompt_sid.empty();
+  }));
+  std::string sid;
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.prompt_status.size(), 1u);
+    sid = rec.prompt_sid.back();
+  }
+
+  /* the subscription goes live; the steer's record delivery is the callback
+     that calls back */
+  rec.attempt_reentry.store(1);
+  ASSERT_EQ(sa_client_subscribe_events(cl, sid.c_str(), rec_events, &rec), 0);
+
+  /* the steer commits a record; its events callback calls sa_client_prompt
+     — which must REFUSE immediately (~0 ms) with no prompt callback */
+  ASSERT_EQ(sa_client_prompt(cl, sid.c_str(), "the steer under the reentry",
+                             rec_prompt, &rec), 0);
+  ASSERT_TRUE(wait_for([&] { return rec.reentry_rc.load() == -1; }))
+      << "an events callback's sa_client_prompt refuses immediately";
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    EXPECT_LT(rec.reentry_ms.load(), 100)
+        << "the refusal is microseconds, not a request-timeout stall";
+    ASSERT_EQ(rec.prompt_status.size(), 2u)
+        << "the create + the steer only — the reentry ran NO callback";
+    EXPECT_EQ(rec.prompt_status[0], 0u);
+    EXPECT_EQ(rec.prompt_status[1], 0u);
+    EXPECT_EQ(rec.err_status.size(), 0u)
+        << "the refusal returns -1 silently (no error channel either)";
+    bool saw_trigger = false;
+    for (size_t i = 0; i < rec.ev_json.size(); i++) {
+      if (rec.ev_seq[i] > 0 &&
+          rec.ev_json[i].find("steer under the reentry") != std::string::npos) {
+        saw_trigger = true;
+      }
+    }
+    EXPECT_TRUE(saw_trigger)
+        << "the record whose callback attempted the reentry was delivered";
+  }
+
+  /* THE SUBSCRIPTION CONTINUES past the refusal: the unsubscribe's terminal
+     marker still rides the same events callback */
+  ASSERT_EQ(sa_client_unsubscribe_events(cl), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    for (size_t i = 0; i < rec.ev_op.size(); i++) {
+      if (rec.ev_op[i] == (uint8_t)CA_EVENTS_UNSUBSCRIBE) return true;
+    }
+    return false;
+  }));
 
   sa_client_destroy(cl);
   fixture_teardown(&fx);

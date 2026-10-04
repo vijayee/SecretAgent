@@ -45,6 +45,18 @@ typedef enum {
 #define SA_CLIENT_STATUS_DISCONNECTED  11
 #define SA_CLIENT_STATUS_ALLOC         12
 #define SA_CLIENT_STATUS_BUSY          13
+#define SA_CLIENT_STATUS_LOCAL         14   /* the request never left: an
+                                             encode or send failed before the
+                                             wire saw it (the channel's fate
+                                             is unknown — the reader sorts
+                                             the drop out) */
+#define SA_CLIENT_STATUS_REENTRANT     15   /* a blocking op called FROM an
+                                             events callback (the reader
+                                             cannot route its response):
+                                             refused outright — the op
+                                             returns -1 and no callback
+                                             fires; this status names the
+                                             refusal */
 
 /* Callback types.
  *
@@ -57,7 +69,11 @@ typedef enum {
  * the pointer stays valid after the callback returns — cross-thread
  * consumers may copy it later. Releasing a payload twice, releasing an
  * unknown pointer, or releasing after destroy is a safe no-op. Unreleased
- * payloads are reclaimed at destroy. */
+ * payloads are reclaimed at destroy. The client delivers ONLY pointers it
+ * tracks: a payload the client could not hold (out of memory) never reaches a
+ * callback — the failure routes through the error channel instead, and the
+ * OOM path's texts may be static literals (a release on an untracked pointer
+ * is the safe no-op above). */
 
 /* The prompt response. status 0 = the frame started (sid = the new frame's
  * "sessions/..." path) or the steer queued (sid = ""). sid is held; NULL
@@ -95,7 +111,9 @@ typedef void (*sa_client_sessions_cb_t)(void* ctx, uint8_t status,
  * after sa_client_unsubscribe_events). sid and record_json are HELD (two
  * releases per record; the marker's record_json is NULL — one release).
  * Fires on the reader thread; a reconnect may deliver a NEW live marker and
- * replay the gap the outage swallowed (see the reconnect note below). */
+ * replay the gap the outage swallowed (see the reconnect note below). A
+ * BLOCKING OP called from an events callback is refused immediately
+ * (SA_CLIENT_STATUS_REENTRANT — the reader cannot route its response). */
 typedef void (*sa_client_events_cb_t)(void* ctx, const char* sid,
                                       uint64_t seq, uint8_t op,
                                       const char* record_json);
@@ -164,16 +182,29 @@ typedef struct sa_client_t sa_client_t;
  * tailing. Requests issued while disconnected fail fast
  * (SA_CLIENT_STATUS_DISCONNECTED); a request alone never re-opens the
  * channel. No subscription active = the reader exits; the client stays
- * disconnected until destroyed. */
+ * disconnected until destroyed.
+ *
+ * THE RE-ENTRY: the events callback runs on the reader thread — a blocking
+ * op from one is refused immediately (the op returns -1, no callback; the
+ * reader cannot route its response, so the request would stall to a lying
+ * TIMEOUT over a daemon that actually committed).
+ *
+ * THE IDLE COST: a connected client with an ACTIVE SUBSCRIPTION polls at the
+ * 2 ms read cadence even with no traffic — an idle subscribed client costs
+ * ~500 wakeups/s (the honest price of the simple reader; liboffs's pd timers
+ * would remove it — a recorded candidate). */
 
 sa_client_t* sa_client_connect(const sa_client_config_t* config);
 
 /* Final teardown (offs_client's disconnect/destroy pair COLLAPSED — the
- * client has no detach-and-linger consumer in this slice): stops the reader
- * thread and joins it, closes the channel, reclaims every unreleased
- * payload, scrubs the api-key copy by length, frees the client. Callbacks
- * already delivered (payloads not yet released) are freed HERE — pointers
- * handed to callbacks are INVALID after destroy returns. */
+ * client has no detach-and-linger consumer in this slice): destroy JOINS the
+ * reader thread and reclaims the payloads; a blocking op ON ANOTHER THREAD
+ * at destroy time is UNDEFINED BEHAVIOR (the offs_client contract, carried
+ * over) — disconnect your callers first. Stops the reader, closes the
+ * channel, reclaims every unreleased payload, scrubs the api-key copy by
+ * length, frees the client. Callbacks already delivered (payloads not yet
+ * released) are freed HERE — pointers handed to callbacks are INVALID after
+ * destroy returns. */
 void sa_client_destroy(sa_client_t* client);
 
 /* Releases a payload previously passed to a callback. The consumer calls
@@ -185,17 +216,20 @@ void sa_client_release_payload(sa_client_t* client, void* payload);
 /* Send the goal text (sid NULL: create + start a top frame; the response's
  * sid names it) or the steer (sid set). BLOCKS until the response, the
  * timeout, or the drop; returns 0 when the prompt callback ran (success or
- * failure-delivery), -1 when the call was refused outright (NULL args; the
- * error callback still fired for the local refusals — busy/not-connected —
- * but no prompt callback ran). */
+ * failure-delivery), -1 when the call was refused outright (NULL args; a
+ * call FROM an events callback — refused immediately, NO callback fires at
+ * all; the error callback still fired for the local refusals —
+ * busy/not-connected — but no prompt callback ran). */
 int sa_client_prompt(sa_client_t* client, const char* sid, const char* text,
                      sa_client_prompt_cb_t callback, void* ctx);
 
-/* Interrupt the session's open turn. Same blocking + return contract. */
+/* Interrupt the session's open turn. Same blocking + return contract
+ * (including the events-callback re-entry refusal: -1, no callback). */
 int sa_client_interrupt(sa_client_t* client, const char* sid,
                         sa_client_interrupt_cb_t callback, void* ctx);
 
-/* List the store's sessions. Same blocking + return contract. */
+/* List the store's sessions. Same blocking + return contract (including the
+ * events-callback re-entry refusal: -1, no callback). */
 int sa_client_list_sessions(sa_client_t* client,
                             sa_client_sessions_cb_t callback, void* ctx);
 
@@ -205,7 +239,8 @@ int sa_client_list_sessions(sa_client_t* client,
  * the live marker (or the refusal/timeout); returns 0 when the
  * subscription is live or the failure was delivered through callbacks, -1
  * when refused outright (NULL args, a subscription already active, not
- * connected — the error callback fired). */
+ * connected, a call FROM an events callback — refused immediately, no
+ * callback — the error callback fired for the rest). */
 int sa_client_subscribe_events(sa_client_t* client, const char* sid,
                                sa_client_events_cb_t callback, void* ctx);
 
@@ -213,7 +248,8 @@ int sa_client_subscribe_events(sa_client_t* client, const char* sid,
  * until its terminal marker was delivered to the events callback (op =
  * CA_EVENTS_UNSUBSCRIBE) — or the timeout fires (the sub stays active then;
  * -1 + the error callback). Returns 0 when delivered, -1 refused outright
- * (no active subscription / not connected). */
+ * (no active subscription / not connected / a call FROM an events callback
+ * — refused immediately, no callback). */
 int sa_client_unsubscribe_events(sa_client_t* client);
 
 #ifdef __cplusplus

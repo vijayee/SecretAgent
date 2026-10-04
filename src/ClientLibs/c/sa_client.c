@@ -44,6 +44,7 @@ typedef int sa_client_tu_anchor_t;   /* ISO C: a non-empty TU when gated */
 #include "../../Network/stream_framer.h"
 #include "../../Platform/platform.h"
 #include "../../Util/allocator.h"
+#include "../../Util/atomic_compat.h"
 #include "../../Util/log.h"
 #include <errno.h>
 #include <string.h>
@@ -111,7 +112,13 @@ struct sa_client_t {
   platform_socket_t* sock;
   stream_framer_t* framer;
   platform_thread_t* reader;
-  volatile uint8_t running;    /* destroy's stop flag */
+  ATOMIC(uint8_t) running;     /* destroy's stop flag (read unlocked at
+                                  every reader-loop + backoff site) */
+  uint64_t reader_tid;         /* platform_thread_self() at the reader's
+                                  entry (the re-entry refusal's check) */
+  ATOMIC(uint8_t) reader_reentry;   /* set while the reader thread runs an
+                                       events callback: a blocking op from
+                                       it refuses immediately */
   volatile uint8_t connected;  /* under lock; off = no sends, no requests */
 
   uint64_t next_req_id;
@@ -120,6 +127,19 @@ struct sa_client_t {
 
   sa_held_t* held;   /* offs_client's list shape, under lock */
 };
+
+/* ---- the blocking-op re-entry refusal -------------------------------------- */
+
+/* The events callback runs on the reader thread; a blocking op it calls can
+   never see its response routed (the reader is busy INSIDE the callback) —
+   a plain send would stall to a TIMEOUT while the daemon actually committed.
+   The gate: the re-entry flag is set ONLY around the reader's event
+   deliveries, so the thread check keeps every OTHER thread's legitimate
+   blocking op running normally. */
+static int _reentry_refused(sa_client_t* c) {
+  if (ATOMIC_LOAD(&c->reader_reentry) == 0) return 0;
+  return c->reader_tid != 0 && platform_thread_self() == c->reader_tid;
+}
 
 /* ---- small helpers --------------------------------------------------------- */
 
@@ -151,19 +171,60 @@ static void _clear_sub_locked(sa_client_t* c);
 
 /* ---- the held-payload table (offs_client's _hold_payload verbatim) --------- */
 
-static void _hold_payload(sa_client_t* c, void* ptr) {
+/* 0 = the pointer is tracked (a callback may now be handed it); -1 = OOM:
+   ptr was freed HERE and the caller must deliver NOTHING — the pin is that
+   no pointer reaches a callback that the held table does not own. */
+static int _hold_payload(sa_client_t* c, void* ptr) {
   sa_held_t* node;
-  if (ptr == NULL || c == NULL) return;
+  if (ptr == NULL || c == NULL) return 0;
   node = get_clear_memory(sizeof(*node));
   if (node == NULL) {
-    free(ptr);   /* never leak: the consumer's later release is a no-op */
-    return;
+    free(ptr);   /* never leak: the delivery is cancelled, so the consumer
+                    never sees the pointer (its release would be a no-op) */
+    return -1;
   }
   node->ptr = ptr;
   platform_mutex_lock(c->lock);
   node->next = c->held;
   c->held = node;
   platform_mutex_unlock(c->lock);
+  return 0;
+}
+
+/* Hold EVERY pointer in the list at once (ONE lock pass, all-or-nothing):
+   either the whole batch is tracked or nothing is. NULL entries are skipped.
+   0 = every pointer is tracked; -1 = OOM mid-build: every pointer in the
+   list was FREED and the table is untouched — the caller delivers nothing. */
+static int _hold_all(sa_client_t* c, void** ptrs, size_t count) {
+  sa_held_t* chain = NULL;
+  size_t i;
+  if (c == NULL || ptrs == NULL || count == 0) return 0;
+  for (i = 0; i < count; i++) {
+    sa_held_t* node;
+    if (ptrs[i] == NULL) continue;
+    node = get_clear_memory(sizeof(*node));
+    if (node == NULL) {
+      while (chain != NULL) {                 /* the staged nodes die */
+        sa_held_t* next = chain->next;
+        free(chain);
+        chain = next;
+      }
+      for (i = 0; i < count; i++) free(ptrs[i]);   /* the payloads too */
+      return -1;
+    }
+    node->ptr = ptrs[i];
+    node->next = chain;
+    chain = node;
+  }
+  platform_mutex_lock(c->lock);
+  while (chain != NULL) {                     /* splice the staged chain */
+    sa_held_t* next = chain->next;
+    chain->next = c->held;
+    c->held = chain;
+    chain = next;
+  }
+  platform_mutex_unlock(c->lock);
+  return 0;
 }
 
 void sa_client_release_payload(sa_client_t* client, void* payload) {
@@ -186,13 +247,18 @@ void sa_client_release_payload(sa_client_t* client, void* payload) {
 
 /* Destroy's sweep: every unreleased copy goes here (a released-once pointer
    was already unlinked and freed — released exactly once, exactly one
-   free). */
+   free). NULL-lock safe (the setup-failure path's destroy). */
 static void _release_all_payloads(sa_client_t* c) {
-  sa_held_t* node;
-  platform_mutex_lock(c->lock);
-  node = c->held;
-  c->held = NULL;
-  platform_mutex_unlock(c->lock);
+  sa_held_t* node = NULL;
+  if (c->lock != NULL) {
+    platform_mutex_lock(c->lock);
+    node = c->held;
+    c->held = NULL;
+    platform_mutex_unlock(c->lock);
+  } else {
+    node = c->held;
+    c->held = NULL;
+  }
   while (node != NULL) {
     sa_held_t* next = node->next;
     free(node->ptr);
@@ -204,19 +270,35 @@ static void _release_all_payloads(sa_client_t* c) {
 /* ---- the error channel ------------------------------------------------------ */
 
 /* Fires the config's error callback with a HELD copy of the text (the
-   lifetime rule: the consumer owns it after the call returns). */
+   lifetime rule: the consumer owns it after the call returns). The hold runs
+   BEFORE the delivery — an OOM hold cancels the delivery, so nothing
+   untracked ever reaches the callback; the fallback delivers the STATIC OOM
+   literal (a release on it is the untracked-pointer no-op and a literal
+   never dies, so the consumer's copy is sound either way). */
 static void _error_local(sa_client_t* c, uint64_t rid, uint8_t status,
                          const char* text) {
   char* copy;
   if (c->cfg.error_cb == NULL) return;
   copy = _dup_string(text);
-  if (copy == NULL) return;
+  if (copy == NULL) {
+    c->cfg.error_cb(c->cfg.error_ctx, rid, status,
+                    "out of memory building the error text");
+    return;
+  }
+  if (_hold_payload(c, copy) != 0) {
+    c->cfg.error_cb(c->cfg.error_ctx, rid, status,
+                    "out of memory holding the error text");
+    return;
+  }
   c->cfg.error_cb(c->cfg.error_ctx, rid, status, copy);
-  _hold_payload(c, copy);
 }
 
 /* ---- channel io -------------------------------------------------------------- */
 
+/* Sends ONE framed request. Returns 0 = sent; -1 = the SOCKET refused the
+   send (the channel's fate is unknown — the reader sorts the drop out);
+   -2 = the encode failed BEFORE a byte was sent (a purely LOCAL failure:
+   the wire never saw the request — never report it as a disconnect). */
 static int _send_framed(sa_client_t* c, uint64_t type, void* payload) {
   uint8_t* raw = NULL;
   size_t raw_len = 0;
@@ -226,10 +308,10 @@ static int _send_framed(sa_client_t* c, uint64_t type, void* payload) {
   int rounds = 0;
 
   if (c->sock == NULL) return -1;
-  if (ca_wire_encode(type, payload, &raw, &raw_len) != 0) return -1;
+  if (ca_wire_encode(type, payload, &raw, &raw_len) != 0) return -2;
   framed = stream_frame_encode(raw, raw_len, &flen);
   free(raw);
-  if (framed == NULL) return -1;
+  if (framed == NULL) return -2;
   /* send all: the socket is nonblocking (a quiet peer's EAGAIN waits in 2 ms
      slices; our frames are small — the round cap is a stuck-peer escape) */
   while (off < flen) {
@@ -250,6 +332,9 @@ static int _send_framed(sa_client_t* c, uint64_t type, void* payload) {
   return 0;
 }
 
+/* Closes the channel. EVERY step guards its own field: the setup-failure
+   path runs destroy with a possibly-NULL lock/sock/framer — no step may
+   assume the client's setup completed. */
 static void _close_channel(sa_client_t* c) {
   if (c->framer != NULL) {
     stream_framer_destroy(c->framer);
@@ -259,9 +344,13 @@ static void _close_channel(sa_client_t* c) {
     platform_socket_destroy(c->sock);
     c->sock = NULL;
   }
-  platform_mutex_lock(c->lock);
-  c->connected = 0;
-  platform_mutex_unlock(c->lock);
+  if (c->lock != NULL) {
+    platform_mutex_lock(c->lock);
+    c->connected = 0;
+    platform_mutex_unlock(c->lock);
+  } else {
+    c->connected = 0;
+  }
 }
 
 /* The TCP auth exchange: the connection's FIRST frame pair (the header's
@@ -452,15 +541,17 @@ static uint8_t _deliver_daemon_error(sa_client_t* c, void* payload) {
   ca_error_t* err = (ca_error_t*)payload;
   uint8_t st = err->status;
   uint64_t rid = err->req_id;
-  char* text = _dup_string(err->text);
-  if (text == NULL) {
-    _error_local(c, rid, SA_CLIENT_STATUS_ALLOC,
-                 "out of memory delivering an error");
-  } else if (c->cfg.error_cb != NULL) {
-    c->cfg.error_cb(c->cfg.error_ctx, rid, st, text);
-    _hold_payload(c, text);
-  } else {
-    free(text);
+  char* text;
+
+  if (c->cfg.error_cb != NULL) {
+    text = _dup_string(err->text);
+    if (text != NULL && _hold_payload(c, text) == 0) {
+      c->cfg.error_cb(c->cfg.error_ctx, rid, st, text);
+    } else {
+      free(text);
+      c->cfg.error_cb(c->cfg.error_ctx, rid, st,
+                      "out of memory delivering the refusal's text");
+    }
   }
   ca_wire_payload_destroy(CA_ERROR, err);
   return st;
@@ -469,12 +560,16 @@ static uint8_t _deliver_daemon_error(sa_client_t* c, void* payload) {
 /* Delivers ONE events response (record or marker) to the subscription's
    callback (the reader thread; the cb/ctx snapshot rides the caller's
    locked section). sid + record_json arrive as FRESH copies handed to the
-   callback — held per the lifetime rule. */
+   callback — HELD BEFORE the delivery (an OOM hold cancels the delivery:
+   no untracked pointer reaches a callback; the failure routes through the
+   error channel instead). */
 static void _deliver_event(sa_client_t* c, const char* sid, uint64_t seq,
                            uint8_t op, const char* record_json,
                            sa_client_events_cb_t cb, void* ctx) {
   char* sid_copy;
   char* rec_copy;
+  void* held[2];
+  size_t nheld = 0;
 
   sid_copy = _dup_string(sid);
   rec_copy = (record_json != NULL) ? _dup_string(record_json) : NULL;
@@ -486,9 +581,21 @@ static void _deliver_event(sa_client_t* c, const char* sid, uint64_t seq,
                  "out of memory delivering an event");
     return;
   }
-  if (cb != NULL) cb(ctx, sid_copy, seq, op, rec_copy);
-  _hold_payload(c, sid_copy);
-  if (rec_copy != NULL) _hold_payload(c, rec_copy);
+  if (cb == NULL) {   /* nothing delivers — the copies die here */
+    free(sid_copy);
+    free(rec_copy);
+    return;
+  }
+  held[nheld++] = sid_copy;
+  if (rec_copy != NULL) held[nheld++] = rec_copy;
+  if (_hold_all(c, held, nheld) != 0) {
+    /* the OOM hold freed the copies: the events callback sees nothing —
+       the OOM routes through the error channel */
+    _error_local(c, 0, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory delivering an event");
+    return;
+  }
+  cb(ctx, sid_copy, seq, op, rec_copy);
 }
 
 /* The reader's one decoded frame. Routes:
@@ -559,8 +666,13 @@ static void _handle_frame(sa_client_t* c, const uint8_t* raw, size_t len) {
 
   if (payload != NULL) ca_wire_payload_destroy(type, payload);
   if (deliver_event || unsub_marker) {
+    /* the re-entry gate: the callback runs on the READER thread — a blocking
+       op it calls sees the flag + the thread match and refuses immediately
+       (this thread cannot route its response) */
+    ATOMIC_STORE(&c->reader_reentry, 1);
     _deliver_event(c, ev->sid, ev->seq, ev->op, ev->record_json, ev_cb,
                    ev_ctx);
+    ATOMIC_STORE(&c->reader_reentry, 0);
     ca_wire_payload_destroy(CA_EVENTS_RESPONSE, ev);
   }
 }
@@ -570,10 +682,12 @@ static void _handle_frame(sa_client_t* c, const uint8_t* raw, size_t len) {
 /* The shared blocking roundtrip. Returns:
    0 = a response arrived (the DECODED wire payload rides *resp_out — the
        CALLER owns it); rid_out/rtype_out/rstatus_out filled;
-   1 = failed: the error callback FIRED, *fail_out carries the status — the
-       op callback completes with it and no payload;
-  -1 = the call was refused outright (the busy slot case fires the error
-       callback with req_id 0) — the op callback does NOT run.
+   1 = failed: the error callback FIRED (the not-connected case, the busy
+       slot, the send failure, the timeout, the mid-wait drop, the daemon's
+       refusal), *fail_out carries the status — the op callback completes
+       with it and no payload;
+  -1 = the call was refused outright with NO callback at all: the ONLY case
+       is the events-callback re-entry refusal (see _reentry_refused).
   The caller's req payload is STAMPED with the assigned req_id (the wire's
   first-member duality) and is the caller's to destroy after the call.
   THE SEND HOLDS THE LOCK: the caller's request frame and the reader's
@@ -585,6 +699,14 @@ static int _roundtrip(sa_client_t* c, uint64_t want_type, void* req_payload,
   uint64_t deadline;
   int done;
 
+  if (_reentry_refused(c)) {
+    /* a blocking op from an events callback: the reader thread is busy
+       RUNNING the callback — its response would never route. Refuse
+       immediately (no callback fires; SA_CLIENT_STATUS_REENTRANT names it). */
+    log_error("sa_client: a blocking op from an events callback is refused "
+              "(status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;
+  }
   platform_mutex_lock(c->lock);
   if (!c->connected) {
     platform_mutex_unlock(c->lock);
@@ -605,13 +727,26 @@ static int _roundtrip(sa_client_t* c, uint64_t want_type, void* req_payload,
   c->pending.active = 1;
   c->pending.req_id = *rid_out;
   c->pending.want_type = want_type;
-  if (_send_framed(c, req_type, req_payload) != 0) {
-    c->pending.active = 0;
-    platform_mutex_unlock(c->lock);
-    _error_local(c, *rid_out, SA_CLIENT_STATUS_DISCONNECTED,
-                 "the connection dropped on send");
-    *fail_out = SA_CLIENT_STATUS_DISCONNECTED;
-    return 1;
+  {
+    int send_rc = _send_framed(c, req_type, req_payload);
+    if (send_rc != 0) {
+      c->pending.active = 0;
+      platform_mutex_unlock(c->lock);
+      if (send_rc < -1) {
+        /* the encode failed: the request never left (an honest LOCAL
+           failure — the channel may be perfectly fine) */
+        _error_local(c, *rid_out, SA_CLIENT_STATUS_LOCAL,
+                     "the request never left (the encode failed)");
+        *fail_out = SA_CLIENT_STATUS_LOCAL;
+      } else {
+        /* the socket refused the send: the channel's fate is unknown —
+           the reader sorts the drop out next */
+        _error_local(c, *rid_out, SA_CLIENT_STATUS_DISCONNECTED,
+                     "the connection dropped on send");
+        *fail_out = SA_CLIENT_STATUS_DISCONNECTED;
+      }
+      return 1;
+    }
   }
   platform_mutex_unlock(c->lock);
 
@@ -677,6 +812,11 @@ int sa_client_prompt(sa_client_t* client, const char* sid, const char* text,
   int rc;
 
   if (client == NULL || text == NULL) return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_prompt: a blocking op from an events callback is "
+              "refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
   req = get_clear_memory(sizeof(*req));
   if (req == NULL) {
     _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
@@ -715,8 +855,15 @@ int sa_client_prompt(sa_client_t* client, const char* sid, const char* text,
       if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_ALLOC, NULL);
       return 0;
     }
+    if (_hold_payload(client, sid_copy) != 0) {
+      /* the hold freed the copy: NO untracked pointer reaches the callback
+         — the OOM routes through the error channel + a failing completion */
+      _error_local(client, rid, SA_CLIENT_STATUS_ALLOC,
+                   "out of memory delivering the prompt response");
+      if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_ALLOC, NULL);
+      return 0;
+    }
     if (callback != NULL) callback(ctx, st, sid_copy);
-    _hold_payload(client, sid_copy);
   }
   return 0;
 }
@@ -730,6 +877,11 @@ int sa_client_interrupt(sa_client_t* client, const char* sid,
   int rc;
 
   if (client == NULL || sid == NULL) return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_interrupt: a blocking op from an events callback is "
+              "refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
   req = get_clear_memory(sizeof(*req));
   if (req == NULL) {
     _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
@@ -764,6 +916,17 @@ int sa_client_interrupt(sa_client_t* client, const char* sid,
   return 0;
 }
 
+/* Frees a whole rows build (the array AND every non-NULL string in it) —
+   the copy failure's unwind and the OOM-hold's cancellation share this. */
+static void _free_rows(sa_client_session_row_t* rows, size_t nrecords) {
+  for (size_t i = 0; i < nrecords; i++) {
+    free((void*)rows[i].sid);
+    free((void*)rows[i].status);
+    free((void*)rows[i].goal);
+  }
+  free(rows);
+}
+
 /* Builds the rows' HELD copies from the decoded listing: the rows array
    itself plus each row's non-NULL string are separate held pointers. On a
    copy failure the PARTIAL build unwinds (freeing what it made), the error
@@ -795,12 +958,7 @@ static sa_client_session_row_t* _build_rows(sa_client_t* c,
     if ((recs[made].sid != NULL && rows[made].sid == NULL) ||
         (recs[made].status != NULL && rows[made].status == NULL) ||
         (recs[made].goal != NULL && rows[made].goal == NULL)) {
-      for (size_t i = 0; i <= made; i++) {
-        free((void*)rows[i].sid);
-        free((void*)rows[i].status);
-        free((void*)rows[i].goal);
-      }
-      free(rows);
+      _free_rows(rows, made + 1);
       _error_local(c, rid, SA_CLIENT_STATUS_ALLOC,
                    "out of memory delivering the listing");
       *oom_out = 1;
@@ -808,6 +966,50 @@ static sa_client_session_row_t* _build_rows(sa_client_t* c,
     }
   }
   return rows;
+}
+
+/* The listing's one delivery: the rows array AND every non-NULL string are
+   held TOGETHER, all-or-nothing. 0 = delivered through the op callback; the
+   OOM path freed the build and delivers through the error channel + a
+   failing op completion (no untracked pointer reaches any callback). */
+static int _deliver_rows(sa_client_t* c, sa_client_session_row_t* rows,
+                         size_t nrecords, uint64_t rid,
+                         sa_client_sessions_cb_t callback, void* ctx,
+                         uint8_t status) {
+  void** ptrs;
+  size_t n = 0;
+  int held;
+
+  if (rows == NULL) {   /* an empty listing is legit: nothing to hold */
+    if (callback != NULL) callback(ctx, status, NULL, 0);
+    return 0;
+  }
+  ptrs = get_clear_memory((nrecords * 3 + 1) * sizeof(void*));
+  if (ptrs == NULL) {
+    _free_rows(rows, nrecords);
+    _error_local(c, rid, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory delivering the listing");
+    if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_ALLOC, NULL, 0);
+    return 0;
+  }
+  ptrs[n++] = rows;
+  for (size_t i = 0; i < nrecords; i++) {
+    ptrs[n++] = (void*)rows[i].sid;
+    ptrs[n++] = (void*)rows[i].status;
+    ptrs[n++] = (void*)rows[i].goal;
+  }
+  held = (_hold_all(c, ptrs, n) == 0);
+  free(ptrs);   /* the batch's staging list dies; the payloads ride held */
+  if (!held) {
+    /* the OOM hold freed the whole build: no untracked pointer reaches the
+       callback — the OOM routes through the error channel */
+    _error_local(c, rid, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory delivering the listing");
+    if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_ALLOC, NULL, 0);
+    return 0;
+  }
+  if (callback != NULL) callback(ctx, status, rows, nrecords);
+  return 0;
 }
 
 int sa_client_list_sessions(sa_client_t* client,
@@ -819,6 +1021,11 @@ int sa_client_list_sessions(sa_client_t* client,
   int rc;
 
   if (client == NULL) return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_list_sessions: a blocking op from an events "
+              "callback is refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
   req = get_clear_memory(sizeof(*req));
   if (req == NULL) {
     _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
@@ -858,21 +1065,8 @@ int sa_client_list_sessions(sa_client_t* client,
       if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_ALLOC, NULL, 0);
       return 0;
     }
-    /* the lifetime rule: the rows array AND every non-NULL string in it are
-       each held separately (one release each; NULL fields no-op) */
-    _hold_payload(client, rows);
-    for (size_t i = 0; i < nrecords; i++) {
-      _hold_payload(client, (void*)rows[i].sid);
-      if (rows[i].status != NULL) {
-        _hold_payload(client, (void*)rows[i].status);
-      }
-      if (rows[i].goal != NULL) {
-        _hold_payload(client, (void*)rows[i].goal);
-      }
-    }
-    if (callback != NULL) callback(ctx, rstatus, rows, nrecords);
+    return _deliver_rows(client, rows, nrecords, rid, callback, ctx, rstatus);
   }
-  return 0;
 }
 
 int sa_client_subscribe_events(sa_client_t* client, const char* sid,
@@ -885,6 +1079,11 @@ int sa_client_subscribe_events(sa_client_t* client, const char* sid,
   int rc = -1;
 
   if (client == NULL || sid == NULL || callback == NULL) return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_subscribe_events: a blocking op from an events "
+              "callback is refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
   platform_mutex_lock(client->lock);
   if (!client->connected) {
     platform_mutex_unlock(client->lock);
@@ -928,13 +1127,23 @@ int sa_client_subscribe_events(sa_client_t* client, const char* sid,
   client->pending.active = 1;
   client->pending.req_id = req.req_id;
   client->pending.want_type = CA_EVENTS_RESPONSE;
-  if (_send_framed(client, CA_EVENTS_REQUEST, &req) != 0) {
-    client->pending.active = 0;
-    platform_mutex_unlock(client->lock);
-    _clear_sub(client);
-    _error_local(client, req.req_id, SA_CLIENT_STATUS_DISCONNECTED,
-                 "the connection dropped on send");
-    return -1;
+  {
+    int send_rc = _send_framed(client, CA_EVENTS_REQUEST, &req);
+    if (send_rc != 0) {
+      client->pending.active = 0;
+      platform_mutex_unlock(client->lock);
+      _clear_sub(client);
+      if (send_rc < -1) {
+        /* the encode failed: the request never left (an honest LOCAL
+           failure — the channel may be perfectly fine) */
+        _error_local(client, req.req_id, SA_CLIENT_STATUS_LOCAL,
+                     "the request never left (the encode failed)");
+      } else {
+        _error_local(client, req.req_id, SA_CLIENT_STATUS_DISCONNECTED,
+                     "the connection dropped on send");
+      }
+      return -1;
+    }
   }
   platform_mutex_unlock(client->lock);
 
@@ -1007,6 +1216,11 @@ int sa_client_unsubscribe_events(sa_client_t* client) {
   int rc = -1;
 
   if (client == NULL) return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_unsubscribe_events: a blocking op from an events "
+              "callback is refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
   platform_mutex_lock(client->lock);
   if (!client->connected) {
     platform_mutex_unlock(client->lock);
@@ -1035,12 +1249,22 @@ int sa_client_unsubscribe_events(sa_client_t* client) {
   client->pending.active = 1;
   client->pending.req_id = rid;
   client->pending.want_type = CA_EVENTS_RESPONSE;
-  if (_send_framed(client, CA_EVENTS_REQUEST, &req) != 0) {
-    client->pending.active = 0;
-    platform_mutex_unlock(client->lock);
-    _error_local(client, rid, SA_CLIENT_STATUS_DISCONNECTED,
-                 "the connection dropped on send");
-    return -1;
+  {
+    int send_rc = _send_framed(client, CA_EVENTS_REQUEST, &req);
+    if (send_rc != 0) {
+      client->pending.active = 0;
+      platform_mutex_unlock(client->lock);
+      if (send_rc < -1) {
+        /* the encode failed: the request never left (an honest LOCAL
+           failure — the channel may be perfectly fine) */
+        _error_local(client, rid, SA_CLIENT_STATUS_LOCAL,
+                     "the request never left (the encode failed)");
+      } else {
+        _error_local(client, rid, SA_CLIENT_STATUS_DISCONNECTED,
+                     "the connection dropped on send");
+      }
+      return -1;
+    }
   }
   platform_mutex_unlock(client->lock);
 
@@ -1092,11 +1316,11 @@ int sa_client_unsubscribe_events(sa_client_t* client) {
 static int _backoff_sleep(sa_client_t* c, uint32_t total_ms) {
   uint32_t slept = 0;
   while (slept < total_ms) {
-    if (!c->running) return 0;
+    if (ATOMIC_LOAD(&c->running) == 0) return 0;
     platform_sleep_ms(SA_BACKOFF_SLICE_MS);
     slept += SA_BACKOFF_SLICE_MS;
   }
-  return c->running;
+  return (int)ATOMIC_LOAD(&c->running);
 }
 
 /* The events channel's reconnect: the 1 s -> 8 s doubling backoff,
@@ -1176,7 +1400,7 @@ static void _clear_sub_locked(sa_client_t* c) {
    each complete frame. Returns 0 = stopped (destroy), -1 = the channel
    dropped. */
 static int _read_until_drop(sa_client_t* c, uint8_t* buf, size_t buf_size) {
-  while (c->running) {
+  while (ATOMIC_LOAD(&c->running)) {
     ssize_t n = platform_socket_recv(c->sock, buf, buf_size);
     if (n > 0) {
       uint8_t* fdata;
@@ -1207,10 +1431,11 @@ static void* _reader_thread(void* arg) {
   sa_client_t* c = (sa_client_t*)arg;
   uint8_t buf[16384];
 
-  while (c->running) {
+  c->reader_tid = platform_thread_self();   /* the re-entry refusal's check */
+  while (ATOMIC_LOAD(&c->running)) {
     int rc = _read_until_drop(c, buf, sizeof(buf));
     if (rc == 0) break;   /* destroy stopped the reader */
-    if (!c->running) break;
+    if (ATOMIC_LOAD(&c->running) == 0) break;
     /* THE DROP: fail the in-flight request (its waiter wakes with the
        disconnect sentinel), then reconnect only for an active
        subscription — a request alone never re-opens the channel. */
@@ -1281,7 +1506,7 @@ sa_client_t* sa_client_connect(const sa_client_config_t* config) {
   c->api_key_len = (config->api_key != NULL) ? strlen(config->api_key) + 1 : 0;
   c->lock = platform_mutex_create();
   c->wake = platform_condvar_create();
-  c->running = 1;
+  ATOMIC_STORE(&c->running, 1);
   c->next_req_id = 0;
   if (c->socket_path == NULL || c->lock == NULL || c->wake == NULL ||
       (config->api_key != NULL && c->api_key == NULL) ||
@@ -1304,9 +1529,15 @@ sa_client_t* sa_client_connect(const sa_client_config_t* config) {
   return c;
 }
 
+/* Final teardown (the header's contract): joins the reader, reclaims the
+   payloads, frees the client. EVERY step guards its own field — the
+   setup-failure path (sa_client_connect) calls this with a possibly-NULL
+   lock/wake/reader and a NULL-safe teardown is what keeps THAT path sound
+   (the blocking-op-on-another-thread hazard stays the header's undefined
+   behavior, per the offs_client contract). */
 void sa_client_destroy(sa_client_t* client) {
   if (client == NULL) return;
-  client->running = 0;
+  ATOMIC_STORE(&client->running, 0);
   /* the reader exits inside one backoff slice (its sleeps slice on
      running); join BEFORE the channel dies — no send/recv races the free */
   if (client->reader != NULL) platform_thread_join(client->reader);
@@ -1322,8 +1553,8 @@ void sa_client_destroy(sa_client_t* client) {
   free(client->socket_path);
   free(client->host);
   free(client->pending.payload);
-  platform_mutex_destroy(client->lock);
-  platform_condvar_destroy(client->wake);
+  if (client->lock != NULL) platform_mutex_destroy(client->lock);
+  if (client->wake != NULL) platform_condvar_destroy(client->wake);
   free(client);
 }
 
