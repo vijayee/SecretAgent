@@ -164,8 +164,12 @@ int ca_wire_encode(uint64_t type, void* payload, uint8_t** out, size_t* out_len)
    id); status = a response's status field, CA_ERROR's status, or — for
    CA_EVENTS_RESPONSE — its op (the live marker's echo is read off this
    out-param: seq == 0 + the echoed op = the transition to live tailing); a
-   request decodes with status 0. On refusal the outs are untouched and
-   *payload stays NULL. */
+   request decodes with status 0.
+   On refusal: *type, *status, and *payload stay untouched (a NULL-init'd
+   payload stays NULL), but req_id IS filled whenever the frame's req_id
+   element decoded — an unknown type or a refusing PAYLOAD leaves it set
+   (so an error frame can echo the request's req_id); only a not-an-array
+   frame or a malformed element 0/1 leaves req_id untouched. */
 
 /* The bytes form (the transports' convenience): cbor_load + decode, the
    loaded cbor destroyed inside; a malformed payload is a refusal. */

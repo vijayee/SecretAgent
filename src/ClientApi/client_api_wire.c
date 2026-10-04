@@ -472,7 +472,15 @@ static int _decode_sessions_response(cbor_item_t* frame, void** payload) {
     rc = rc != 0 ? rc : (item == NULL ? -1 : _decode_u64(item, &depth));
     cbor_decref(&item);
     cbor_decref(&row);
-    if (rc != 0 || depth > SIZE_MAX) {
+    /* depth rides the wire as a full u64 and the cast to size_t only
+       truncates on a NARROWER size_t — the width-guarded comparison is that
+       overflow trip; on a 64-bit size_t it is compile-time dead, so the
+       arm elides it. */
+#if SIZE_MAX < UINT64_MAX
+    if (rc != 0 || depth > (uint64_t)SIZE_MAX) {
+#else
+    if (rc != 0) {
+#endif
       cbor_decref(&rows);
       ca_wire_payload_destroy(CA_SESSIONS_RESPONSE, res);
       return -1;
