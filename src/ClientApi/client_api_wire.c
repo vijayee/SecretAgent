@@ -242,7 +242,8 @@ static int _decode_sid_element(cbor_item_t* frame, size_t index,
 }
 
 /* [1, req_id, text] | [1, req_id, sid, text]; sid "" decodes as absent */
-static int _decode_prompt_request(cbor_item_t* frame, void** payload) {
+static int _decode_prompt_request(cbor_item_t* frame, uint64_t req_id,
+                                  void** payload) {
   size_t size = cbor_array_size(frame);
   ca_prompt_request_t* req;
   cbor_item_t* item;
@@ -250,6 +251,7 @@ static int _decode_prompt_request(cbor_item_t* frame, void** payload) {
 
   if (size != 3 && size != 4) return -1;
   req = get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
   if (size == 4) {
     rc = _decode_sid_element(frame, 2, CA_WIRE_SID_MAX, &req->sid, 0);
     if (rc != 0) {
@@ -270,13 +272,15 @@ static int _decode_prompt_request(cbor_item_t* frame, void** payload) {
 }
 
 /* [2, req_id, status, sid] — sid "" = a steer */
-static int _decode_prompt_response(cbor_item_t* frame, void** payload) {
+static int _decode_prompt_response(cbor_item_t* frame, uint64_t req_id,
+                                   void** payload) {
   ca_prompt_response_t* res;
   cbor_item_t* item;
   int rc;
 
   if (cbor_array_size(frame) != 4) return -1;
   res = get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
   item = cbor_array_get(frame, 2);
   rc = item == NULL ? -1 : _decode_u8(item, &res->status);
   cbor_decref(&item);
@@ -297,13 +301,15 @@ static int _decode_prompt_response(cbor_item_t* frame, void** payload) {
 }
 
 /* [3, req_id, sid, op, from_seq] */
-static int _decode_events_request(cbor_item_t* frame, void** payload) {
+static int _decode_events_request(cbor_item_t* frame, uint64_t req_id,
+                                  void** payload) {
   ca_events_request_t* req;
   cbor_item_t* item;
   int rc;
 
   if (cbor_array_size(frame) != 5) return -1;
   req = get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
   req->sid = NULL;
   rc = _decode_sid_element(frame, 2, CA_WIRE_SID_MAX, &req->sid, 1);
   if (rc != 0) {
@@ -330,13 +336,15 @@ static int _decode_events_request(cbor_item_t* frame, void** payload) {
 
 /* [4, req_id, sid, seq, op, record_json] — the live marker (seq 0) carries
    no record; a record frame (seq != 0) MUST carry one */
-static int _decode_events_response(cbor_item_t* frame, void** payload) {
+static int _decode_events_response(cbor_item_t* frame, uint64_t req_id,
+                                   void** payload) {
   ca_events_response_t* res;
   cbor_item_t* item;
   int rc;
 
   if (cbor_array_size(frame) != 6) return -1;
   res = get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
   rc = _decode_sid_element(frame, 2, CA_WIRE_SID_MAX, &res->sid, 1);
   if (rc != 0) {
     ca_wire_payload_destroy(CA_EVENTS_RESPONSE, res);
@@ -369,12 +377,14 @@ static int _decode_events_response(cbor_item_t* frame, void** payload) {
 }
 
 /* [5, req_id, sid] */
-static int _decode_interrupt_request(cbor_item_t* frame, void** payload) {
+static int _decode_interrupt_request(cbor_item_t* frame, uint64_t req_id,
+                                      void** payload) {
   ca_interrupt_request_t* req;
   int rc;
 
   if (cbor_array_size(frame) != 3) return -1;
   req = get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
   req->sid = NULL;
   rc = _decode_sid_element(frame, 2, CA_WIRE_SID_MAX, &req->sid, 1);
   if (rc != 0) {
@@ -386,13 +396,15 @@ static int _decode_interrupt_request(cbor_item_t* frame, void** payload) {
 }
 
 /* [6, req_id, status] */
-static int _decode_interrupt_response(cbor_item_t* frame, void** payload) {
+static int _decode_interrupt_response(cbor_item_t* frame, uint64_t req_id,
+                                      void** payload) {
   ca_interrupt_response_t* res;
   cbor_item_t* item;
   int rc;
 
   if (cbor_array_size(frame) != 3) return -1;
   res = get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
   item = cbor_array_get(frame, 2);
   rc = item == NULL ? -1 : _decode_u8(item, &res->status);
   cbor_decref(&item);
@@ -405,17 +417,20 @@ static int _decode_interrupt_response(cbor_item_t* frame, void** payload) {
 }
 
 /* [7, req_id] */
-static int _decode_sessions_request(cbor_item_t* frame, void** payload) {
+static int _decode_sessions_request(cbor_item_t* frame, uint64_t req_id,
+                                    void** payload) {
   ca_sessions_request_t* req;
 
   if (cbor_array_size(frame) != 2) return -1;
   req = get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
   *payload = req;
   return 0;
 }
 
 /* [8, req_id, rows] — row = [sid, status, goal, created, depth] */
-static int _decode_sessions_response(cbor_item_t* frame, void** payload) {
+static int _decode_sessions_response(cbor_item_t* frame, uint64_t req_id,
+                                     void** payload) {
   ca_sessions_response_t* res;
   cbor_item_t* rows;
   size_t nrows;
@@ -432,6 +447,7 @@ static int _decode_sessions_response(cbor_item_t* frame, void** payload) {
     return -1;
   }
   res = get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
   res->nrecords = nrows;
   if (nrows > 0) {
     res->records = get_clear_memory(sizeof(ca_sessions_record_t) * nrows);
@@ -494,13 +510,15 @@ static int _decode_sessions_response(cbor_item_t* frame, void** payload) {
 }
 
 /* [11, req_id, status, text] */
-static int _decode_error(cbor_item_t* frame, void** payload) {
+static int _decode_error(cbor_item_t* frame, uint64_t req_id,
+                         void** payload) {
   ca_error_t* err;
   cbor_item_t* item;
   int rc;
 
   if (cbor_array_size(frame) != 4) return -1;
   err = get_clear_memory(sizeof(*err));
+  err->req_id = req_id;
   item = cbor_array_get(frame, 2);
   rc = item == NULL ? -1 : _decode_u8(item, &err->status);
   cbor_decref(&item);
@@ -540,39 +558,39 @@ static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
 
   switch (wire_type) {
     case CA_PROMPT_REQUEST:
-      rc = _decode_prompt_request(frame, payload);
+      rc = _decode_prompt_request(frame, *req_id, payload);
       if (rc == 0) *status = 0;   /* a request carries no status */
       break;
     case CA_PROMPT_RESPONSE:
-      rc = _decode_prompt_response(frame, payload);
+      rc = _decode_prompt_response(frame, *req_id, payload);
       if (rc == 0) *status = ((ca_prompt_response_t*)*payload)->status;
       break;
     case CA_EVENTS_REQUEST:
-      rc = _decode_events_request(frame, payload);
+      rc = _decode_events_request(frame, *req_id, payload);
       if (rc == 0) *status = 0;
       break;
     case CA_EVENTS_RESPONSE:
-      rc = _decode_events_response(frame, payload);
+      rc = _decode_events_response(frame, *req_id, payload);
       if (rc == 0) *status = ((ca_events_response_t*)*payload)->op;
       break;
     case CA_INTERRUPT_REQUEST:
-      rc = _decode_interrupt_request(frame, payload);
+      rc = _decode_interrupt_request(frame, *req_id, payload);
       if (rc == 0) *status = 0;
       break;
     case CA_INTERRUPT_RESPONSE:
-      rc = _decode_interrupt_response(frame, payload);
+      rc = _decode_interrupt_response(frame, *req_id, payload);
       if (rc == 0) *status = ((ca_interrupt_response_t*)*payload)->status;
       break;
     case CA_SESSIONS_REQUEST:
-      rc = _decode_sessions_request(frame, payload);
+      rc = _decode_sessions_request(frame, *req_id, payload);
       if (rc == 0) *status = 0;
       break;
     case CA_SESSIONS_RESPONSE:
-      rc = _decode_sessions_response(frame, payload);
+      rc = _decode_sessions_response(frame, *req_id, payload);
       if (rc == 0) *status = 0;
       break;
     case CA_ERROR:
-      rc = _decode_error(frame, payload);
+      rc = _decode_error(frame, *req_id, payload);
       if (rc == 0) *status = ((ca_error_t*)*payload)->status;
       break;
     default:

@@ -74,7 +74,7 @@ if(NOT SA_ENABLE_STREAMS)
   list(FILTER C_SRC EXCLUDE
     REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/src/Util/(vec|validation|error|bcrypt)\\.c$")
   list(FILTER C_SRC EXCLUDE
-    REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/src/Platform/(platform_random|platform_file|platform_socket)\\.c$")
+    REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/src/Platform/(platform_random|platform_file|platform_socket|platform_socket_watcher)\\.c$")
 endif()
 
 # WaveDB: the durable floor (embedded HBTrie/MVCC/WAL/subtree store). Built

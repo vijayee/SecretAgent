@@ -81,7 +81,10 @@ CA_STATIC_ASSERT(CA_SESSIONS_RESPONSE == CA_SESSIONS_REQUEST + 1,
 #define CA_WIRE_REQ_ID_MAX UINT64_MAX
 
 /* --- the payload types (plain C structs; the destroy frees their heap
-   fields) --------------------------------------------------------------- */
+   fields). THE req_id DUALITY: element 1 lands BOTH on the caller's
+   *req_id out-param AND in the decoded payload's own req_id field (every
+   struct's first member — the transports' bridges route on the out-param,
+   the handlers read the field). ------------------------------- */
 typedef struct ca_prompt_request_t {
   uint64_t req_id;
   char* sid;     /* heap or NULL */

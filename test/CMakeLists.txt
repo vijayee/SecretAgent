@@ -94,6 +94,12 @@ if (BUILD_TESTING)
       if(SA_HAS_STREAMS)
         target_sources(testsecretagent PRIVATE test_client_api_handlers.cpp)
       endif()
+      # The client-api unix transport's suite (Task 5): the socket carrier
+      # needs everything the handlers' suite does (the wire's libcbor + the
+      # loop thread's poll-dancer) plus the framer — the same BOTH gate.
+      if(SA_HAS_STREAMS)
+        target_sources(testsecretagent PRIVATE test_client_api_unix.cpp)
+      endif()
       # The refine slice rides the same WDB gate as test_frame (its types live
       # on frame.h's surface); the review-call tests also need the streams
       # gate, added with Task 4's step.
@@ -237,7 +243,7 @@ if (BUILD_TESTING)
         # the same classes.
         # TestClientApiHandlers.TestInterruptReachesTheFrame (the client-api
         # handlers' slice) interrupts a POOLED frame's real sleeping pyrt cell
-        # — the same classes.
+        # — the same classes; so does its socket twin in the transport suite.
         if(_test_name MATCHES "^TestPyrt" OR _test_name MATCHES "^TestLoop" OR
            _test_name MATCHES "^TestLiveLoop" OR _test_name MATCHES "^TestPyAgent" OR
            _test_name MATCHES "^TestFrameTree" OR
@@ -245,6 +251,7 @@ if (BUILD_TESTING)
            _test_name MATCHES "^TestFrame.TestChildrenYieldTurnEndRidesTheFinishBatch$" OR
            _test_name MATCHES "^TestFrame.TestSecondResumeComposesNothing$" OR
            _test_name MATCHES "^TestClientApiHandlers.TestInterruptReachesTheFrame$" OR
+           _test_name MATCHES "^TestClientApiUnix.TestInterruptPostsOverTheSocket$" OR
            _test_name MATCHES "^TestRefine.TestRefineLiveRefineAgainstRealModel$")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()
