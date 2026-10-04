@@ -605,6 +605,18 @@ static void _connection_read_callback(pd_loop_t* loop, pd_watcher_t* watcher,
   }
 
   if (events & PD_EVENT_READ) {
+    /* THE STALE-READ GUARD (the ASan-recorded crash): the hangup's socket
+     * close rides the conn's ACTOR (a pool worker, async) while a
+     * level-triggered EOF on the departed peer keeps reporting READ to
+     * this loop-thread callback until the watcher's DEL lands — a
+     * callback firing AFTER the teardown touches a NULL/freed socket
+     * (the demo daemon's SIGINT shutdown caught exactly that shape). The
+     * conn's own latch refuses the event here; the sock-NULL check
+     * covers the latch-set window (_connection_close_fd clears the
+     * socket BEFORE the latch rises). */
+    if (ATOMIC_LOAD(&connection->is_closing) || connection->sock == NULL) {
+      return;
+    }
     /* On Windows backends the bytes that triggered this completion may be
      * sitting in the watcher's internal buffer; drain them first the same
      * way the unix carrier does (pd_watcher_drain_read), then fall back to
