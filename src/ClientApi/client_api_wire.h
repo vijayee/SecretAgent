@@ -36,7 +36,19 @@
    CA_SESSIONS_RESPONSE  8: [8, req_id, rows] — row = [sid, status, goal,
                              created, depth]
    CA_ERROR             11: [11, req_id, status, text] — any pairing's
-                             failure */
+                             failure
+   CA_AUTH_REQUEST      12: [12, req_id, api_key] — the TCP transport's
+                             auth exchange (the unix socket needs none);
+                             number mirrors liboffs's CLIENT_API_AUTH
+                             REQUEST (its client_api_wire.h:22); our
+                             payload carries the SAME req_id duality every
+                             other request carries (liboffs's auth request
+                             had none, and its api_key rode a bytestring
+                             ours keeps as a bound text string — every
+                             other field on this wire is text)
+   CA_AUTH_RESPONSE     13: [13, req_id, status] — 0 = the connection is
+                             authenticated; 1 = bad key (the connection
+                             CLOSES after a bad-key response) */
 #define CA_PROMPT_REQUEST     1
 #define CA_PROMPT_RESPONSE    2
 #define CA_EVENTS_REQUEST     3
@@ -46,6 +58,8 @@
 #define CA_SESSIONS_REQUEST   7
 #define CA_SESSIONS_RESPONSE  8
 #define CA_ERROR              11
+#define CA_AUTH_REQUEST       12
+#define CA_AUTH_RESPONSE      13
 
 #if defined(__cplusplus)
 #define CA_STATIC_ASSERT static_assert
@@ -65,6 +79,8 @@ CA_STATIC_ASSERT(CA_INTERRUPT_RESPONSE == CA_INTERRUPT_REQUEST + 1,
                  "interrupt response must be interrupt request + 1");
 CA_STATIC_ASSERT(CA_SESSIONS_RESPONSE == CA_SESSIONS_REQUEST + 1,
                  "sessions response must be sessions request + 1");
+CA_STATIC_ASSERT(CA_AUTH_RESPONSE == CA_AUTH_REQUEST + 1,
+                 "auth response must be auth request + 1");
 
 /* The wire's field bounds (each decoder refuses over-bound strings loud —
    the caller answers CA_ERROR):
@@ -78,6 +94,8 @@ CA_STATIC_ASSERT(CA_SESSIONS_RESPONSE == CA_SESSIONS_REQUEST + 1,
 #define CA_WIRE_STATUS_MAX 32u
 #define CA_WIRE_RECORD_MAX (128u * 1024u)
 #define CA_WIRE_SESSIONS_MAX 256u
+#define CA_WIRE_KEY_MAX 256u   /* an auth request's api_key (bcrypt keys are
+                                  ~60 chars; 256 is generous headroom) */
 #define CA_WIRE_REQ_ID_MAX UINT64_MAX
 
 /* --- the payload types (plain C structs; the destroy frees their heap
@@ -154,6 +172,18 @@ typedef struct ca_error_t {
   uint8_t status;   /* 1 = the request was refused; 2 = the frame unknown... */
   char* text;       /* heap */
 } ca_error_t;
+
+typedef struct ca_auth_request_t {
+  uint64_t req_id;
+  char* api_key;    /* heap; the presented key (bcrypt-checked against the
+                       transport's hash) */
+} ca_auth_request_t;
+
+typedef struct ca_auth_response_t {
+  uint64_t req_id;
+  uint8_t status;   /* 0 = authenticated; 1 = bad key (the connection
+                       closes after this frame) */
+} ca_auth_response_t;
 
 /* Encode one frame's payload into fresh CBOR bytes (cbor_serialize_alloc's
    buffer — free() it). The encoder is the TRUSTED side: field content is

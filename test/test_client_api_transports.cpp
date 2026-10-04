@@ -2,14 +2,17 @@
 // Created by victor on 10/03/26.
 //
 
-/* The client-api unix transport's suite (the plan's Task 5 / the client-api
-   spec §4): the FULL stack over a real socket — the raw AF_UNIX client double
-   writes stream_frame_encode(ca_wire_encode(...)) frames to the transport's
-   temp-path socket; the transport's framer extracts, its bridge dispatches
+/* The client-api TRANSPORTS' suite (the plan's Tasks 5 + 6 / the client-api
+   spec §4): the FULL stack over real sockets — the raw client double writes
+   stream_frame_encode(ca_wire_encode(...)) frames to the transport's socket
+   (unix: a temp-path AF_UNIX file; tcp: loopback host:port with the bcrypt
+   api-key auth); the transport's framer extracts, its bridge dispatches
    onto the handlers server, and the responses ride back encoded + framed.
    Every assertion reads a DECODED frame (the wire's bytes form), scanned by
    TYPE + REQ_ID — the handlers' suite's discipline, now over bytes on a
-   socket instead of an in-proc recording vector. */
+   socket instead of an in-proc recording vector. The TestClientApiUnix
+   suite (Task 5's) is unchanged; TestClientApiTcp (Task 6) rides the SAME
+   fixture machinery parameterized by transport. */
 
 #include <gtest/gtest.h>
 #include <atomic>
@@ -22,6 +25,8 @@
 extern "C" {
 #include "../src/ClientApi/Unix/unix_transport.h"
 #include "../src/ClientApi/Unix/unix_connection.h"
+#include "../src/ClientApi/Tcp/tcp_transport.h"
+#include "../src/ClientApi/Tcp/tcp_connection.h"
 #include "../src/ClientApi/client_api_wire.h"
 #include "../src/ClientApi/handlers.h"
 #include "../src/Network/stream_framer.h"
@@ -31,6 +36,7 @@ extern "C" {
 #include "../src/Streams/loop_thread.h"
 #include "../src/Platform/platform.h"
 #include "../src/Util/allocator.h"
+#include "../src/Util/bcrypt.h"
 #include "../src/Util/json.h"
 }
 
@@ -52,12 +58,16 @@ static frame_config_t test_config(void) {
 
 /* --- the in-proc fixture: pool + store + loop + server + TRANSPORT ---------- */
 
+#define FIXTURE_API_KEY "the-demo-api-key"
+
 typedef struct {
   scheduler_pool_t* pool;
   streams_loop_thread_t* loop;
   wave_database_root_t* db;
   ca_session_server_t* server;
-  unix_transport_t* transport;
+  unix_transport_t* transport;   /* set = the unix variant (Task 5) */
+  tcp_transport_t* tcp_transport;   /* set = the TCP variant (Task 6) */
+  platform_address_t tcp_addr;   /* the TCP transport's bound address */
   frame_config_t cfg;
   char socket_path[128];
   char dir_path[120];
@@ -66,7 +76,7 @@ typedef struct {
 /* 0 = set up; nonzero = which step failed. cfg's model_base_url stays NULL:
    a frame WITHOUT the shared backend builds a NULL default backend and its
    engine fails fast, deterministic and network-free. */
-static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
+static int fixture_setup_common(fixture_t* fx, model_backend_t* shared_backend) {
   memset(fx, 0, sizeof(*fx));
   fx->cfg = test_config();
   fx->pool = scheduler_pool_create(2);
@@ -84,18 +94,40 @@ static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
                                         shared_backend);
   if (fx->server == NULL) return -4;
 
-  /* the temp-path socket (the socket's file permission is the auth — the
-     test runs it under the process's own umask, no chmod dance) */
   char tmpl[] = "/tmp/sa-ca5-XXXXXX";
   char* dir = mkdtemp(tmpl);
   if (dir == NULL) return -5;
   snprintf(fx->dir_path, sizeof(fx->dir_path), "%s", dir);
   snprintf(fx->socket_path, sizeof(fx->socket_path), "%s/serve.sock", dir);
+  return 0;
+}
+
+/* The UNIX variant: the socket file's permission is the auth (no key). */
+static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
+  int rc = fixture_setup_common(fx, shared_backend);
+  if (rc != 0) return rc;
 
   fx->transport = unix_transport_create(fx->pool, fx->server,
                                         fx->socket_path);
   if (fx->transport == NULL) return -6;
   unix_transport_start(fx->transport);
+  return 0;
+}
+
+/* The TCP variant: the loopback listener with a bcrypt-hashed api key (cost
+   4 — the exchange runs 2^4 rounds, milliseconds, and the WRONG-key
+   refusal's latency budget in the tests stays honest). The transport binds
+   port 0 and reports the bound address back (create's out_addr param). */
+static int fixture_setup_tcp(fixture_t* fx, model_backend_t* shared_backend) {
+  int rc = fixture_setup_common(fx, shared_backend);
+  if (rc != 0) return rc;
+
+  char hash[64];
+  if (bcrypt_generate(FIXTURE_API_KEY, 4, hash, sizeof(hash)) != 0) return -7;
+  fx->tcp_transport = tcp_transport_create(fx->pool, fx->server,
+                                           "127.0.0.1", 0, hash, &fx->tcp_addr);
+  if (fx->tcp_transport == NULL) return -6;
+  tcp_transport_start(fx->tcp_transport);
   return 0;
 }
 
@@ -107,17 +139,24 @@ static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
    and the loop dies last. The test client's socket is closed by the test
    body BEFORE this runs (the honest disconnect path — the hangup dispatch). */
 static void fixture_teardown(fixture_t* fx) {
-  unix_transport_destroy(fx->transport);
+  if (fx->transport != NULL) {
+    unix_transport_destroy(fx->transport);
+  }
+  if (fx->tcp_transport != NULL) {
+    tcp_transport_destroy(fx->tcp_transport);
+  }
   ca_session_server_destroy(fx->server);
   scheduler_pool_stop(fx->pool);
   wave_db_close(fx->db);
   scheduler_pool_destroy(fx->pool);
   streams_loop_destroy(fx->loop);
-  unlink(fx->socket_path);   /* the transport unlinked it already; idempotent */
+  unlink(fx->socket_path);   /* the unix transport unlinked it already;
+                                idempotent (and a TCP teardown is a no-op) */
   rmdir(fx->dir_path);
 }
 
-/* --- the raw AF_UNIX client double ------------------------------------------ */
+/* --- the raw client double (transport-agnostic: reads/sends/recording run
+       the test thread for BOTH connect forms below) ------------------------- */
 
 typedef struct client_frame_t {
   uint64_t type;
@@ -125,16 +164,16 @@ typedef struct client_frame_t {
   std::vector<uint8_t> bytes;
 } client_frame_t;
 
-typedef struct unix_client_t {
+typedef struct test_client_t {
   platform_socket_t* sock;
   stream_framer_t* framer;
   std::vector<client_frame_t> frames;   /* the test thread's own recording —
                                            reads and sends both run the test
                                            thread; no lock */
   int dead;                             /* set on HANGUP (a 0-length read) */
-} unix_client_t;
+} test_client_t;
 
-static int client_connect(unix_client_t* c, const char* path) {
+static int client_connect(test_client_t* c, const char* path) {
   c->sock = NULL;
   c->framer = NULL;
   c->frames.clear();
@@ -157,7 +196,40 @@ static int client_connect(unix_client_t* c, const char* path) {
   return 0;
 }
 
-static void client_close(unix_client_t* c) {
+/* The TCP variant of the same double: a loopback TCP connection. */
+static int client_connect_tcp(test_client_t* c, const char* host,
+                              uint16_t port) {
+  c->sock = NULL;
+  c->framer = NULL;
+  c->frames.clear();
+  c->dead = 0;
+  c->sock = platform_socket_create(PLATFORM_AF_INET, 1);
+  if (c->sock == NULL) return -1;
+  platform_address_t addr;
+  memset(&addr, 0, sizeof(addr));
+  if (platform_address_parse(&addr, host, port) != 0) {
+    platform_socket_destroy(c->sock);
+    c->sock = NULL;
+    return -1;
+  }
+  if (platform_socket_connect(c->sock, &addr) != 0) {
+    platform_socket_destroy(c->sock);
+    c->sock = NULL;
+    return -1;
+  }
+  platform_socket_set_nonblocking(c->sock);
+  c->framer = stream_framer_create();
+  return 0;
+}
+
+/* The bound port the transport reports back (port 0 rides out as the real
+   port in create's out_addr; the family may be the dual-stack v6). */
+static uint16_t fixture_tcp_port(const fixture_t* fx) {
+  return (fx->tcp_addr.family == PLATFORM_AF_INET6) ? fx->tcp_addr.inet6.port
+                                                    : fx->tcp_addr.inet.port;
+}
+
+static void client_close(test_client_t* c) {
   if (c == NULL) return;
   if (c->framer != NULL) {
     stream_framer_destroy(c->framer);
@@ -171,7 +243,7 @@ static void client_close(unix_client_t* c) {
 
 /* Encode + frame + SEND ALL (a short unix-socket send drains fully long
    before our frames approach any buffer's size — refused loud if not). */
-static int client_send_frame(unix_client_t* c, uint64_t type, void* payload) {
+static int client_send_frame(test_client_t* c, uint64_t type, void* payload) {
   uint8_t* raw = NULL;
   size_t len = 0;
   if (ca_wire_encode(type, payload, &raw, &len) != 0) {
@@ -201,7 +273,7 @@ static int client_send_frame(unix_client_t* c, uint64_t type, void* payload) {
    recording (raw bytes kept; decoded on demand by the scans). Returns 1 = at
    least one frame recorded, 0 = quiet, -1 = hangup (or garbage: the server
    sent something the wire refuses — refuses loud, dead). */
-static int client_pump(unix_client_t* c) {
+static int client_pump(test_client_t* c) {
   if (c == NULL || c->sock == NULL) return -1;
   for (;;) {
     uint8_t buf[16384];
@@ -254,7 +326,7 @@ static int client_pump(unix_client_t* c) {
 /* Pump until a NEW recorded frame matches the filter (type + req_id). The
    read loop is the test's ONLY reader — frames land in order, so matching by
    req_id + expected type races nothing. Returns the frame's INDEX. */
-static int client_wait_frame(unix_client_t* c, uint64_t want_type,
+static int client_wait_frame(test_client_t* c, uint64_t want_type,
                              uint64_t want_req_id, size_t* out_index,
                              int rounds) {
   for (int i = 0; i < rounds; i++) {
@@ -272,7 +344,7 @@ static int client_wait_frame(unix_client_t* c, uint64_t want_type,
 }
 
 /* Decode recorded frame `idx` (a local COPY of its bytes). */
-static bool client_decode(unix_client_t* c, size_t idx, uint64_t* type,
+static bool client_decode(test_client_t* c, size_t idx, uint64_t* type,
                           void** payload, uint64_t* req_id, uint8_t* status) {
   if (idx >= c->frames.size()) return false;
   std::vector<uint8_t> bytes = c->frames[idx].bytes;
@@ -320,9 +392,54 @@ static ca_sessions_request_t* sessions_req_heap(uint64_t req_id) {
   return req;
 }
 
+static ca_auth_request_t* auth_req_heap(uint64_t req_id, const char* key) {
+  ca_auth_request_t* req =
+      (ca_auth_request_t*)get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
+  req->api_key = strdup(key);
+  return req;
+}
+
+/* The TCP suite's auth exchange (the tcp_connection.c shape): send the AUTH
+   pair, wait the response, return its status (0 = authenticated, 1 = bad
+   key; -1 = the response never arrived or would not decode). */
+static int client_authenticate(test_client_t* c, uint64_t req_id,
+                               const char* key) {
+  ca_auth_request_t* req = auth_req_heap(req_id, key);
+  if (client_send_frame(c, CA_AUTH_REQUEST, req) != 0) {
+    ca_wire_payload_destroy(CA_AUTH_REQUEST, req);
+    return -1;
+  }
+  ca_wire_payload_destroy(CA_AUTH_REQUEST, req);
+
+  size_t idx = 0;
+  if (client_wait_frame(c, CA_AUTH_RESPONSE, req_id, &idx, 600) != 1) {
+    return -1;
+  }
+  uint64_t t = 0, rid = 0;
+  void* p = NULL;
+  uint8_t st = 0;
+  if (!client_decode(c, idx, &t, &p, &rid, &st)) return -1;
+  ca_auth_response_t* res = (ca_auth_response_t*)p;
+  int status = res->status;
+  ca_wire_payload_destroy(CA_AUTH_RESPONSE, p);
+  return status;
+}
+
+/* Pump until the peer closes (recv 0 / error). The graceful close's pin:
+   the refused connection's socket EOFs shortly after its final frame. */
+static bool client_wait_dead(test_client_t* c, int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    client_pump(c);
+    if (c->dead) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return false;
+}
+
 /* A no-sid prompt's create+start over the socket; waits the response and
    returns the sid ("" on failure — the caller ASSERTs the frame first). */
-static std::string prompt_create_sid(unix_client_t* c, uint64_t req_id,
+static std::string prompt_create_sid(test_client_t* c, uint64_t req_id,
                                      const char* goal) {
   ca_prompt_request_t* req =
       prompt_req_heap(req_id, NULL, goal);   /* NULL sid = create+start */
@@ -354,7 +471,7 @@ struct chan_ev_t {
   std::string steer_content; /* the msg.append user content, else "" */
 };
 
-static std::vector<chan_ev_t> client_channel(unix_client_t* c,
+static std::vector<chan_ev_t> client_channel(test_client_t* c,
                                              uint64_t want_req_id) {
   std::vector<chan_ev_t> out;
   std::vector<std::vector<uint8_t>> candidates;
@@ -401,7 +518,7 @@ static std::vector<chan_ev_t> client_channel(unix_client_t* c,
 }
 
 /* The marker's op echo needs the decoded status — scan the recorded raws. */
-static bool chan_marker_op_seen(unix_client_t* c, uint64_t want_req_id,
+static bool chan_marker_op_seen(test_client_t* c, uint64_t want_req_id,
                                 uint8_t want_op) {
   for (size_t j = 0; j < c->frames.size(); j++) {
     if (c->frames[j].type != (uint64_t)CA_EVENTS_RESPONSE ||
@@ -420,7 +537,7 @@ static bool chan_marker_op_seen(unix_client_t* c, uint64_t want_req_id,
   return false;
 }
 
-static bool chan_wait_marker(unix_client_t* c, uint64_t want_req_id,
+static bool chan_wait_marker(test_client_t* c, uint64_t want_req_id,
                              uint8_t want_op, int rounds) {
   for (int i = 0; i < rounds; i++) {
     client_pump(c);
@@ -433,7 +550,7 @@ static bool chan_wait_marker(unix_client_t* c, uint64_t want_req_id,
 
 /* Waits until the channel delivers ONE msg.append user record whose content
    is `text`. */
-static bool chan_wait_text(unix_client_t* c, uint64_t want_req_id,
+static bool chan_wait_text(test_client_t* c, uint64_t want_req_id,
                            const char* text, int rounds) {
   for (int i = 0; i < rounds; i++) {
     client_pump(c);
@@ -537,7 +654,7 @@ static int unix_scripted_complete(void* self, json_value_t* messages,
 TEST(TestClientApiUnix, TestPromptRoundTripCreatesARealFrame) {
   fixture_t fx;
   ASSERT_EQ(fixture_setup(&fx, NULL), 0);
-  unix_client_t client;
+  test_client_t client;
   ASSERT_EQ(client_connect(&client, fx.socket_path), 0);
 
   std::string sid = prompt_create_sid(&client, 7, "make the thing");
@@ -574,7 +691,7 @@ TEST(TestClientApiUnix, TestPromptRoundTripCreatesARealFrame) {
 TEST(TestClientApiUnix, TestSteerAndEventsStreamThroughTheSocket) {
   fixture_t fx;
   ASSERT_EQ(fixture_setup(&fx, NULL), 0);
-  unix_client_t client;
+  test_client_t client;
   ASSERT_EQ(client_connect(&client, fx.socket_path), 0);
 
   std::string sid = prompt_create_sid(&client, 1, "steer me");
@@ -649,7 +766,7 @@ TEST(TestClientApiUnix, TestSteerAndEventsStreamThroughTheSocket) {
 TEST(TestClientApiUnix, TestUnknownSidAndMalformedFrameRefuseLoud) {
   fixture_t fx;
   ASSERT_EQ(fixture_setup(&fx, NULL), 0);
-  unix_client_t client;
+  test_client_t client;
   ASSERT_EQ(client_connect(&client, fx.socket_path), 0);
 
   const char* ghost = "sessions/0000000000000000000deadbeef";
@@ -728,7 +845,7 @@ TEST(TestClientApiUnix, TestUnknownSidAndMalformedFrameRefuseLoud) {
 TEST(TestClientApiUnix, TestConnCloseMidReplayPurges) {
   fixture_t fx;
   ASSERT_EQ(fixture_setup(&fx, NULL), 0);
-  unix_client_t a, b;
+  test_client_t a, b;
   ASSERT_EQ(client_connect(&a, fx.socket_path), 0);
 
   std::string sid = prompt_create_sid(&a, 1, "the replay purge");
@@ -779,6 +896,114 @@ TEST(TestClientApiUnix, TestConnCloseMidReplayPurges) {
   fixture_teardown(&fx);
 }
 
+/* --- the TCP suite (Task 6): the SAME stack over loopback TCP, behind the
+   bcrypt api-key auth — the unix suite's fixture + client double, the AUTH
+   pair opening every connection --------------------------------------------- */
+
+/* FAIL-LOUD pin: the transport refuses a NULL or empty key hash at create —
+   no unauthenticated TCP, ever (unix leans on file permissions; TCP cannot). */
+TEST(TestClientApiTcp, TestTransportRefusesToStartWithoutAKey) {
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_common(&fx, NULL), 0);
+  EXPECT_EQ(tcp_transport_create(fx.pool, fx.server, "127.0.0.1", 0, NULL,
+                                 NULL), nullptr)
+      << "the NULL key hash refuses";
+  EXPECT_EQ(tcp_transport_create(fx.pool, fx.server, "127.0.0.1", 0, "",
+                                 NULL), nullptr)
+      << "the empty key hash refuses the same way";
+  fixture_teardown(&fx);
+}
+
+TEST(TestClientApiTcp, TestAuthedPromptRoundTripOverTcp) {
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_tcp(&fx, NULL), 0);
+  test_client_t client;
+  ASSERT_EQ(client_connect_tcp(&client, "127.0.0.1", fixture_tcp_port(&fx)), 0);
+
+  /* the AUTH pair opens the conversation; the right key authenticates */
+  ASSERT_EQ(client_authenticate(&client, 1, FIXTURE_API_KEY), 0)
+      << "the right key's response carries status 0";
+
+  std::string sid = prompt_create_sid(&client, 7, "make the tcp thing");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u)
+      << "the wire's response carries the frame's sid";
+  EXPECT_NE(ca_session_server_frame(fx.server, sid.c_str()), nullptr)
+      << "the real frame in the real store";
+
+  client_close(&client);
+  fixture_teardown(&fx);
+}
+
+/* THE AUTH STATE'S ENFORCEMENT: a non-AUTH first frame is refused loud —
+   one CA_ERROR echoing the refused request's req_id — and the connection
+   CLOSES. THE GRACEFUL-CLOSE PATH'S FIRST REAL CALLER: TCP_CONNECTION_CLOSE
+   rides out behind the error's write and tears the connection down (the
+   client's EOF is the pin); before this slice its only callers were the
+   teardown passes and the socket-error paths (CA5's recorded untested
+   entry point). */
+TEST(TestClientApiTcp, TestPromptBeforeAuthRefusedLoudAndClosed) {
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_tcp(&fx, NULL), 0);
+  test_client_t client;
+  ASSERT_EQ(client_connect_tcp(&client, "127.0.0.1", fixture_tcp_port(&fx)), 0);
+
+  ca_prompt_request_t* req = prompt_req_heap(5, NULL, "sneaking in");
+  ASSERT_EQ(client_send_frame(&client, CA_PROMPT_REQUEST, req), 0);
+  ca_wire_payload_destroy(CA_PROMPT_REQUEST, req);
+
+  size_t idx = 0;
+  ASSERT_EQ(client_wait_frame(&client, CA_ERROR, 5, &idx, 600), 1)
+      << "the pre-auth refusal answers the echoed req_id";
+  uint64_t t = 0, rid = 0;
+  void* p = NULL;
+  uint8_t st = 0;
+  ASSERT_TRUE(client_decode(&client, idx, &t, &p, &rid, &st));
+  ASSERT_EQ(t, (uint64_t)CA_ERROR);
+  ASSERT_EQ(rid, 5u);
+  ca_error_t* err = (ca_error_t*)p;
+  ASSERT_NE(err->text, nullptr);
+  EXPECT_STREQ(err->text, "authentication required");
+  EXPECT_EQ(err->status, 1u);
+  ca_wire_payload_destroy(CA_ERROR, p);
+
+  EXPECT_TRUE(client_wait_dead(&client, 600))
+      << "the connection closes after the pre-auth refusal";
+
+  client_close(&client);
+  fixture_teardown(&fx);
+}
+
+TEST(TestClientApiTcp, TestWrongKeyAnswersStatusOneAndCloses) {
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_tcp(&fx, NULL), 0);
+  test_client_t client;
+  ASSERT_EQ(client_connect_tcp(&client, "127.0.0.1", fixture_tcp_port(&fx)), 0);
+
+  /* the wrong key: the AUTH RESPONSE with status 1, then the close */
+  ca_auth_request_t* wrong = auth_req_heap(3, "not-the-key");
+  ASSERT_EQ(client_send_frame(&client, CA_AUTH_REQUEST, wrong), 0);
+  ca_wire_payload_destroy(CA_AUTH_REQUEST, wrong);
+
+  size_t idx = 0;
+  ASSERT_EQ(client_wait_frame(&client, CA_AUTH_RESPONSE, 3, &idx, 600), 1)
+      << "the auth pair's response frame";
+  uint64_t t = 0, rid = 0;
+  void* p = NULL;
+  uint8_t st = 0;
+  ASSERT_TRUE(client_decode(&client, idx, &t, &p, &rid, &st));
+  ASSERT_EQ(t, (uint64_t)CA_AUTH_RESPONSE);
+  ASSERT_EQ(rid, 3u);
+  ca_auth_response_t* res = (ca_auth_response_t*)p;
+  EXPECT_EQ(res->status, 1u) << "the bad key's status";
+  ca_wire_payload_destroy(CA_AUTH_RESPONSE, p);
+
+  EXPECT_TRUE(client_wait_dead(&client, 600))
+      << "the connection closes after the bad-key response";
+
+  client_close(&client);
+  fixture_teardown(&fx);
+}
+
 #if defined(SA_HAS_PYTHON)
 
 /* test_client_api_handlers.cpp's same shape: py_agent_init through a bare
@@ -803,7 +1028,7 @@ TEST(TestClientApiUnix, TestInterruptPostsOverTheSocket) {
 
   fixture_t fx;
   ASSERT_EQ(fixture_setup(&fx, &sm.base), 0);
-  unix_client_t client;
+  test_client_t client;
   ASSERT_EQ(client_connect(&client, fx.socket_path), 0);
 
   std::string sid = prompt_create_sid(&client, 1, "interrupt me");

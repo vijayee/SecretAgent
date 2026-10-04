@@ -94,11 +94,13 @@ if (BUILD_TESTING)
       if(SA_HAS_STREAMS)
         target_sources(testsecretagent PRIVATE test_client_api_handlers.cpp)
       endif()
-      # The client-api unix transport's suite (Task 5): the socket carrier
-      # needs everything the handlers' suite does (the wire's libcbor + the
-      # loop thread's poll-dancer) plus the framer — the same BOTH gate.
+      # The client-api TRANSPORTS' suite (Tasks 5 + 6, one file for both
+      # transports): the socket carriers need everything the handlers' suite
+      # does (the wire's libcbor + the loop thread's poll-dancer) plus the
+      # framer and the bcrypt machinery — the same BOTH gate.
       if(SA_HAS_STREAMS)
-        target_sources(testsecretagent PRIVATE test_client_api_unix.cpp)
+        target_sources(testsecretagent PRIVATE
+                       test_client_api_transports.cpp)
       endif()
       # The refine slice rides the same WDB gate as test_frame (its types live
       # on frame.h's surface); the review-call tests also need the streams

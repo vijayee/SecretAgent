@@ -68,6 +68,13 @@ platform_socket_t* platform_listen_socket_create(const char* host, uint16_t port
 int platform_socket_listen(platform_socket_t* sock, int backlog);
 platform_socket_t* platform_socket_accept(platform_socket_t* sock, platform_address_t* remote);
 
+/* The socket's BOUND address (getsockname) — what a port-0 listener binds
+ * for real (the listen helper's out_addr reports the REQUESTED address only,
+ * so a port-0 caller learns the real port here). Socket-family addresses
+ * only (/inet/, /inet6/); a pipe-backed or local socket refuses (-1). */
+int platform_socket_bound_address(platform_socket_t* sock,
+                                  platform_address_t* out);
+
 /* Client */
 int platform_socket_connect(platform_socket_t* sock, const platform_address_t* addr);
 

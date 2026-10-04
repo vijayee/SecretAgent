@@ -390,3 +390,90 @@ TEST(TestClientApiWire, TestUnknownWellFormedTypeRefuses) {
     free(raw);
   }
 }
+/* The AUTH pair (Task 6 / the TCP transport's first exchange): [12, req_id,
+   api_key] and its [13, req_id, status] response — the same req_id duality
+   every other request carries, the same pairing rule (13 = 12 + 1, the
+   compile-time assert), and bcrypt-key field bounds. */
+TEST(TestClientApiWire, TestAuthPairRoundTrip) {
+  /* the request: a presented key round-trips; a request's status out is 0 */
+  ca_auth_request_t req = {0};
+  char key_buf[] = "a-presented-key";
+  req.req_id = 21;
+  req.api_key = key_buf;
+  uint8_t* raw = NULL;
+  size_t raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_AUTH_REQUEST, &req, &raw, &raw_len), 0);
+
+  uint64_t type = 0;
+  void* payload = NULL;
+  uint64_t req_id = 0;
+  uint8_t status = 0;
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_AUTH_REQUEST);
+  EXPECT_EQ(req_id, 21u);
+  EXPECT_EQ(status, 0u) << "a request carries no status";
+  ca_auth_request_t* back = (ca_auth_request_t*)payload;
+  ASSERT_NE(back, nullptr);
+  EXPECT_STREQ(back->api_key, "a-presented-key");
+  ca_wire_payload_destroy(CA_AUTH_REQUEST, back);
+  free(raw);
+
+  /* the response: status 1 = bad key (the connection closes after it); the
+     response's status rides the decode's status out like every response's */
+  ca_auth_response_t res = {0};
+  res.req_id = 21;
+  res.status = 1;
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_AUTH_RESPONSE, &res, &raw, &raw_len), 0);
+  type = 0;
+  payload = NULL;
+  req_id = 0;
+  status = 0;
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_AUTH_RESPONSE);
+  EXPECT_EQ(req_id, 21u);
+  EXPECT_EQ(status, 1u);
+  ca_auth_response_t* res_back = (ca_auth_response_t*)payload;
+  ASSERT_NE(res_back, nullptr);
+  EXPECT_EQ(res_back->status, 1u);
+  ca_wire_payload_destroy(CA_AUTH_RESPONSE, res_back);
+  free(raw);
+
+  /* the bounds: an EMPTY key refuses ("" is the absent sentinel on this
+     wire and an auth request's key is never absent) */
+  ca_auth_request_t absent = {0};
+  absent.req_id = 4;
+  char empty_buf[1] = "";
+  absent.api_key = empty_buf;
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_AUTH_REQUEST, &absent, &raw, &raw_len), 0);
+  type = 0;
+  payload = NULL;
+  req_id = 0;
+  status = 0;
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  /* the bounds: an over-bound key refuses loud */
+  std::string big(CA_WIRE_KEY_MAX + 1, 'k');
+  ca_auth_request_t oversized = {0};
+  oversized.req_id = 5;
+  oversized.api_key = &big[0];
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_AUTH_REQUEST, &oversized, &raw, &raw_len), 0);
+  type = 0;
+  payload = NULL;
+  req_id = 0;
+  status = 0;
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+}

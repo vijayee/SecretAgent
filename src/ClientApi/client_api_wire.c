@@ -209,6 +209,26 @@ static cbor_item_t* _encode_error(const ca_error_t* err) {
   return array;
 }
 
+/* [12, req_id, api_key] */
+static cbor_item_t* _encode_auth_request(const ca_auth_request_t* req) {
+  cbor_item_t* array = cbor_new_definite_array(3);
+
+  _push_u8(array, CA_AUTH_REQUEST);
+  _push_u64(array, req->req_id);
+  _push_string(array, req->api_key);
+  return array;
+}
+
+/* [13, req_id, status] */
+static cbor_item_t* _encode_auth_response(const ca_auth_response_t* res) {
+  cbor_item_t* array = cbor_new_definite_array(3);
+
+  _push_u8(array, CA_AUTH_RESPONSE);
+  _push_u64(array, res->req_id);
+  _push_u8(array, res->status);
+  return array;
+}
+
 /* ---- per-type decoders: total-or-refusal — on ANY refusal the
    partially-built payload is destroyed here (never a partial payload, never
    a leak); *payload fills on success only ---- */
@@ -538,6 +558,51 @@ static int _decode_error(cbor_item_t* frame, uint64_t req_id,
   return 0;
 }
 
+/* [12, req_id, api_key] — the key is a non-empty bounded text string (the
+   "" sentinel is the ABSENT marker on this wire; an auth request's key is
+   never absent, so "" refuses here like every other required field) */
+static int _decode_auth_request(cbor_item_t* frame, uint64_t req_id,
+                                void** payload) {
+  ca_auth_request_t* req;
+  cbor_item_t* item;
+  int rc;
+
+  if (cbor_array_size(frame) != 3) return -1;
+  req = get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
+  item = cbor_array_get(frame, 2);
+  rc = item == NULL ? -1 : 0;
+  if (rc == 0) req->api_key = _decode_string(item, CA_WIRE_KEY_MAX);
+  cbor_decref(&item);
+  if (rc != 0 || req->api_key == NULL) {
+    ca_wire_payload_destroy(CA_AUTH_REQUEST, req);
+    return -1;
+  }
+  *payload = req;
+  return 0;
+}
+
+/* [13, req_id, status] */
+static int _decode_auth_response(cbor_item_t* frame, uint64_t req_id,
+                                 void** payload) {
+  ca_auth_response_t* res;
+  cbor_item_t* item;
+  int rc;
+
+  if (cbor_array_size(frame) != 3) return -1;
+  res = get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
+  item = cbor_array_get(frame, 2);
+  rc = item == NULL ? -1 : _decode_u8(item, &res->status);
+  cbor_decref(&item);
+  if (rc != 0) {
+    ca_wire_payload_destroy(CA_AUTH_RESPONSE, res);
+    return -1;
+  }
+  *payload = res;
+  return 0;
+}
+
 static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
                          uint64_t* req_id, uint8_t* status) {
   cbor_item_t* item;
@@ -593,6 +658,14 @@ static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
       rc = _decode_error(frame, *req_id, payload);
       if (rc == 0) *status = ((ca_error_t*)*payload)->status;
       break;
+    case CA_AUTH_REQUEST:
+      rc = _decode_auth_request(frame, *req_id, payload);
+      if (rc == 0) *status = 0;
+      break;
+    case CA_AUTH_RESPONSE:
+      rc = _decode_auth_response(frame, *req_id, payload);
+      if (rc == 0) *status = ((ca_auth_response_t*)*payload)->status;
+      break;
     default:
       return -1;   /* the closed vocabulary: an unknown type refuses loud */
   }
@@ -641,6 +714,12 @@ int ca_wire_encode(uint64_t type, void* payload, uint8_t** out,
       break;
     case CA_ERROR:
       frame = _encode_error((const ca_error_t*)payload);
+      break;
+    case CA_AUTH_REQUEST:
+      frame = _encode_auth_request((const ca_auth_request_t*)payload);
+      break;
+    case CA_AUTH_RESPONSE:
+      frame = _encode_auth_response((const ca_auth_response_t*)payload);
       break;
     default:
       return -1;   /* the closed vocabulary: an unknown type refuses loud */
@@ -746,6 +825,21 @@ void ca_wire_payload_destroy(uint64_t type, void* payload) {
       ca_error_t* err = (ca_error_t*)payload;
       free(err->text);
       free(err);
+      break;
+    }
+    case CA_AUTH_REQUEST: {
+      /* liboffs's client_api_auth_request_destroy shape: the key's memory is
+         scrubbed before its free — a presented key never lingers. */
+      ca_auth_request_t* req = (ca_auth_request_t*)payload;
+      if (req->api_key != NULL) {
+        memset(req->api_key, 0, strlen(req->api_key));
+        free(req->api_key);
+      }
+      free(req);
+      break;
+    }
+    case CA_AUTH_RESPONSE: {
+      free(payload);
       break;
     }
     default:

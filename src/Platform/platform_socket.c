@@ -247,6 +247,32 @@
     return connect(sock->fd, (struct sockaddr*)&storage, addrlen);
   }
 
+  int platform_socket_bound_address(platform_socket_t* sock,
+                                    platform_address_t* out) {
+    struct sockaddr_storage storage;
+    socklen_t addrlen = sizeof(storage);
+    if (getsockname(sock->fd, (struct sockaddr*)&storage, &addrlen) != 0) {
+      return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (storage.ss_family == AF_INET) {
+      struct sockaddr_in* sin = (struct sockaddr_in*)&storage;
+      out->family = PLATFORM_AF_INET;
+      out->inet.addr = sin->sin_addr.s_addr;
+      out->inet.port = ntohs(sin->sin_port);
+      return 0;
+    }
+    if (storage.ss_family == AF_INET6) {
+      struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&storage;
+      out->family = PLATFORM_AF_INET6;
+      memcpy(out->inet6.addr, &sin6->sin6_addr, 16);
+      out->inet6.port = ntohs(sin6->sin6_port);
+      out->inet6.scope_id = sin6->sin6_scope_id;
+      return 0;
+    }
+    return -1;
+  }
+
   int platform_socket_set_nonblocking(platform_socket_t* sock) {
     int flags = fcntl(sock->fd, F_GETFL, 0);
     if (flags < 0) {
@@ -643,6 +669,34 @@
       return -1;
     }
     return connect(sock->fd, (struct sockaddr*)&storage, addrlen) == 0 ? 0 : -1;
+  }
+
+  int platform_socket_bound_address(platform_socket_t* sock,
+                                    platform_address_t* out) {
+    if (sock == NULL || sock->is_pipe || out == NULL) return -1;
+    struct sockaddr_storage storage;
+    socklen_t addrlen = sizeof(storage);
+    if (getsockname(sock->fd, (struct sockaddr*)&storage, &addrlen) != 0) {
+      errno = _wsaerr_to_errno(WSAGetLastError());
+      return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (storage.ss_family == AF_INET) {
+      struct sockaddr_in* sin = (struct sockaddr_in*)&storage;
+      out->family = PLATFORM_AF_INET;
+      out->inet.addr = sin->sin_addr.s_addr;
+      out->inet.port = ntohs(sin->sin_port);
+      return 0;
+    }
+    if (storage.ss_family == AF_INET6) {
+      struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&storage;
+      out->family = PLATFORM_AF_INET6;
+      memcpy(out->inet6.addr, &sin6->sin6_addr, 16);
+      out->inet6.port = ntohs(sin6->sin6_port);
+      out->inet6.scope_id = sin6->sin6_scope_id;
+      return 0;
+    }
+    return -1;
   }
 
   int platform_socket_set_nonblocking(platform_socket_t* sock) {

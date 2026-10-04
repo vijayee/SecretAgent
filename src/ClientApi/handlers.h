@@ -92,7 +92,8 @@ typedef struct ca_session_server_t ca_session_server_t;
 /* All borrowed: the root (frames open subtrees on it), the pool (the
    server's actor + every api-created frame attach — a POOLED frame requires
    a POOLED store: open the root with wave_db_open_config on the SAME pool),
-   the loop (the transports + the server share ONE loop thread).
+   the loop (the server's ONE marshal loop — each transport runs its own
+   poll-dancer accept/IO pd loop and marshals onto this one).
    frame_cfg = the created frames' template, copied by value; its TEXT
    members are borrowed from the caller (frame_create dups its own per
    frame), and its `pool` member is OVERWRITTEN with the server's pool
