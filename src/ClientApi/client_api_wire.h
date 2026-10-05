@@ -48,7 +48,16 @@
                              other field on this wire is text)
    CA_AUTH_RESPONSE     13: [13, req_id, status] — 0 = the connection is
                              authenticated; 1 = bad key (the connection
-                             CLOSES after a bad-key response) */
+                             CLOSES after a bad-key response)
+   CA_CONFIG_REQUEST    14: [14, req_id, base_url, api_key, model] — the
+                             frame-config template's get/set (the session
+                             server's frame_create source; "" = absent =
+                             keep on EVERY field, so the all-"" shape —
+                             and the 2-element form [14, req_id] — is the
+                             GET; any present field makes it a SET)
+   CA_CONFIG_RESPONSE   15: [15, req_id, status, base_url, api_key, model]
+                             — the GET's answer ("" = absent) and the SET's
+                             status-0 echo of the post-set template */
 #define CA_PROMPT_REQUEST     1
 #define CA_PROMPT_RESPONSE    2
 #define CA_EVENTS_REQUEST     3
@@ -60,6 +69,8 @@
 #define CA_ERROR              11
 #define CA_AUTH_REQUEST       12
 #define CA_AUTH_RESPONSE      13
+#define CA_CONFIG_REQUEST     14
+#define CA_CONFIG_RESPONSE    15
 
 #if defined(__cplusplus)
 #define CA_STATIC_ASSERT static_assert
@@ -81,6 +92,12 @@ CA_STATIC_ASSERT(CA_SESSIONS_RESPONSE == CA_SESSIONS_REQUEST + 1,
                  "sessions response must be sessions request + 1");
 CA_STATIC_ASSERT(CA_AUTH_RESPONSE == CA_AUTH_REQUEST + 1,
                  "auth response must be auth request + 1");
+CA_STATIC_ASSERT(CA_CONFIG_RESPONSE == CA_CONFIG_REQUEST + 1,
+                 "config response must be config request + 1");
+CA_STATIC_ASSERT(CA_CONFIG_REQUEST == CA_AUTH_RESPONSE + 1,
+                 "config request joins the vocabulary's adjacency — a "
+                 "renumber that collides with the ERROR 11 / AUTH 12-13 "
+                 "numbers fails here at compile time");
 
 /* The wire's field bounds (each decoder refuses over-bound strings loud —
    the caller answers CA_ERROR):
@@ -95,7 +112,10 @@ CA_STATIC_ASSERT(CA_AUTH_RESPONSE == CA_AUTH_REQUEST + 1,
 #define CA_WIRE_RECORD_MAX (128u * 1024u)
 #define CA_WIRE_SESSIONS_MAX 256u
 #define CA_WIRE_KEY_MAX 256u   /* an auth request's api_key (bcrypt keys are
-                                  ~60 chars; 256 is generous headroom) */
+                                  ~60 chars; 256 is generous headroom) — the
+                                  CONFIG pair's api_key reuses this bound */
+#define CA_WIRE_CONFIG_TEXT_MAX 512u   /* a CONFIG set's base_url */
+#define CA_WIRE_CONFIG_TAG_MAX 128u    /* a CONFIG set's model tag */
 #define CA_WIRE_REQ_ID_MAX UINT64_MAX
 
 /* --- the payload types (plain C structs; the destroy frees their heap
@@ -187,6 +207,33 @@ typedef struct ca_auth_response_t {
   uint8_t status;   /* 0 = authenticated; 1 = bad key (the connection
                        closes after this frame) */
 } ca_auth_response_t;
+
+/* The CONFIG pair (the settings surface): the session server's frame-config
+   template {base_url, api_key, model} travels the wire. The ALL-ABSENT
+   request (every field NULL — the 2-element [14, req_id] form, or the
+   5-element form with every "" sentinel) is the GET; any present field
+   makes it a SET that mutates only the present ones (absent = unchanged;
+   the template answers status 0 either way). The api_key rides the AUTH
+   pair's scrub discipline: the decode records the string's byte length and
+   the destroy scrubs by it before the free (strlen would stop at the first
+   embedded NUL a CBOR string carried). */
+typedef struct ca_config_request_t {
+  uint64_t req_id;
+  char* base_url;   /* heap or NULL (absent = keep); CONFIG_TEXT bound */
+  char* api_key;    /* heap or NULL (absent = keep); KEY bound */
+  size_t key_len;   /* the key's DECODED byte length (the destroy's scrub
+                       count — set when api_key decoded, never by strlen) */
+  char* model;      /* heap or NULL (absent = keep); TAG bound */
+} ca_config_request_t;
+
+typedef struct ca_config_response_t {
+  uint64_t req_id;
+  uint8_t status;   /* 0 = the fields below are the template's truth */
+  char* base_url;   /* heap or NULL — the absent member rides the wire as "" */
+  char* api_key;    /* heap or NULL; the destroy scrubs by key_len */
+  size_t key_len;   /* the key's DECODED byte length (the scrub count) */
+  char* model;      /* heap or NULL */
+} ca_config_response_t;
 
 /* Encode one frame's payload into fresh CBOR bytes (cbor_serialize_alloc's
    buffer — free() it). The encoder is the TRUSTED side: field content is

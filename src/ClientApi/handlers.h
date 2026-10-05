@@ -94,9 +94,14 @@ typedef struct ca_session_server_t ca_session_server_t;
    a POOLED store: open the root with wave_db_open_config on the SAME pool),
    the loop (the server's ONE marshal loop — each transport runs its own
    poll-dancer accept/IO pd loop and marshals onto this one).
-   frame_cfg = the created frames' template, copied by value; its TEXT
-   members are borrowed from the caller (frame_create dups its own per
-   frame), and its `pool` member is OVERWRITTEN with the server's pool
+   frame_cfg = the created frames' template, copied by value; its three
+   TEXT members (model_base_url/model_api_key/model_name) are DUP'd at
+   create (the server OWNS them: the CA_CONFIG pair's set mutates the
+   template, so the caller's buffers can stay borrowed) — frame_create
+   still dups its OWN per-frame copies, which is why a RUNNING frame keeps
+   the config it was created with while new frames adopt the mutated
+   template; the destroy frees the template's copies; its `pool` member is
+   OVERWRITTEN with the server's pool
    (frames the API creates ride the API's pool, whatever the template said).
    shared_backend = BORROWED, may be NULL: when set, EVERY api-created frame
    is injected with it BEFORE frame_start (deterministic injection — a test

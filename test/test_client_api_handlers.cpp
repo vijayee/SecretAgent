@@ -64,10 +64,18 @@ typedef struct {
    model_base_url stays NULL: a frame WITHOUT the shared backend builds a
    NULL default backend and its engine fails fast, deterministic and
    network-free ("model-missing") — the steers/events machinery under test
-   never touches the engine's model path. */
-static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
+   never touches the engine's model path. The config suite's variant takes
+   the template's three text members explicitly (the CA_CONFIG pair's
+   get/set reads and mutates the daemon's truth); the default keeps the
+   borrowed "unused" model tag above. */
+static int fixture_setup_cfg(fixture_t* fx, model_backend_t* shared_backend,
+                             const char* base_url, const char* api_key,
+                             const char* model_name) {
   memset(fx, 0, sizeof(*fx));
   fx->cfg = test_config();
+  fx->cfg.model_base_url = base_url;
+  fx->cfg.model_api_key = api_key;
+  fx->cfg.model_name = model_name;
   fx->pool = scheduler_pool_create(2);
   if (fx->pool == NULL) return -1;
   scheduler_pool_start(fx->pool);
@@ -83,6 +91,10 @@ static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
                                         shared_backend);
   if (fx->server == NULL) return -4;
   return 0;
+}
+
+static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
+  return fixture_setup_cfg(fx, shared_backend, NULL, NULL, "unused");
 }
 
 /* The documented teardown order (handlers.h): the connections are closed by
@@ -230,6 +242,24 @@ static ca_sessions_request_t* sessions_req(uint64_t req_id) {
   ca_sessions_request_t* req =
       (ca_sessions_request_t*)get_clear_memory(sizeof(*req));
   req->req_id = req_id;
+  return req;
+}
+
+/* The CONFIG request builder: a NULL field rides the absent (keep) shape —
+   the all-NULL call is the GET. Ownership transfers into
+   ca_session_handle (the handler's closure destroys the payload). */
+static ca_config_request_t* config_req(uint64_t req_id, const char* base_url,
+                                       const char* api_key,
+                                       const char* model) {
+  ca_config_request_t* req =
+      (ca_config_request_t*)get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
+  if (base_url != NULL) req->base_url = strdup(base_url);
+  if (api_key != NULL) {
+    req->api_key = strdup(api_key);
+    req->key_len = strlen(api_key);
+  }
+  if (model != NULL) req->model = strdup(model);
   return req;
 }
 
@@ -1414,6 +1444,155 @@ TEST(TestClientApiHandlers, TestHoldGapFlushesRacingCommitsExactlyOnce) {
   EXPECT_EQ(b.refs.load(), 0);
   conn_double_destroy(&a);
   conn_double_destroy(&b);
+}
+
+/* --- the config pair's server pins ------------------------------------------ */
+
+/* The config get/set against the REAL session server: the template the
+   prompt path feeds frame_create is the truth the wire carries. */
+TEST(TestClientApiHandlers, TestConfigGetAndSetTheTemplate) {
+  /* GET → the response {status 0, base_url "", api_key "", model ""}
+     (the daemon's template defaults empty); SET {tag "gemma4"} → status 0,
+     GET → the tag rides; SET {base_url, api_key, tag} all → GET carries
+     all; a RUNNING frame keeps its model — the frame is created with the
+     template's ORIGINAL config BEFORE any set and keeps its registry
+     record through the template's mutations (the new-frames-adopt rule is
+     honest by construction: the template is read at frame_create only,
+     PINNED at _ca_on_config — the frame's copies are frame-owned dups). */
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_cfg(&fx, NULL, NULL, NULL, NULL), 0);
+  conn_double_t conn;
+  conn_double_init(&conn);
+
+  /* The RUNNING frame is born under the template's ORIGINAL (empty) truth
+     BEFORE any set — its config is dup'd at ITS frame_create. */
+  std::string sid = prompt_create_and_sid(&fx, &conn, 2, "keep my config");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+  frame_t* running = ca_session_server_frame(fx.server, sid.c_str());
+  ASSERT_NE(running, nullptr);
+
+  /* The GET on the daemon's template defaults (still untouched): every
+     field rides the "" sentinel and decodes all-absent. */
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(1, NULL, NULL, NULL), &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 2, 600)) << "the GET's answer";
+  {
+    uint64_t type = 0, req_id = 0;
+    void* payload = NULL;
+    uint8_t status = 0;
+    ASSERT_TRUE(conn_decode(&conn, 1, &type, &payload, &req_id, &status));
+    ASSERT_EQ(type, (uint64_t)CA_CONFIG_RESPONSE);
+    ASSERT_EQ(req_id, 1u);
+    ca_config_response_t* res = (ca_config_response_t*)payload;
+    EXPECT_EQ(res->status, 0u);
+    EXPECT_EQ(res->base_url, nullptr) << "the template defaults empty";
+    EXPECT_EQ(res->api_key, nullptr);
+    EXPECT_EQ(res->model, nullptr);
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
+  }
+
+  /* SET {tag "gemma4:latest"} only: status 0, and the answer echoes the
+     POST-SET template (the base_url/api_key members stayed absent). */
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(3, NULL, NULL, "gemma4:latest"), &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 3, 600)) << "the SET's answer";
+  {
+    uint64_t type = 0, req_id = 0;
+    void* payload = NULL;
+    uint8_t status = 0;
+    ASSERT_TRUE(conn_decode(&conn, 2, &type, &payload, &req_id, &status));
+    ASSERT_EQ(type, (uint64_t)CA_CONFIG_RESPONSE);
+    ASSERT_EQ(req_id, 3u);
+    ca_config_response_t* res = (ca_config_response_t*)payload;
+    EXPECT_EQ(res->status, 0u);
+    EXPECT_EQ(res->base_url, nullptr);
+    EXPECT_EQ(res->api_key, nullptr);
+    ASSERT_NE(res->model, nullptr);
+    EXPECT_STREQ(res->model, "gemma4:latest");
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
+  }
+
+  /* GET: the tag rides. */
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(4, NULL, NULL, NULL), &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 4, 600)) << "the GET's answer";
+  {
+    uint64_t type = 0, req_id = 0;
+    void* payload = NULL;
+    uint8_t status = 0;
+    ASSERT_TRUE(conn_decode(&conn, 3, &type, &payload, &req_id, &status));
+    ASSERT_EQ(type, (uint64_t)CA_CONFIG_RESPONSE);
+    ASSERT_EQ(req_id, 4u);
+    ca_config_response_t* res = (ca_config_response_t*)payload;
+    EXPECT_EQ(res->model != NULL, true);
+    EXPECT_STREQ(res->model, "gemma4:latest");
+    EXPECT_EQ(res->api_key, nullptr) << "the absent member stayed absent";
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
+  }
+
+  /* SET {base_url, api_key "", tag} all three elements — the
+     absent-fields-unchanged shape: the absent api_key leaves the
+     template's member untouched while the other two land. */
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(5, "http://127.0.0.1:11434", "",
+                               "gemma4:latest"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 5, 600)) << "the SET's answer";
+  {
+    uint64_t type = 0, req_id = 0;
+    void* payload = NULL;
+    uint8_t status = 0;
+    ASSERT_TRUE(conn_decode(&conn, 4, &type, &payload, &req_id, &status));
+    ASSERT_EQ(type, (uint64_t)CA_CONFIG_RESPONSE);
+    ASSERT_EQ(req_id, 5u);
+    ca_config_response_t* res = (ca_config_response_t*)payload;
+    EXPECT_EQ(res->status, 0u);
+    EXPECT_STREQ(res->base_url, "http://127.0.0.1:11434");
+    EXPECT_EQ(res->api_key, nullptr) << "kept untouched";
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
+  }
+
+  /* SET all three (the api_key PRESENT — key_len rides the compose for the
+     destroy's scrub) → the GET carries all. */
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(6, "http://127.0.0.1:11434", "sk-secret",
+                               "gemma4:latest"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 6, 600)) << "the SET's answer";
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(7, NULL, NULL, NULL), &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 7, 600)) << "the GET's answer";
+  {
+    uint64_t type = 0, req_id = 0;
+    void* payload = NULL;
+    uint8_t status = 0;
+    ASSERT_TRUE(conn_decode(&conn, 6, &type, &payload, &req_id, &status));
+    ASSERT_EQ(type, (uint64_t)CA_CONFIG_RESPONSE);
+    ASSERT_EQ(req_id, 7u);
+    ca_config_response_t* res = (ca_config_response_t*)payload;
+    EXPECT_EQ(res->status, 0u);
+    EXPECT_STREQ(res->base_url, "http://127.0.0.1:11434");
+    ASSERT_NE(res->api_key, nullptr);
+    EXPECT_STREQ(res->api_key, "sk-secret");
+    ASSERT_NE(res->model, nullptr);
+    EXPECT_STREQ(res->model, "gemma4:latest");
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
+  }
+
+  /* The RUNNING frame keeps its model: the registry frame is the SAME
+     object through every template mutation — its config is the frame's OWN
+     dup (taken at ITS frame_create from the ORIGINAL template), and the
+     set's free + re-dup touches only the SERVER's template copies (watched
+     under ASan/valgrind too: any shared-pointer break of that separation
+     is a use-after-free on the template's or the frame's side). */
+  EXPECT_EQ(ca_session_server_frame(fx.server, sid.c_str()), running)
+      << "the running frame's record (and its frame-owned config) survived "
+         "the template's mutations";
+
+  fixture_teardown(&fx);
+  /* The ref discipline proved (the fixture's existing backstop). */
+  EXPECT_EQ(conn.refs.load(), 0);
+  conn_double_destroy(&conn);
 }
 
 #endif /* SA_HAS_WDB && SA_HAS_STREAMS */

@@ -189,6 +189,126 @@ static void _ca_send_error(ca_session_conn_t* iface, uint64_t req_id,
   (void)_ca_send(iface, CA_ERROR, err);
 }
 
+/* --- the frame-config template's get/set (the CA_CONFIG pair) -------------- */
+
+/* Dup one template text member (NULL rides as NULL = the absent sentinel).
+   0 dup'd (or absent); -1 = OOM (the server refuses loud — never a
+   half-owned template). */
+static int _ca_cfg_dup_into(const char** dst, const char* src) {
+  char* dup = NULL;
+
+  if (src != NULL) {
+    dup = strdup(src);
+    if (dup == NULL) return -1;
+  }
+  *dst = dup;
+  return 0;
+}
+
+/* The set's TOTAL stage: dup every present field first, so the template
+   mutates all-or-refuses (the wire's decode discipline carried over). */
+static int _ca_cfg_stage(char** base_url, char** api_key, char** model,
+                         const ca_config_request_t* req) {
+  if (req->base_url != NULL) {
+    *base_url = strdup(req->base_url);
+    if (*base_url == NULL) return -1;
+  }
+  if (req->api_key != NULL) {
+    *api_key = strdup(req->api_key);
+    if (*api_key == NULL) {
+      free(*base_url);
+      return -1;
+    }
+  }
+  if (req->model != NULL) {
+    *model = strdup(req->model);
+    if (*model == NULL) {
+      free(*base_url);
+      free(*api_key);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* Compose ONE CA_CONFIG response from the template's current truth (the
+   absent member rides the wire's "" sentinel; the api_key's scrub length
+   rides the compose). 0 = res filled; -1 = OOM (res destroyed here). */
+static int _ca_config_response_compose(ca_session_server_t* server,
+                                       uint64_t req_id,
+                                       ca_config_response_t** res_out) {
+  ca_config_response_t* res =
+      (ca_config_response_t*)get_clear_memory(sizeof(*res));
+
+  res->req_id = req_id;
+  res->status = 0;   /* the template's current truth (the set's echo too) */
+  if (server->cfg.model_base_url != NULL) {
+    res->base_url = strdup(server->cfg.model_base_url);
+  }
+  if (server->cfg.model_api_key != NULL) {
+    res->api_key = strdup(server->cfg.model_api_key);
+    res->key_len = strlen(server->cfg.model_api_key);
+  }
+  if (server->cfg.model_name != NULL) {
+    res->model = strdup(server->cfg.model_name);
+  }
+  if ((server->cfg.model_base_url != NULL && res->base_url == NULL) ||
+      (server->cfg.model_api_key != NULL && res->api_key == NULL) ||
+      (server->cfg.model_name != NULL && res->model == NULL)) {
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, res);
+    return -1;
+  }
+  *res_out = res;
+  return 0;
+}
+
+/* The config set: any present field mutates the template; absent (the ""
+   sentinel decoded to NULL) leaves its member untouched. THE
+   NEW-FRAMES-ADOPT RULE — honest by construction, PINNED here AND in the
+   test: the template is read ONLY at frame_create (the prompt's create
+   path), and frame_create dups its OWN per-frame copies — this mutation
+   frees and re-dups ONLY the server's template members, so a RUNNING frame
+   keeps exactly the config it was created with while every NEW frame
+   adopts the mutated template. (The separation is also watched: the
+   ASan/valgrind gates flag any use-after-free if a template member ever
+   aliased a frame's copy.) The GET is the all-absent shape and falls
+   straight through to the compose. */
+static void _ca_on_config(ca_session_server_t* server, void* payload_raw,
+                          ca_session_conn_t* iface) {
+  ca_config_request_t* req = (ca_config_request_t*)payload_raw;
+  uint64_t req_id = req->req_id;
+
+  if (req->base_url != NULL || req->api_key != NULL || req->model != NULL) {
+    /* The set stages BEFORE its commit (_ca_cfg_stage's total shape), so
+       the template mutates all-or-refuses — never a half-mutated
+       template. */
+    char* base_url = NULL;
+    char* api_key = NULL;
+    char* model = NULL;
+
+    if (_ca_cfg_stage(&base_url, &api_key, &model, req) != 0) {
+      _ca_send_error(iface, req_id, 1,
+                     "the config set was refused (out of memory)");
+      return;
+    }
+    free((char*)server->cfg.model_base_url);
+    free((char*)server->cfg.model_api_key);
+    free((char*)server->cfg.model_name);
+    server->cfg.model_base_url = base_url;   /* absent = its NULL rides */
+    server->cfg.model_api_key = api_key;
+    server->cfg.model_name = model;
+  }
+  /* The template's post-set truth answers both the GET and the SET (the
+     SET's status-0 echo — the plan's answer shape). */
+  ca_config_response_t* res = NULL;
+  if (_ca_config_response_compose(server, req_id, &res) != 0) {
+    _ca_send_error(iface, req_id, 1,
+                   "the config read was refused (out of memory)");
+    return;
+  }
+  (void)_ca_send(iface, CA_CONFIG_RESPONSE, res);
+}
+
 /* --- the loop-thread closures --------------------------------------------- */
 
 typedef struct ca_work_t {
@@ -1273,6 +1393,9 @@ static void _ca_work_run(void* raw) {
     case CA_SESSIONS_REQUEST:
       _ca_on_sessions(server, w->payload, w->iface);
       break;
+    case CA_CONFIG_REQUEST:
+      _ca_on_config(server, w->payload, w->iface);
+      break;
     default:
       /* The wire's decode refuses unknown types first; this is the closed
          vocabulary's defensive floor (the payload dies at this closure's
@@ -1309,6 +1432,29 @@ ca_session_server_t* ca_session_server_create(wave_database_root_t* root,
   server->loop = loop;
   server->shared_backend = shared_backend;
   server->cfg = *frame_cfg;
+  /* The server OWNS the template's three text members (handlers.h): the
+     CA_CONFIG set must free + re-dup them; frame_create dups its own
+     per-frame copies off this template (the running-frames-keep /
+     new-frames-adopt rule). STAGED: the caller's pointers move to locals
+     and the members zero first — a dup failure below frees only owned
+     copies, never a caller's buffer. */
+  const char* cfg_base_url = frame_cfg->model_base_url;
+  const char* cfg_api_key = frame_cfg->model_api_key;
+  const char* cfg_model_name = frame_cfg->model_name;
+  server->cfg.model_base_url = NULL;
+  server->cfg.model_api_key = NULL;
+  server->cfg.model_name = NULL;
+  if (_ca_cfg_dup_into(&server->cfg.model_base_url, cfg_base_url) != 0 ||
+      _ca_cfg_dup_into(&server->cfg.model_api_key, cfg_api_key) != 0 ||
+      _ca_cfg_dup_into(&server->cfg.model_name, cfg_model_name) != 0) {
+    log_error("ca_session_server_create: the template's text dup failed — "
+              "refused loud");
+    free((char*)server->cfg.model_base_url);
+    free((char*)server->cfg.model_api_key);
+    free((char*)server->cfg.model_name);
+    free(server);
+    return NULL;
+  }
   server->cfg.pool = pool;   /* the API's frames ride the API's pool: the
                                 template's pool member is overwritten */
   ATOMIC_STORE(&server->dying, 0);
@@ -1450,6 +1596,11 @@ void ca_session_server_destroy(ca_session_server_t* server) {
     }
     server->regs = NULL;
   }
+  /* The template's OWNED text members (the create's dups, possibly
+     re-duped by a CA_CONFIG set since). */
+  free((char*)server->cfg.model_base_url);
+  free((char*)server->cfg.model_api_key);
+  free((char*)server->cfg.model_name);
   /* The server's actor dies LAST: its mailbox may still hold bounced
      replies/notices (their payloads die in the drain). */
   actor_destroy(&server->actor);

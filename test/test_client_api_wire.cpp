@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <string>
+#include <vector>
 extern "C" {
 #include "../src/ClientApi/client_api_wire.h"
 }
@@ -361,6 +362,219 @@ static void _encode_off_vocabulary_frame(uint64_t wire_type, uint8_t** out,
   cbor_decref(&array);
   ASSERT_NE(n, 0u) << "the hand-shaped frame must serialize";
   ASSERT_NE(*out, nullptr);
+}
+
+/* A hand-shaped frame [type, req_id, tail...] — the config pair's GET form
+   and the bad-size/bad-field refusal shapes need it (nullptr rides a CBOR
+   null — the not-a-text field's refusal shape). */
+static void _hand_frame(uint64_t type, uint64_t req_id,
+                        const std::vector<const char*>& tail, uint8_t** out,
+                        size_t* out_len) {
+  std::vector<cbor_item_t*> elements;
+  elements.push_back(cbor_build_uint64(type));
+  elements.push_back(cbor_build_uint64(req_id));
+  for (const char* s : tail) {
+    elements.push_back(s == nullptr ? cbor_new_null() : cbor_build_string(s));
+  }
+  cbor_item_t* array = cbor_new_definite_array(elements.size());
+  for (cbor_item_t* e : elements) {
+    (void)cbor_array_push(array, e);
+    cbor_decref(&e);
+  }
+  size_t n = cbor_serialize_alloc(array, (unsigned char**)out, out_len);
+  cbor_decref(&array);
+  ASSERT_NE(n, 0u) << "the hand-shaped frame must serialize";
+  ASSERT_NE(*out, nullptr);
+}
+
+/* The CONFIG wire pair (the settings surface's pair): [14, req_id,
+   base_url, api_key, model] and its [15, req_id, status, base_url,
+   api_key, model] — "" is the ABSENT sentinel on every template field
+   (all-absent = the GET), the api_key rides the AUTH pair's by-length
+   scrub discipline, and the pairing assert joined the vocabulary at
+   compile time (14/15 = the ERROR 11 / AUTH 12-13 numbers' next free
+   pair). */
+TEST(TestClientApiWire, TestConfigRoundTrips) {
+  /* GET: {req_id 9} → the response carries base_url/api_key/model strings
+     (absent = the "" sentinel, per the wire's bounded-string discipline:
+     CA_WIRE_CONFIG_* bounds — TEXT 512 for base_url, KEY 256 for api_key
+     mirroring CA_WIRE_KEY_MAX, TAG 128 for the model tag). */
+  /* SET: {req_id 9, base_url "http://127.0.0.1:11434", api_key "", tag
+     "gemma4:latest"} = the absent-fields-unchanged shape ("" = absent
+     everywhere in CONFIG's set) → decodes equal. */
+  uint8_t* raw = NULL;
+  size_t raw_len = 0;
+  uint64_t type = 0;
+  void* payload = NULL;
+  uint64_t req_id = 0;
+  uint8_t status = 0;
+
+  /* the SET request's encode→decode equality (the "" sentinel rides as the
+     empty string and decodes back to the absent NULL) */
+  ca_config_request_t req = {0};
+  req.req_id = 9;
+  req.base_url = (char*)"http://127.0.0.1:11434";
+  req.api_key = NULL;   /* absent — the encoder writes the "" sentinel */
+  req.model = (char*)"gemma4:latest";
+  ASSERT_EQ(ca_wire_encode(CA_CONFIG_REQUEST, &req, &raw, &raw_len), 0);
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_CONFIG_REQUEST);
+  EXPECT_EQ(req_id, 9u);
+  EXPECT_EQ(status, 0u) << "a request decodes with status 0";
+  ASSERT_NE(payload, nullptr);
+  {
+    ca_config_request_t* back = (ca_config_request_t*)payload;
+    EXPECT_STREQ(back->base_url, "http://127.0.0.1:11434");
+    EXPECT_EQ(back->api_key, nullptr) << "the absent sentinel kept absent";
+    EXPECT_STREQ(back->model, "gemma4:latest");
+    ca_wire_payload_destroy(CA_CONFIG_REQUEST, back);
+  }
+  free(raw);
+
+  /* the GET by the wire's own encoder: the all-NULL fields ride as all ""
+     and decode all-absent */
+  ca_config_request_t get = {0};
+  get.req_id = 9;
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_CONFIG_REQUEST, &get, &raw, &raw_len), 0);
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_CONFIG_REQUEST);
+  ASSERT_NE(payload, nullptr);
+  EXPECT_EQ(((ca_config_request_t*)payload)->base_url, nullptr);
+  EXPECT_EQ(((ca_config_request_t*)payload)->api_key, nullptr);
+  EXPECT_EQ(((ca_config_request_t*)payload)->model, nullptr);
+  ca_wire_payload_destroy(CA_CONFIG_REQUEST, payload);
+  free(raw);
+
+  /* the GET's 2-element form [14, req_id]: the spec's "{req_id}" shape */
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  _hand_frame(CA_CONFIG_REQUEST, 4, {}, &raw, &raw_len);
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_CONFIG_REQUEST);
+  EXPECT_EQ(req_id, 4u);
+  ASSERT_NE(payload, nullptr);
+  EXPECT_EQ(((ca_config_request_t*)payload)->base_url, nullptr);
+  ca_wire_payload_destroy(CA_CONFIG_REQUEST, payload);
+  free(raw);
+
+  /* the response: the GET's answer round-trips every template field, the
+     key's DECODED length rides for the destroy's scrub, and the response's
+     type IS request + 1 (the pairing assert's runtime face) */
+  ca_config_response_t res = {0};
+  res.req_id = 9;
+  res.status = 0;
+  res.base_url = (char*)"http://127.0.0.1:11434";
+  res.api_key = (char*)"sk-secret";
+  res.model = (char*)"gemma4:latest";
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_CONFIG_RESPONSE, &res, &raw, &raw_len), 0);
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_CONFIG_RESPONSE)
+      << "the response = request + 1";
+  EXPECT_EQ(req_id, 9u);
+  EXPECT_EQ(status, 0u);
+  ASSERT_NE(payload, nullptr);
+  {
+    ca_config_response_t* back = (ca_config_response_t*)payload;
+    EXPECT_EQ(back->status, 0u);
+    EXPECT_STREQ(back->base_url, "http://127.0.0.1:11434");
+    ASSERT_NE(back->api_key, nullptr);
+    EXPECT_STREQ(back->api_key, "sk-secret");
+    EXPECT_EQ(back->key_len, strlen("sk-secret")) << "the scrub's count";
+    EXPECT_STREQ(back->model, "gemma4:latest");
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, back);
+  }
+  free(raw);
+
+  /* the response's absent shape: the all-"" answer decodes all-absent —
+     the template-defaults-empty truth a fresh daemon's GET carries */
+  ca_config_response_t empty = {0};
+  empty.req_id = 15;
+  empty.status = 0;
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_CONFIG_RESPONSE, &empty, &raw, &raw_len), 0);
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  ASSERT_NE(payload, nullptr);
+  EXPECT_EQ(status, 0u);
+  EXPECT_EQ(((ca_config_response_t*)payload)->base_url, nullptr);
+  EXPECT_EQ(((ca_config_response_t*)payload)->api_key, nullptr);
+  EXPECT_EQ(((ca_config_response_t*)payload)->model, nullptr);
+  ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
+  free(raw);
+
+  /* the bounds: every template field refuses over its bound loud */
+  std::string big_url(CA_WIRE_CONFIG_TEXT_MAX + 1, 'u');
+  ca_config_request_t over_url = {0};
+  over_url.req_id = 5;
+  over_url.base_url = &big_url[0];   /* C++17: data() is a mutable char* */
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_CONFIG_REQUEST, &over_url, &raw, &raw_len), 0);
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  std::string big_key(CA_WIRE_KEY_MAX + 1, 'k');
+  ca_config_request_t over_key = {0};
+  over_key.req_id = 6;
+  over_key.api_key = &big_key[0];
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_CONFIG_REQUEST, &over_key, &raw, &raw_len), 0);
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  std::string big_tag(CA_WIRE_CONFIG_TAG_MAX + 1, 't');
+  ca_config_request_t over_tag = {0};
+  over_tag.req_id = 7;
+  over_tag.model = &big_tag[0];
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_CONFIG_REQUEST, &over_tag, &raw, &raw_len), 0);
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  /* the hand shapes: a 3-element partial-field form refuses, and a CBOR
+     null field (not-a-text) refuses — the wire never trusts its peer */
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  _hand_frame(CA_CONFIG_REQUEST, 8, {"only-a-base-url"}, &raw, &raw_len);
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  uint8_t* raw2 = NULL;   /* the ASSERTs inside _hand_frame force two vars */
+  size_t raw2_len = 0;
+  payload = NULL;
+  _hand_frame(CA_CONFIG_REQUEST, 8, {"http://ok", nullptr, "tag"}, &raw2,
+              &raw2_len);
+  EXPECT_EQ(ca_wire_decode_bytes(raw2, raw2_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw2);
 }
 
 TEST(TestClientApiWire, TestUnknownWellFormedTypeRefuses) {

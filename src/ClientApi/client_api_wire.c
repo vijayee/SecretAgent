@@ -229,6 +229,32 @@ static cbor_item_t* _encode_auth_response(const ca_auth_response_t* res) {
   return array;
 }
 
+/* [14, req_id, base_url, api_key, model] — the three template fields are
+   always present (the "" sentinel rides them; the all-"" frame is the
+   GET). [15, req_id, status, base_url, api_key, model] mirrors. */
+static cbor_item_t* _encode_config_request(const ca_config_request_t* req) {
+  cbor_item_t* array = cbor_new_definite_array(5);
+
+  _push_u8(array, CA_CONFIG_REQUEST);
+  _push_u64(array, req->req_id);
+  _push_string(array, req->base_url);
+  _push_string(array, req->api_key);
+  _push_string(array, req->model);
+  return array;
+}
+
+static cbor_item_t* _encode_config_response(const ca_config_response_t* res) {
+  cbor_item_t* array = cbor_new_definite_array(6);
+
+  _push_u8(array, CA_CONFIG_RESPONSE);
+  _push_u64(array, res->req_id);
+  _push_u8(array, res->status);
+  _push_string(array, res->base_url);
+  _push_string(array, res->api_key);
+  _push_string(array, res->model);
+  return array;
+}
+
 /* ---- per-type decoders: total-or-refusal — on ANY refusal the
    partially-built payload is destroyed here (never a partial payload, never
    a leak); *payload fills on success only ---- */
@@ -607,6 +633,87 @@ static int _decode_auth_response(cbor_item_t* frame, uint64_t req_id,
   return 0;
 }
 
+/* One CONFIG template field: a bounded text string the "" sentinel decodes
+   as NULL = absent (len_out, when set, receives the DECODED byte length —
+   the api_key's scrub count; strlen cannot see past an embedded NUL). */
+static int _decode_config_field(cbor_item_t* frame, size_t index,
+                                size_t max_len, char** out,
+                                size_t* len_out) {
+  cbor_item_t* item = cbor_array_get(frame, index);
+  int rc = -1;
+
+  if (item != NULL && cbor_isa_string(item)) {
+    size_t len = cbor_string_length(item);
+    if (len <= max_len) {
+      if (len == 0) {
+        *out = NULL;   /* the "" sentinel decodes as absent */
+      } else {
+        *out = get_memory(len + 1);
+        memcpy(*out, cbor_string_handle(item), len);
+        (*out)[len] = '\0';
+      }
+      if (len_out != NULL) *len_out = len;
+      rc = 0;
+    }
+  }
+  cbor_decref(&item);
+  return rc;
+}
+
+/* [14, req_id, base_url, api_key, model] — the SET ("" = absent = keep);
+   [14, req_id] is the GET (all fields absent). A 3/4-element frame (the
+   partial-field hand shape) refuses — the wire never trusts its peer. */
+static int _decode_config_request(cbor_item_t* frame, uint64_t req_id,
+                                  void** payload) {
+  size_t size = cbor_array_size(frame);
+  ca_config_request_t* req;
+
+  if (size != 2 && size != 5) return -1;
+  req = get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
+  if (size == 5) {
+    if (_decode_config_field(frame, 2, CA_WIRE_CONFIG_TEXT_MAX,
+                             &req->base_url, NULL) != 0 ||
+        _decode_config_field(frame, 3, CA_WIRE_KEY_MAX, &req->api_key,
+                             &req->key_len) != 0 ||
+        _decode_config_field(frame, 4, CA_WIRE_CONFIG_TAG_MAX, &req->model,
+                             NULL) != 0) {
+      ca_wire_payload_destroy(CA_CONFIG_REQUEST, req);
+      return -1;
+    }
+  }
+  *payload = req;
+  return 0;
+}
+
+/* [15, req_id, status, base_url, api_key, model] — the GET's answer ("" =
+   absent) and the SET's status-0 echo of the post-set template */
+static int _decode_config_response(cbor_item_t* frame, uint64_t req_id,
+                                   void** payload) {
+  ca_config_response_t* res;
+  cbor_item_t* item;
+  int rc;
+
+  if (cbor_array_size(frame) != 6) return -1;
+  res = get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
+  item = cbor_array_get(frame, 2);
+  rc = item == NULL ? -1 : _decode_u8(item, &res->status);
+  cbor_decref(&item);
+  if (rc != 0 ||
+      _decode_config_field(frame, 3, CA_WIRE_CONFIG_TEXT_MAX, &res->base_url,
+                           NULL) != 0 ||
+      _decode_config_field(frame, 4, CA_WIRE_KEY_MAX, &res->api_key,
+                           &res->key_len) != 0 ||
+      _decode_config_field(frame, 5, CA_WIRE_CONFIG_TAG_MAX, &res->model,
+                           NULL) != 0) {
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, res);
+    return -1;
+  }
+  *payload = res;
+  return 0;
+}
+
 static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
                          uint64_t* req_id, uint8_t* status) {
   cbor_item_t* item;
@@ -670,6 +777,14 @@ static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
       rc = _decode_auth_response(frame, *req_id, payload);
       if (rc == 0) *status = ((ca_auth_response_t*)*payload)->status;
       break;
+    case CA_CONFIG_REQUEST:
+      rc = _decode_config_request(frame, *req_id, payload);
+      if (rc == 0) *status = 0;
+      break;
+    case CA_CONFIG_RESPONSE:
+      rc = _decode_config_response(frame, *req_id, payload);
+      if (rc == 0) *status = ((ca_config_response_t*)*payload)->status;
+      break;
     default:
       return -1;   /* the closed vocabulary: an unknown type refuses loud */
   }
@@ -724,6 +839,12 @@ int ca_wire_encode(uint64_t type, void* payload, uint8_t** out,
       break;
     case CA_AUTH_RESPONSE:
       frame = _encode_auth_response((const ca_auth_response_t*)payload);
+      break;
+    case CA_CONFIG_REQUEST:
+      frame = _encode_config_request((const ca_config_request_t*)payload);
+      break;
+    case CA_CONFIG_RESPONSE:
+      frame = _encode_config_response((const ca_config_response_t*)payload);
       break;
     default:
       return -1;   /* the closed vocabulary: an unknown type refuses loud */
@@ -846,6 +967,33 @@ void ca_wire_payload_destroy(uint64_t type, void* payload) {
     }
     case CA_AUTH_RESPONSE: {
       free(payload);
+      break;
+    }
+    case CA_CONFIG_REQUEST: {
+      /* The AUTH pair's scrub idiom: the decoded key's memory is scrubbed
+         by its DECODED byte length before the free — a presented key never
+         lingers (strlen would stop at the first embedded NUL). */
+      ca_config_request_t* req = (ca_config_request_t*)payload;
+      free(req->base_url);
+      if (req->api_key != NULL) {
+        memset(req->api_key, 0, req->key_len);
+        free(req->api_key);
+      }
+      free(req->model);
+      free(req);
+      break;
+    }
+    case CA_CONFIG_RESPONSE: {
+      /* The GET's answer carries the template's api_key — the same
+         by-length scrub (the plan's pinned discipline for this pair). */
+      ca_config_response_t* res = (ca_config_response_t*)payload;
+      free(res->base_url);
+      if (res->api_key != NULL) {
+        memset(res->api_key, 0, res->key_len);
+        free(res->api_key);
+      }
+      free(res->model);
+      free(res);
       break;
     }
     default:
