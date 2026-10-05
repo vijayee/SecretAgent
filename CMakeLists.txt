@@ -429,7 +429,7 @@ if(SA_ENABLE_WDB AND SA_ENABLE_STREAMS)
   target_compile_definitions(sa_client PUBLIC SA_HAS_WDB=1)
   target_include_directories(sa_client PRIVATE ${WDB_ROOT}/src)
   target_link_libraries(sa_client PUBLIC ${WDB_LINK_ARCHIVE})
-  add_dependencies(sa_client wavedb-ext ${WDB_ALIAS_TARGET})
+  add_dependencies(sa_client wavedb-ext ${WDB_ALIAS_TARGET} poll-dancer-ext)
   target_include_directories(sa_client PRIVATE
     ${WDB_ROOT}/deps/libcbor/src
     ${WDB_BUILD}/deps/libcbor
