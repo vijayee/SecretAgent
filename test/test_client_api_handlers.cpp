@@ -556,6 +556,96 @@ TEST(TestClientApiHandlers, TestPromptStartsATopFrameAndAnswersItsSid) {
   conn_double_destroy(&conn);
 }
 
+TEST(TestClientApiHandlers, TestPromptCreateCommitsTheUserMessageRecord) {
+  /* THE CREATE-PROMPT'S DURABLE INPUT (the FFI-binding chat contract's
+     truth — a NO-BACKEND fixture keeps the shape network-free): the
+     create's prompt text commits as the frame's `msg.append` {role: user}
+     record BEFORE the no-backend turn's `control {kind: model-missing}` —
+     the replay-then-live channel carries BOTH in that order (durable input
+     ahead of any model work: the store's FIFO). */
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup(&fx, NULL), 0);
+  conn_double_t conn;
+  conn_double_init(&conn);
+
+  std::string sid = prompt_create_and_sid(&fx, &conn, 1, "the prompt text");
+
+  /* The record's commit is fire-and-post from the frame's dispatch; wait
+     for the control's arrival (the turn's fact that follows it), then read
+     the SUBSCRIBE-free channel through a fresh replay. */
+  bool control_committed = false;
+  ca_session_handle(fx.server, CA_EVENTS_REQUEST,
+                    events_req(2, sid.c_str(), CA_EVENTS_REPLAY_THEN_LIVE, 0),
+                    &conn.iface);
+  for (int i = 0; i < 600 && !control_committed; i++) {
+    size_t n = conn_count(&conn);
+    for (size_t j = 2; j < n; j++) {
+      void* p = NULL;
+      uint64_t t = 0, rid = 0;
+      uint8_t st = 0;
+      if (!conn_decode(&conn, j, &t, &p, &rid, &st)) break;
+      if (t != (uint64_t)CA_EVENTS_RESPONSE) {
+        ca_wire_payload_destroy(t, p);
+        continue;
+      }
+      ca_events_response_t* ev = (ca_events_response_t*)p;
+      if (ev->seq > 0 && ev->record_json != NULL &&
+          strstr(ev->record_json, "model-missing") != NULL) {
+        control_committed = true;
+      }
+      ca_wire_payload_destroy(CA_EVENTS_RESPONSE, p);
+    }
+    if (!control_committed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+  EXPECT_TRUE(control_committed) << "the turn's control record rode";
+
+  /* The replay's order pin: the subscribe's response marker (the decoded
+     frames at 0..1), then the records in the store's FIFO: FIRST the user
+     msg.append with the prompt's text, THEN the model-missing control. */
+  std::vector<chan_ev_t> channel = conn_channel(&conn, 2);
+  size_t first_record = 0;
+  while (first_record < channel.size() && channel[first_record].seq == 0) {
+    first_record++;
+  }
+  ASSERT_LT(first_record + 1, channel.size())
+      << "the replay carried both records — seen "
+      << channel.size() << " channel frames";
+  ASSERT_NE(channel[first_record].seq, 0u);
+  {
+    const std::string& raw = channel[first_record].record_json;
+    json_value_t* rec = json_parse(raw.data(), raw.size(), NULL);
+    ASSERT_NE(rec, nullptr) << "raw: " << raw;
+    EXPECT_STREQ(json_as_string(json_get(rec, "type")), "msg.append");
+    json_value_t* rp = json_get(rec, "payload");
+    ASSERT_NE(rp, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(rp, "role")), "user");
+    EXPECT_STREQ(json_as_string(json_get(rp, "content")), "the prompt text");
+    json_value_destroy(rec);
+  }
+  const chan_ev_t control = channel[first_record + 1];
+  ASSERT_GT(control.seq, channel[first_record].seq)
+      << "the store's FIFO: the user's words commit ahead of the turn's "
+         "control";
+  {
+    json_value_t* rec = json_parse(control.record_json.data(),
+                                   control.record_json.size(), NULL);
+    ASSERT_NE(rec, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(rec, "type")), "control");
+    json_value_t* rp = json_get(rec, "payload");
+    ASSERT_NE(rp, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(rp, "kind")), "model-missing");
+    json_value_destroy(rec);
+  }
+
+  fixture_teardown(&fx);
+  /* The ref discipline proved: the server released every connection ref. */
+  EXPECT_EQ(conn.refs.load(), 0)
+      << "the server's held connection references all released";
+  conn_double_destroy(&conn);
+}
+
 TEST(TestClientApiHandlers, TestPromptSteerAppendsAUserMessage) {
   /* A created frame steered over the wire: status 0, the response's sid ""
      (the steer shape), and the frame's log carries the msg.append user

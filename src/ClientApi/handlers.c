@@ -1070,6 +1070,21 @@ static void _ca_on_prompt(ca_session_server_t* server, void* payload_raw,
       return;
     }
     _ca_reg_add(server, reg_sid, f);
+    /* THE CREATE-PROMPT'S DURABLE INPUT (the FFI-binding chat contract's
+       truth): the prompt's text must ride a `msg.append` {role: user}
+       record on the frame's log — the session events channel is the
+       client's user-bubble source, and a create whose text lived only in
+       the goal meta never delivered it (the runtime's own durable-input
+       rule: the user's words commit BEFORE any model work). Posted to the
+       born frame's mailbox BEFORE frame_start, so the FIFO order carries
+       msg.append ahead of the engine's first turn. A refusal here is OOM
+       only — the goal meta still carries the text; the post logs the gap.
+       A frame whose start refuses below destroys the mailbox with the
+       post never dispatched — nothing committed. */
+    if (_frame_steer_post(f, "user", req->text) != 0) {
+      log_error("ca: the create-prompt's user msg.append refused the post "
+                "at '%s' (the goal meta carries the text)", frame_sid(f));
+    }
     if (frame_start(f) != 0) {
       /* A fresh frame's start cannot refuse; when it does anyway, tear the
          half-made session down and refuse loud — never a half-answer. */
