@@ -1313,6 +1313,150 @@ int sa_client_unsubscribe_events(sa_client_t* client) {
   }
 }
 
+/* The config pair's shared delivery (both ops' responses shape identically —
+   the GET's answer and the SET's echo): the three response members are
+   COPIED and HELD (the header's ownership rule) before the callback runs;
+   a NULL member is the template's absent member (no copy, no release). 0 =
+   delivered (or a callback-less success); OOM = the delivery cancelled loud
+   through the error channel + a failing completion (no untracked pointer
+   ever reaches the callback — the hold's all-or-nothing rule). */
+static int _deliver_config(sa_client_t* c, uint64_t rid, uint8_t status,
+                           ca_config_response_t* res,
+                           sa_client_config_cb_t callback, void* ctx) {
+  char* base_url = NULL;
+  char* api_key = NULL;
+  char* model = NULL;
+  void* held[3] = {NULL, NULL, NULL};
+  int oom = 0;
+
+  if (res != NULL) {
+    base_url = _dup_string(res->base_url);
+    api_key = _dup_string(res->api_key);
+    model = _dup_string(res->model);
+    /* The response's presence facts BEFORE its destroy (the wire struct
+       dies here; the copies' NULLs carry the absence). */
+    oom = (res->base_url != NULL && base_url == NULL) ||
+          (res->api_key != NULL && api_key == NULL) ||
+          (res->model != NULL && model == NULL);
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, res);
+  }
+  if (oom) {
+    free(base_url);
+    free(api_key);
+    free(model);
+    _error_local(c, rid, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory delivering the config response");
+    if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_ALLOC, NULL, NULL, NULL);
+    return 0;
+  }
+  held[0] = base_url;
+  held[1] = api_key;
+  held[2] = model;
+  if (_hold_all(c, held, 3) != 0) {
+    /* _hold_all freed the copies: nothing is tracked, nothing delivered */
+    _error_local(c, rid, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory delivering the config response");
+    if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_ALLOC, NULL, NULL, NULL);
+    return 0;
+  }
+  if (callback != NULL) callback(ctx, status, base_url, api_key, model);
+  return 0;
+}
+
+/* ---- the config ops (the CA_CONFIG pair's client surface) ---------------- */
+
+int sa_client_config_get(sa_client_t* client, sa_client_config_cb_t callback,
+                         void* ctx) {
+  ca_config_request_t* req;
+  uint64_t rid = 0, rtype = 0;
+  uint8_t rstatus = 0, fail = 0;
+  void* resp = NULL;
+  int rc;
+
+  if (client == NULL) return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_config_get: a blocking op from an events callback "
+              "is refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
+  req = get_clear_memory(sizeof(*req));
+  if (req == NULL) {
+    _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory building the config get");
+    return 0;
+  }
+  /* The all-absent request IS the GET (the wire's own rule: the "" sentinel
+     and the NULL member both decode absent). */
+  rc = _roundtrip(client, CA_CONFIG_RESPONSE, req, CA_CONFIG_REQUEST, &rid,
+                  &rtype, &rstatus, &resp, &fail);
+  ca_wire_payload_destroy(CA_CONFIG_REQUEST, req);
+  if (rc < 0) return -1;
+  if (rc == 1) {
+    if (callback != NULL) callback(ctx, fail, NULL, NULL, NULL);
+    return 0;
+  }
+  if (rtype != CA_CONFIG_RESPONSE) {
+    /* unreachable (the slot filters by the pairing) — drop loud, move on */
+    ca_wire_payload_destroy(rtype, resp);
+    return 0;
+  }
+  return _deliver_config(client, rid, rstatus, (ca_config_response_t*)resp,
+                         callback, ctx);
+}
+
+int sa_client_config_set(sa_client_t* client, const char* base_url,
+                         const char* api_key, const char* model,
+                         sa_client_config_cb_t callback, void* ctx) {
+  ca_config_request_t* req;
+  uint64_t rid = 0, rtype = 0;
+  uint8_t rstatus = 0, fail = 0;
+  void* resp = NULL;
+  int rc = 0;
+  const char* members[3] = {base_url, api_key, model};
+
+  if (client == NULL) return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_config_set: a blocking op from an events callback "
+              "is refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
+  req = get_clear_memory(sizeof(*req));
+  if (req == NULL) {
+    _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory building the config set");
+    return 0;
+  }
+  req->base_url = _dup_string(members[0]);
+  req->api_key = _dup_string(members[1]);
+  req->model = _dup_string(members[2]);
+  if ((members[0] != NULL && req->base_url == NULL) ||
+      (members[1] != NULL && req->api_key == NULL) ||
+      (members[2] != NULL && req->model == NULL)) {
+    _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory building the config set");
+    ca_wire_payload_destroy(CA_CONFIG_REQUEST, req);
+    return 0;
+  }
+  /* A presented member that is "" rides the wire's absent sentinel — the
+     SET of an empty value cannot exist on this wire (the header's set
+     note); the call still answers the template's truth. */
+  rc = _roundtrip(client, CA_CONFIG_RESPONSE, req, CA_CONFIG_REQUEST, &rid,
+                  &rtype, &rstatus, &resp, &fail);
+  ca_wire_payload_destroy(CA_CONFIG_REQUEST, req);
+  if (rc < 0) return -1;
+  if (rc == 1) {
+    if (callback != NULL) callback(ctx, fail, NULL, NULL, NULL);
+    return 0;
+  }
+  if (rtype != CA_CONFIG_RESPONSE) {
+    /* unreachable (the slot filters by the pairing) — drop loud, move on */
+    ca_wire_payload_destroy(rtype, resp);
+    return 0;
+  }
+  return _deliver_config(client, rid, rstatus, (ca_config_response_t*)resp,
+                         callback, ctx);
+}
+
 /* ---- the reconnect ------------------------------------------------------------ */
 
 /* The backoff's cancellation-slicing sleep: 100 ms steps so destroy's join

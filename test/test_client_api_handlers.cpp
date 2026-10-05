@@ -1579,6 +1579,35 @@ TEST(TestClientApiHandlers, TestConfigGetAndSetTheTemplate) {
     ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
   }
 
+  /* THE PRESENT-MEMBER KEEP RULE: the template now CARRIES all three; a set
+     that arrives ABSENT for a member (the api_key here) leaves that member
+     untouched — a staged-NULL assignment never erases the template's text. */
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(8, "http://other.example", NULL,
+                               "gemma4:latest"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 8, 600)) << "the keep-rule SET's answer";
+  ca_session_handle(fx.server, CA_CONFIG_REQUEST,
+                    config_req(9, NULL, NULL, NULL), &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 9, 600)) << "the keep-rule GET's answer";
+  {
+    uint64_t type = 0, req_id = 0;
+    void* payload = NULL;
+    uint8_t status = 0;
+    ASSERT_TRUE(conn_decode(&conn, 8, &type, &payload, &req_id, &status));
+    ASSERT_EQ(type, (uint64_t)CA_CONFIG_RESPONSE);
+    ASSERT_EQ(req_id, 9u);
+    ca_config_response_t* res = (ca_config_response_t*)payload;
+    EXPECT_EQ(res->status, 0u);
+    EXPECT_STREQ(res->base_url, "http://other.example");
+    ASSERT_NE(res->api_key, nullptr)
+        << "the absent api_key kept the template's text";
+    EXPECT_STREQ(res->api_key, "sk-secret");
+    ASSERT_NE(res->model, nullptr);
+    EXPECT_STREQ(res->model, "gemma4:latest");
+    ca_wire_payload_destroy(CA_CONFIG_RESPONSE, payload);
+  }
+
   /* The RUNNING frame keeps its model: the registry frame is the SAME
      object through every template mutation — its config is the frame's OWN
      dup (taken at ITS frame_create from the ORIGINAL template), and the

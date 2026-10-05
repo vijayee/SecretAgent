@@ -252,6 +252,36 @@ int sa_client_subscribe_events(sa_client_t* client, const char* sid,
  * — refused immediately, no callback). */
 int sa_client_unsubscribe_events(sa_client_t* client);
 
+/* The config response (the CA_CONFIG pair's surface): status 0 = the three
+ * strings are the daemon's frame-config template's truth. The absent
+ * members ride NULL (the wire's "" sentinel decodes absent) — so a present
+ * but empty template member never exists. All three pointer arguments are
+ * HELD payloads (three releases for a full answer; a NULL member needs
+ * none), per the header's payload ownership rule above. */
+typedef void (*sa_client_config_cb_t)(void* ctx, uint8_t status,
+                                      const char* base_url,
+                                      const char* api_key, const char* model);
+
+/* Read the daemon's frame-config template (the all-absent CA_CONFIG request
+ * shape). GET + SET both answer the template's POST-SET truth with status 0.
+ * Same blocking + return contract as the request ops (including the
+ * events-callback re-entry refusal: -1, no callback). */
+int sa_client_config_get(sa_client_t* client, sa_client_config_cb_t callback,
+                         void* ctx);
+
+/* Mutate the daemon's frame-config template (the CA_CONFIG set: absent
+ * fields unchanged; NEW frames adopt the mutated template, RUNNING frames
+ * keep theirs). Each argument NON-NULL rides that set member; NULL is the
+ * ABSENT member — and an empty string is also absent (the wire's "" sentinel
+ * decodes to absent: a member can be SET to text, never TO empty — the
+ * honest reader sends a non-template'd value instead). The response's
+ * callback carries the template's post-set truth. Same blocking + return
+ * contract as the request ops (including the re-entry refusal: -1, no
+ * callback). */
+int sa_client_config_set(sa_client_t* client, const char* base_url,
+                         const char* api_key, const char* model,
+                         sa_client_config_cb_t callback, void* ctx);
+
 /* The dart:ffi ABI companion (the binding's struct-drift tripwire): the
  * config struct's byte shape, probed — each index maps to one offset/size;
  * the Dart tests call these and fail loud if the layouts ever drift. The

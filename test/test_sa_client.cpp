@@ -145,6 +145,13 @@ typedef struct rec_t {
   std::vector<size_t> session_count;
   std::vector<std::vector<std::string>> session_sids;
   std::vector<std::vector<std::string>> session_status;
+  /* the config responses (the GET's answer / the SET's echo): the absent
+     members ride "" here (the recorder's own NULLs→"" normalisation) */
+  std::vector<uint8_t> cfg_status;
+  std::vector<std::string> cfg_base;
+  std::vector<std::string> cfg_key;
+  std::vector<std::string> cfg_model;
+  int cfg_null_callbacks = 0;   /* the failure deliveries (NULL members) */
   /* the events: one slot per delivered callback (record or marker) */
   std::vector<uint64_t> ev_seq;
   std::vector<uint8_t> ev_op;
@@ -207,6 +214,28 @@ static void rec_sessions(void* ctx, uint8_t status,
   r->session_count.push_back(nrows);
   r->session_sids.push_back(sids);
   r->session_status.push_back(statuses);
+}
+
+static void rec_config(void* ctx, uint8_t status, const char* base_url,
+                       const char* api_key, const char* model) {
+  rec_t* r = (rec_t*)ctx;
+  std::lock_guard<std::mutex> g(r->m);
+  if (base_url == NULL && api_key == NULL && model == NULL) {
+    /* the failure delivery (NULL members — nothing to release) */
+    r->cfg_status.push_back(status);
+    r->cfg_base.push_back("");
+    r->cfg_key.push_back("");
+    r->cfg_model.push_back("");
+    r->cfg_null_callbacks++;
+    return;
+  }
+  r->cfg_status.push_back(status);
+  r->cfg_base.push_back(base_url ? base_url : "");
+  r->cfg_key.push_back(api_key ? api_key : "");
+  r->cfg_model.push_back(model ? model : "");
+  rec_release(r, (void*)base_url);
+  rec_release(r, (void*)api_key);
+  rec_release(r, (void*)model);
 }
 
 static void rec_events(void* ctx, const char* sid, uint64_t seq, uint8_t op,
@@ -321,6 +350,107 @@ TEST(TestSaClient, TestPromptRoundTripAndSessionsListing) {
 
   sa_client_destroy(cl);
   fixture_teardown(&fx);
+}
+
+TEST(TestSaClientConfig, TestConfigGetThenSetThenGet) {
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup(&fx), 0);
+  rec_t rec;
+  sa_client_config_t cfg = client_config(&fx);
+  cfg.error_ctx = &rec;
+  sa_client_t* cl = sa_client_connect(&cfg);
+  ASSERT_NE(cl, nullptr);
+
+  /* THE GET: the fixture template's truth — base/key absent (the ""/NULL
+     sentinel), model the fixture's own default. Status 0, no error channel
+     noise. */
+  ASSERT_EQ(sa_client_config_get(cl, rec_config, &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.cfg_status.empty();
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.cfg_status.back(), 0u);
+    EXPECT_STREQ(rec.cfg_base.back().c_str(), "");
+    EXPECT_STREQ(rec.cfg_key.back().c_str(), "");
+    EXPECT_STREQ(rec.cfg_model.back().c_str(), "unused");
+    EXPECT_EQ(rec.err_status.size(), 0u);
+  }
+
+  /* THE SET, model only: the absent members unchanged (the echo's base/key
+     stay absent; model rides). */
+  ASSERT_EQ(sa_client_config_set(cl, NULL, NULL, "gemma4:latest",
+                                 rec_config, &rec),
+            0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return rec.cfg_status.size() == 2;
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.cfg_status.back(), 0u);
+    EXPECT_STREQ(rec.cfg_base.back().c_str(), "");
+    EXPECT_STREQ(rec.cfg_key.back().c_str(), "");
+    EXPECT_STREQ(rec.cfg_model.back().c_str(), "gemma4:latest");
+  }
+
+  /* THE SET, all three members; the GET carries the whole template after. */
+  ASSERT_EQ(sa_client_config_set(cl, "http://127.0.0.1:11434", "sk-the-key",
+                                 "deepseek-chat", rec_config, &rec),
+            0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return rec.cfg_status.size() == 3;
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.cfg_status.back(), 0u);
+    EXPECT_STREQ(rec.cfg_base.back().c_str(), "http://127.0.0.1:11434");
+    EXPECT_STREQ(rec.cfg_key.back().c_str(), "sk-the-key");
+    EXPECT_STREQ(rec.cfg_model.back().c_str(), "deepseek-chat");
+  }
+  ASSERT_EQ(sa_client_config_get(cl, rec_config, &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return rec.cfg_status.size() == 4;
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.cfg_status.back(), 0u);
+    EXPECT_STREQ(rec.cfg_base.back().c_str(), "http://127.0.0.1:11434");
+    EXPECT_STREQ(rec.cfg_key.back().c_str(), "sk-the-key");
+    EXPECT_STREQ(rec.cfg_model.back().c_str(), "deepseek-chat");
+  }
+
+  /* THE "" SENTINEL = ABSENT: an empty-string member is NOT a set-to-empty;
+     the GET's truth keeps every prior member (the wire's decode rule). */
+  ASSERT_EQ(sa_client_config_set(cl, "", "", "gemma4:latest", rec_config, &rec),
+            0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return rec.cfg_status.size() == 5;
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.cfg_status.back(), 0u);
+    EXPECT_STREQ(rec.cfg_base.back().c_str(), "http://127.0.0.1:11434")
+        << "the empty-string base_url decoded ABSENT, not a set-to-empty";
+    EXPECT_STREQ(rec.cfg_key.back().c_str(), "sk-the-key");
+    EXPECT_STREQ(rec.cfg_model.back().c_str(), "gemma4:latest");
+    EXPECT_EQ(rec.cfg_null_callbacks, 0u) << "no failure delivery rode";
+    EXPECT_EQ(rec.err_status.size(), 0u);
+  }
+
+  sa_client_destroy(cl);
+  fixture_teardown(&fx);
+}
+
+TEST(TestSaClientConfig, TestNullClientRefusedOutright) {
+  ASSERT_EQ(sa_client_config_get(NULL, rec_config, nullptr), -1);
+  ASSERT_EQ(
+      sa_client_config_set(NULL, "http://x", "k", "m", rec_config, nullptr),
+      -1);
 }
 
 TEST(TestSaClient, TestSteerAndEventsStreamWithMarkers) {

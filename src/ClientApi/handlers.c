@@ -291,12 +291,25 @@ static void _ca_on_config(ca_session_server_t* server, void* payload_raw,
                      "the config set was refused (out of memory)");
       return;
     }
-    free((char*)server->cfg.model_base_url);
-    free((char*)server->cfg.model_api_key);
-    free((char*)server->cfg.model_name);
-    server->cfg.model_base_url = base_url;   /* absent = its NULL rides */
-    server->cfg.model_api_key = api_key;
-    server->cfg.model_name = model;
+    /* Absent-fields-unchanged, COMMITTED per present member: a member a
+       set carries is freed + re-dup'd; an ABSENT member's template text
+       STAYS (the staged NULL never overwrote it — the wire's "" sentinel
+       decoded absent above, and the stage left it NULL). The prior
+       commit's blanket free + NULL assignment erased a template member a
+       absent set touched — the client suite's mixed absent/present set
+       pinned the loss; this shape is the fix. */
+    if (base_url != NULL) {
+      free((char*)server->cfg.model_base_url);
+      server->cfg.model_base_url = base_url;
+    }
+    if (api_key != NULL) {
+      free((char*)server->cfg.model_api_key);
+      server->cfg.model_api_key = api_key;
+    }
+    if (model != NULL) {
+      free((char*)server->cfg.model_name);
+      server->cfg.model_name = model;
+    }
   }
   /* The template's post-set truth answers both the GET and the SET (the
      SET's status-0 echo — the plan's answer shape). */
