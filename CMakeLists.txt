@@ -383,6 +383,100 @@ if(SA_ENABLE_TSAN AND NOT MSVC)
   target_link_options(secretagent INTERFACE -fsanitize=thread)
 endif()
 
+# libsa_client (the FFI client stack, the client-api spec §1): ONE
+# self-contained shared object the dart:ffi consumer dlopens — Pondr ships
+# exactly one file, so the .so must not lean on a libsecretagent artifact.
+# WHY THE WHOLE C_SRC list (the static target's exact set, which already
+# covers src/ClientLibs + src/ClientApi + src/Network through the glob): the
+# client-api module is BOTH sides — sa_client.c is the consumer stack, but
+# handlers.c (the served side) USES the frame layer (frame_internal.h /
+# frame_messages.h), and the frame layer pulls the store, the scheduler, the
+# streams loop, and the rest of the runtime. That closure IS the runtime
+# library, so the honest shared target is the runtime library as a .so: the
+# same file list compiled SHARED (a second compile — CMake keeps the static
+# archive untouched), never a link against the static target. The OFF gates
+# keep the .so out of a sans-store/sans-streams build (the empty-TU idiom
+# leaves no client to ship).
+if(SA_ENABLE_WDB AND SA_ENABLE_STREAMS)
+  # The .so carries the runtime MINUS the python execution layer: CPython's
+  # static archive is not shared-object-safe on this family (its import.o
+  # carries a local-exec TLS relocation against pkgcontext — R_X86_64_TPOFF32
+  # — which the dynamic linker rejects outright), so src/Python is filtered
+  # and SA_HAS_PYTHON stays undefined on this target. Everything else gates
+  # its pyrt references behind that define (frame.c's runtime boot/teardown,
+  # loop.c's _loop_python_ready answering 0 — a tool call then fails loud
+  # with control "python-missing", the designed no-runtime shape); the
+  # daemon (frame-demo) keeps hosting Python through the static library.
+  set(SA_CLIENT_SHARED_SRC ${C_SRC})
+  list(FILTER SA_CLIENT_SHARED_SRC EXCLUDE
+    REGEX "^${CMAKE_CURRENT_SOURCE_DIR}/src/Python/")
+  add_library(sa_client SHARED ${SA_CLIENT_SHARED_SRC})
+  # A shared object needs position-independent objects; the static build does
+  # not, so the property is per-target and the library's sources recompile
+  # PIC independently of the archive (the dep archives this target pulls are
+  # all configured with CMAKE_POSITION_INDEPENDENT_CODE=ON — wavedb,
+  # poll-dancer, the in-tree http_parser — and libcbor/xxhash/hashmap are
+  # built inside wavedb's PIC-ON configure scope).
+  set_target_properties(sa_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(sa_client PRIVATE ${C_INC})
+
+  # MIRRORING DISCIPLINE: every compile/link surface below repeats the static
+  # target's block VERBATIM (same gates, same orders, same conditions) with
+  # sa_client substituted — the .so must see the identical ABI surface the
+  # archive's consumers see, MODULO the python exclusion above (no
+  # SA_HAS_PYTHON define, no libpython link, no cpython-ext dependency).
+
+  target_compile_definitions(sa_client PUBLIC SA_HAS_WDB=1)
+  target_include_directories(sa_client PRIVATE ${WDB_ROOT}/src)
+  target_link_libraries(sa_client PUBLIC ${WDB_LINK_ARCHIVE})
+  add_dependencies(sa_client wavedb-ext ${WDB_ALIAS_TARGET})
+  target_include_directories(sa_client PRIVATE
+    ${WDB_ROOT}/deps/libcbor/src
+    ${WDB_BUILD}/deps/libcbor
+    ${WDB_BUILD}/deps/libcbor/src
+    ${WDB_ROOT}/deps/hashmap/include)
+  target_link_libraries(sa_client PUBLIC
+    ${WDB_BUILD}/libxxhash.a
+    ${WDB_BUILD}/deps/libcbor/src/libcbor.a
+    ${WDB_BUILD}/libhashmap.a
+    pthread m atomic)
+  find_package(OpenSSL COMPONENTS Crypto)
+  if(OpenSSL_FOUND)
+    target_link_libraries(sa_client PUBLIC OpenSSL::Crypto)
+  endif()
+
+  target_compile_definitions(sa_client PUBLIC SA_HAS_STREAMS=1)
+  target_include_directories(sa_client PUBLIC ${PD_ROOT}/include)
+  target_link_libraries(sa_client PUBLIC ${PD_BUILD}/libpoll_dancer.a
+    http_parser)
+  target_link_libraries(sa_client PUBLIC pthread)
+  find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
+  target_link_libraries(sa_client PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+
+  if(SA_ENABLE_ASAN)
+    if(MSVC)
+      target_compile_options(sa_client PRIVATE /fsanitize=address /Z7)
+    else()
+      target_compile_options(sa_client PRIVATE -fsanitize=address
+        -fno-omit-frame-pointer -g)
+      # On a SHARED target the runtime must ride the .so's own link (the
+      # static target hands it to consumers through INTERFACE; the .so has
+      # no consumer link here — dlopen resolves nothing sanitizer-wise).
+      target_link_options(sa_client PRIVATE -fsanitize=address)
+    endif()
+  endif()
+  if(SA_ENABLE_UBSAN AND NOT MSVC)
+    target_compile_options(sa_client PRIVATE -fsanitize=undefined
+      -fno-omit-frame-pointer -g)
+    target_link_options(sa_client PRIVATE -fsanitize=undefined)
+  endif()
+  if(SA_ENABLE_TSAN AND NOT MSVC)
+    target_compile_options(sa_client PRIVATE -fsanitize=thread
+      -fno-omit-frame-pointer -g)
+    target_link_options(sa_client PRIVATE -fsanitize=thread)
+  endif()
+endif()
+
 # frame-demo (Task 11): the demo CLI. One executable, no tests: it needs the
 # frame store (WaveDB gate — frame.h's whole surface rides SA_HAS_WDB) and
 # the model client; the python bridge arrives through the same library link.

@@ -827,4 +827,31 @@ TEST(TestSaClientTcp, TestBadKeyConnectRefused) {
   fixture_teardown(&fx);
 }
 
+/* The FFI ABI companion's probes (the C-side half of the struct-drift
+   contract; the Dart test pins the EXACT values, this suite pins the
+   SHAPE: the ten members in declared order — non-decreasing offsets, all
+   inside the struct's byte budget, the first member at 0 — and the
+   out-of-range answer 0). A reordered member, a count change, or a member
+   pushed past the recorded size flips one of these. */
+TEST(TestSaClientConfigFfi, TestProbesPinTheStructShape) {
+  size_t size = sa_client_config_ffi_sizeof();
+  ASSERT_GT(size, (size_t)0);
+
+  size_t prev = 0;
+  for (int i = 0; i < 10; i++) {
+    size_t off = sa_client_config_ffi_offset(i);
+    ASSERT_LE(prev, off) << "probe index " << i
+                         << " answered before its predecessor: the "
+                            "declared order drifted";
+    ASSERT_LT(off, size) << "probe index " << i
+                         << " answered past sizeof: the struct grew "
+                            "beyond the recorded budget";
+    prev = off;
+  }
+  EXPECT_EQ(sa_client_config_ffi_offset(0), (size_t)0);
+  /* the out-of-range bounds answer 0 (the probe's documented floor) */
+  EXPECT_EQ(sa_client_config_ffi_offset(10), (size_t)0);
+  EXPECT_EQ(sa_client_config_ffi_offset(-1), (size_t)0);
+}
+
 #endif /* SA_HAS_WDB && SA_HAS_STREAMS */

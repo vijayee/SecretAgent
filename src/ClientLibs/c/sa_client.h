@@ -252,6 +252,17 @@ int sa_client_subscribe_events(sa_client_t* client, const char* sid,
  * — refused immediately, no callback). */
 int sa_client_unsubscribe_events(sa_client_t* client);
 
+/* The dart:ffi ABI companion (the binding's struct-drift tripwire): the
+ * config struct's byte shape, probed — each index maps to one offset/size;
+ * the Dart tests call these and fail loud if the layouts ever drift. The
+ * members' DECLARED order is the index order (the mirror's field order must
+ * follow it: dart:ffi structs lay out in declaration order). Both are pure
+ * compile-time-constant answers — no locks, no allocation. */
+size_t sa_client_config_ffi_sizeof(void);
+size_t sa_client_config_ffi_offset(int index);   /* 0..: transport, socket_path,
+     host, port, api_key, connect_timeout_ms, request_timeout_ms, max_retries,
+     error_cb, error_ctx — the count = 10; an out-of-range index answers 0. */
+
 #ifdef __cplusplus
 }
 #endif

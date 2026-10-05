@@ -1568,4 +1568,32 @@ void sa_client_destroy(sa_client_t* client) {
   free(client);
 }
 
+/* ---- the FFI ABI companion (the header's struct-drift tripwire) ------------ */
+
+/* The config struct's member count and its declared index order live in ONE
+   switch — a member added to (or reordered in) sa_client_config_t must
+   extend this table in the SAME edit, or the probe index's documented
+   order drifts (the C-side test pins the ascending/within-sizeof sanity;
+   the Dart test pins the exact values). */
+
+size_t sa_client_config_ffi_sizeof(void) {
+  return sizeof(sa_client_config_t);
+}
+
+size_t sa_client_config_ffi_offset(int index) {
+  switch (index) {
+    case 0: return offsetof(sa_client_config_t, transport);
+    case 1: return offsetof(sa_client_config_t, socket_path);
+    case 2: return offsetof(sa_client_config_t, host);
+    case 3: return offsetof(sa_client_config_t, port);
+    case 4: return offsetof(sa_client_config_t, api_key);
+    case 5: return offsetof(sa_client_config_t, connect_timeout_ms);
+    case 6: return offsetof(sa_client_config_t, request_timeout_ms);
+    case 7: return offsetof(sa_client_config_t, max_retries);
+    case 8: return offsetof(sa_client_config_t, error_cb);
+    case 9: return offsetof(sa_client_config_t, error_ctx);
+    default: return 0;   /* out of range: the probe answers 0 */
+  }
+}
+
 #endif /* SA_HAS_WDB && SA_HAS_STREAMS */
