@@ -2556,6 +2556,29 @@ static json_value_t* _frame_ask_record_payload(frame_t* f,
   return payload;
 }
 
+/* The ask.resolution record's compose (every parked-ask refusal's shape:
+   {kind ask-reply, askId, decision, value}): the owner's FRM_ASK_REPLY
+   consume and the park's WAKE LATCHES (escalation spec §4 — the steer's
+   supersede, the interrupt's refuse, and an interrupted ASKING cell's
+   auto-resolution) all pin this ONE record shape. NULL on OOM — loud. The
+   empty/NULL value renders JSON null (the standing consume's shape). */
+static json_value_t* _frame_ask_reply_payload_compose(const char* ask_id,
+                                                      const char* decision,
+                                                      const char* value) {
+  json_value_t* payload = json_new_object();
+  if (payload == NULL) {
+    log_error("frame: out of memory composing an ask.reply payload");
+    return NULL;
+  }
+  json_object_set(payload, "kind", json_new_string("ask-reply"));
+  json_object_set(payload, "askId", json_new_string(ask_id));
+  json_object_set(payload, "decision", json_new_string(decision));
+  json_object_set(payload, "value",
+                  (value != NULL && value[0] != '\0') ? json_new_string(value)
+                                                      : json_new_null());
+  return payload;
+}
+
 /* The parked ask's PAIRED close (escalation spec §1.3): the ordinary close's
    sibling — ONE fire-and-post batch of [cell.result (the real status),
    step.end, the "ask" record, turn.end{reason blocked}] so the ask and its
@@ -2655,13 +2678,42 @@ void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
     log_error("frame: interrupt apply on a dead frame");
     return;
   }
-  const char* names[3];   /* filled in step with payloads (an OOM'd cell.result
-                             record is SKIPPED, so indices must never alias) */
-  json_value_t* payloads[3];
+  const char* names[5];   /* filled in step with payloads (an OOM'd record is
+                             SKIPPED, so indices must never alias) */
+  json_value_t* payloads[5];
   size_t n = 0;
   uint8_t cell_was_pending = f->cell_pending;
   uint8_t with_riders =
       (f->engine.engine_live != 0 && f->engine.turn_open != 0) ? 1 : 0;
+  /* The interrupted ASKING cell's resolution (escalation spec §4, the
+     review's fold): interrupt/deadline close of a CELL whose ask is parked —
+     the close batch GAINS the ask's records so the resolution is durable
+     with the turn's end (the standing close evaporated the park at the
+     terminate with NO durable record: the model asked, the owner never saw
+     it). The ASKING cell never wrote its "ask" record (ask_close owns that
+     compose and never ran) — BOTH records compose here. An OOM'd record is
+     skipped loud, never waited on (the standing interrupt contract). */
+  uint8_t with_ask = (with_riders != 0 && f->engine.pending_ask.ask_id != NULL)
+                         ? 1 : 0;
+  json_value_t* ask_payload = NULL;
+  json_value_t* ask_reply_payload = NULL;
+  if (with_ask != 0) {
+    ask_payload = _frame_ask_record_payload(f, &f->engine);
+    if (ask_payload == NULL) {
+      log_error("frame: the interrupted asking cell's ask record at '%s' "
+                "never composed (out of memory) — the batch rides WITHOUT it "
+                "(the missing question is the resume-repair-visible gap)",
+                f->sid_path);
+    }
+    ask_reply_payload = _frame_ask_reply_payload_compose(
+        f->engine.pending_ask.ask_id, "reject",
+        "interrupted at the frame's request");
+    if (ask_reply_payload == NULL) {
+      log_error("frame: out of memory composing the interrupted asking "
+                "cell's ask.reply at '%s' — the batch rides WITHOUT it loud",
+                f->sid_path);
+    }
+  }
   if (cell_was_pending != 0) {
     json_value_t* cell_result = json_new_object();
     if (cell_result == NULL) {
@@ -2681,6 +2733,21 @@ void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
   if (with_riders != 0) {
     names[n] = LIFE_EVENT_STEP_END;
     payloads[n++] = lifecycle_step_json(f->engine.turn_counter, 1);
+  }
+  if (with_ask != 0) {
+    /* The paired resolution, riding the close (ask first, its refusal
+       second — the same order the ordinary close and the reply's consume
+       use). */
+    if (ask_payload != NULL) {
+      names[n] = "ask";
+      payloads[n++] = ask_payload;
+    }
+    if (ask_reply_payload != NULL) {
+      names[n] = "ask.reply";
+      payloads[n++] = ask_reply_payload;
+    }
+  }
+  if (with_riders != 0) {
     names[n] = LIFE_EVENT_TURN_END;
     payloads[n++] =
         lifecycle_turn_end_json(f->engine.turn_counter, LIFE_REASON_ABORTED,
@@ -2748,6 +2815,13 @@ void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
       f->cell_status = 1;
     }
     f->pyrt_poisoned = 1;
+    if (with_ask != 0) {
+      /* The park evaporates with ITS OWN resolution (the refusal rode the
+         batch; the clear follows the post — the standing consume
+         discipline), BEFORE the terminate (whose funnel clear owns the
+         refused-batch path's park instead). */
+      _frame_engine_ask_clear(f);
+    }
 #ifdef SA_HAS_PYTHON
     if (f->pyrt != NULL) pyrt_interrupt(f->pyrt);
 #endif
@@ -2755,8 +2829,64 @@ void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
     return;
   }
   log_error("frame: the interrupt close at '%s' was refused pre-post — the "
-            "tail stays for resume-repair", f->sid_path);
+            "tail stays for resume-repair; the park's resolution rides the "
+            "same refusal shape (the terminate's funnel clears it)",
+            f->sid_path);
   _frame_engine_terminate(f, 0, reason_text);
+}
+
+/* The PARKED interrupt's latch (escalation spec §4: interrupt while parked,
+   Q7's resolution): the turn already ended durably blocked, so a wakeup
+   interrupt here is NO mid-cell cut — no synthesized close, NO terminate,
+   NO poison, NO cut arm. The pending ask auto-answers
+   {decision reject, "interrupted at the frame's request"} and ONE batch
+   carries the refusal + its control marker {ask-interrupted} (the
+   doom close's control-then-close shape, atomically). The park clears with
+   the post (the standing consume discipline: a pre-post refusal or an OOM'd
+   compose leaves it standing for the retry — the reply's shape) and the
+   frame returns IDLE-RESUMABLE: phase NONE, the engine stays live, the
+   poison rules untouched. NO FRM_TURN: the refused ask carries no user-side
+   input — a later reply/steer (whose parked branch is gone) opens the next
+   turn itself. */
+static void _frame_park_interrupt_apply(frame_t* f) {
+  if (f == NULL || f->st == NULL || f->engine.pending_ask.ask_id == NULL) {
+    log_error("frame: the parked interrupt's latch on a dead frame or no "
+              "park");
+    return;
+  }
+  json_value_t* reply_payload = _frame_ask_reply_payload_compose(
+      f->engine.pending_ask.ask_id, "reject",
+      "interrupted at the frame's request");
+  json_value_t* control_payload = json_new_object();
+  if (control_payload != NULL) {
+    json_object_set(control_payload, "kind",
+                    json_new_string("ask-interrupted"));
+    json_object_set(control_payload, "text", json_new_null());
+  }
+  if (reply_payload == NULL || control_payload == NULL) {
+    json_value_destroy(reply_payload);
+    json_value_destroy(control_payload);
+    log_error("frame: out of memory composing the parked ask's interrupt "
+              "resolution at '%s' (ask %s) — the park stands for the retry",
+              f->sid_path, f->engine.pending_ask.ask_id);
+    return;
+  }
+  const char* names[2] = {"ask.reply", "control"};
+  json_value_t* payloads[2] = {reply_payload, control_payload};
+  int rc = _frame_event_batch_post_fire(f, names, payloads, 2,
+                                        "parked ask interruption");
+  if (rc != 0) {
+    log_error("frame: the parked ask's interrupt resolution at '%s' was "
+              "refused pre-post — the park stands for the retry", f->sid_path);
+    return;
+  }
+  /* The frame returns idle-resumable (the phase follows the clear; the
+     engine stays live — a later steer/reply re-enters through its own
+     wake/continuation). */
+  _frame_engine_ask_clear(f);
+  f->engine.phase = FRAME_PHASE_NONE;
+  log_info("frame: the parked ask at '%s' was interrupted — the frame idles "
+           "resumable, the turn's blocked close untouched", f->sid_path);
 }
 
 /* The SYNC-SEMANTICS write (frame_internal.h contract): post the event
@@ -3871,7 +4001,26 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          at the compose) — a hand-crafted payload that fails it is dropped
          loud with nothing committed. A steer arriving AFTER the frame ended
          (done) still appends when it slipped past the handler's refusal —
-         the log stays appendable; the handler layer owns the done-refusal. */
+         the log stays appendable; the handler layer owns the done-refusal.
+
+         THE PARK'S STEER LATCH (escalation spec §4, Q7's resolution): a
+         steer over a standing park SUPERSEDES the pending ask — the ask
+         auto-answers {decision reject, "superseded by new user input"} and
+         the steer's own durable msg.append is the next turn's input (NO
+         extra turn for the refusal alone, NO second user-side append for
+         the value). The append + the refusal ride ONE batch (append first;
+         atomically — a crash can never leave the input committed without
+         its resolution, and a store-stage refusal leaves the park standing
+         for the whole pair's retry, never half).
+         THE STEER'S WAKE: the standing steer never posts a FRM_TURN — in
+         its standing shape the engine is mid-run and the run loop's own
+         continuation serves the next derive. A parked engine is NOT in that
+         shape (its run loop already returned), and neither is the
+         idle-resumable engine an interrupted park leaves: a live engine
+         resting at phase NONE with the steer's fresh input in the tail
+         re-enters via the ask-reply continuation's repost idiom (the wake
+         is honored at the park's wake; a done frame's engine is already
+         ended — its steer stays append-only). */
       frm_steer_payload_t* sp = (frm_steer_payload_t*)msg->payload;
       msg->payload = NULL;
       if (sp == NULL || sp->role == NULL || sp->text == NULL) {
@@ -3880,11 +4029,61 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         frm_steer_payload_destroy(sp);
         break;
       }
-      json_value_t* payload = _frame_msg_append_payload(sp->role, sp->text);
-      if (payload != NULL) {
-        _frame_event_post_fire(f, "msg.append", payload);
+      uint8_t superseded =
+          (f->engine.pending_ask.ask_id != NULL &&
+           f->engine.phase == FRAME_PHASE_ASK) ? 1 : 0;
+      json_value_t* append_payload =
+          _frame_msg_append_payload(sp->role, sp->text);
+      json_value_t* reply_payload = NULL;
+      if (superseded != 0) {
+        reply_payload = _frame_ask_reply_payload_compose(
+            f->engine.pending_ask.ask_id, "reject",
+            "superseded by new user input");
       }
-      frm_steer_payload_destroy(sp);
+      if (append_payload == NULL ||
+          (superseded != 0 && reply_payload == NULL)) {
+        /* Nothing was posted (the compose failed pre-post) — the steer is
+           dropped loud (the standing append-OOM shape); a superseding steer
+           additionally leaves the park standing for the retry. */
+        log_error("frame: out of memory composing the steer's records at '%s' "
+                  "— dropped loud, nothing committed%s", f->sid_path,
+                  (superseded != 0) ? "; the park stands for the retry" : "");
+        json_value_destroy(append_payload);
+        json_value_destroy(reply_payload);
+        frm_steer_payload_destroy(sp);
+        break;
+      }
+      if (superseded != 0) {
+        const char* names[2] = {"msg.append", "ask.reply"};
+        json_value_t* payloads[2] = {append_payload, reply_payload};
+        int rc = _frame_event_batch_post_fire(f, names, payloads, 2,
+                                              "steer supersede");
+        frm_steer_payload_destroy(sp);
+        if (rc != 0) {
+          /* The pre-post refusal logged; the park stands for the retry. */
+          break;
+        }
+        /* The park clears with its rejection (the standing consume
+           discipline; the pyrt publish flag follows the clear). */
+        _frame_engine_ask_clear(f);
+        f->engine.phase = FRAME_PHASE_NONE;
+      } else {
+        _frame_event_post_fire(f, "msg.append", append_payload);
+        frm_steer_payload_destroy(sp);
+      }
+      /* The steer's own re-entry: a live engine resting at phase NONE (the
+         park just cleared, or the idle-post-turn engine the interrupt latch
+         left) serves the steer's input; the repost's refusal is the DESTROY
+         flag only, loud, never silent. */
+      if (f->engine.engine_live != 0 && f->engine.phase == FRAME_PHASE_NONE) {
+        if (atomic_load(&f->actor.flags) & ACTOR_FLAG_DESTROY) {
+          log_error("frame: the steer's turn continuation was refused at "
+                    "'%s' — the mailbox is gone; the frame idles",
+                    f->sid_path);
+        }
+        _frame_post(&f->actor, (uint32_t)FRM_TURN, NULL, NULL,
+                    "the steer's turn continuation");
+      }
       break;
     }
     case FRM_INT:
@@ -3898,8 +4097,18 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          no-op plus the next arm's single-watch false alarm). Disarm is
          idempotent and NULL-safe. The case runs in python-less builds too —
          the apply guards its pyrt accesses internally; the FRM_INT case is
-         unconditional. */
+         unconditional. The PARK'S INTERRUPT LATCH (escalation spec §4):
+         a wakeup interrupt over a standing park is NOT a mid-cell cut (the
+         turn already ended durably blocked) — the park auto-answers, the
+         frame idles-resumable, the poison stays untouched; the standing
+         synthesis runs everywhere else (the ASKING cell's interrupt still
+         rides it, its close batch carrying the ask's resolution). */
       _frame_cell_watchdog_disarm(f);
+      if (f->engine.pending_ask.ask_id != NULL &&
+          f->engine.phase == FRAME_PHASE_ASK) {
+        _frame_park_interrupt_apply(f);
+        break;
+      }
       _frame_interrupt_apply(f, 1, "aborted: interrupted at the frame's request");
       break;
     case FRM_CELL_WATCHDOG: {
@@ -4050,17 +4259,9 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       } else {
         content = "Owner declined.";
       }
-      json_value_t* reply_payload = json_new_object();
+      json_value_t* reply_payload = _frame_ask_reply_payload_compose(
+          rp->ask_id, decision_name, rp->value);
       json_value_t* append_payload = _frame_msg_append_payload("user", content);
-      if (reply_payload != NULL) {
-        json_object_set(reply_payload, "kind", json_new_string("ask-reply"));
-        json_object_set(reply_payload, "askId", json_new_string(rp->ask_id));
-        json_object_set(reply_payload, "decision",
-                        json_new_string(decision_name));
-        json_object_set(reply_payload, "value",
-                        (rp->value != NULL && rp->value[0] != '\0')
-                            ? json_new_string(rp->value) : json_new_null());
-      }
       if (reply_payload == NULL || append_payload == NULL) {
         json_value_destroy(reply_payload);
         json_value_destroy(append_payload);

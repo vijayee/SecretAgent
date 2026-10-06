@@ -266,10 +266,14 @@ if (BUILD_TESTING)
            # Escalation Task 2: the ask park's three pins run real pyrt cells
            # (turn 1's cell calls actor.ask through the frame's own runtime) —
            # the same CPython-owned classes. The engine-less ask pin (the
-           # fourth) runs NO cell and keeps full leak checking.
+           # fourth) runs NO cell and keeps full leak checking; the
+           # refused-batch pin (Task 3's registration fix) parks and retries
+           # against a real cell too — its sibling's registration was missed
+           # at Task 2 and its full-LSan run fails on the same classes.
            _test_name MATCHES "^TestFrame.TestAskParksAndBlocksTheTurn$" OR
            _test_name MATCHES "^TestFrame.TestAskStaleReplyIsDroppedLoud$" OR
-           _test_name MATCHES "^TestFrame.TestAskSecondAskInSameTurnRefused$")
+           _test_name MATCHES "^TestFrame.TestAskSecondAskInSameTurnRefused$" OR
+           _test_name MATCHES "^TestFrame.TestAskReplyRefusedBatchKeepsTheParkedAskStanding$")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()
       endforeach()

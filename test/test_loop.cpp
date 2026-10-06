@@ -3,6 +3,7 @@
 //
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -18,6 +19,7 @@ extern "C" {
 #include "../src/Frame/persona.h"          /* the compose expectations' pure API */
 #include "../src/Frame/persona_records.h"  /* the shipped hammer record */
 #include "../src/Scheduler/scheduler.h"   /* the pooled tests' pool API */
+#include "../src/Util/log.h"              /* the publish poll's INFO capture */
 #include "../src/Util/json.h"
 #include "../src/Util/allocator.h"
 }
@@ -260,6 +262,41 @@ static int scripted_decode(const std::string& body, model_reply_t** reply_out,
   json_value_destroy(root);
   *reply_out = r;
   return 0;
+}
+
+/* JSON-string escaping (the canned body shapes carry two layers: the
+   tool-call arguments value is itself a JSON-encoded string — the same
+   helper test_frame.cpp's canned bodies ride). */
+static std::string json_escape(const std::string& s) {
+  std::string out;
+  for (char c : s) {
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      default:   out += c;
+    }
+  }
+  return out;
+}
+
+/* An `execute` tool-call completion body whose `code` argument is `code`
+   (test_frame.cpp's canned shape; the ask tests copy it — no shared file
+   restructuring). */
+static std::string canned_cell_body(const std::string& code) {
+  std::string inner = std::string("{\"code\":\"") + json_escape(code) + "\"}";
+  return std::string(
+             R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+             R"json({"type":"function","function":{"name":"execute",)json"
+             R"json("arguments":")json") + json_escape(inner) +
+             std::string(R"json("}}]}}]})json");
+}
+
+/* A content-only completion body. */
+static std::string canned_content_body(const std::string& text) {
+  return std::string(
+      R"json({"choices":[{"message":{"role":"assistant","content":")json") + text +
+      std::string(R"json("}}]})json");
 }
 
 static int scripted_complete(void* self, json_value_t* messages, json_value_t* tools,
@@ -1686,6 +1723,455 @@ TEST(TestLoop, TestFrameInterruptArmsNoStoreWriteWhenNothingOpen) {
   char* v = frame_recall(f, "k");   /* the frame still works (no deadlock) */
   free(v);
   frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* --- escalation task 3: the park's wake latches (spec §4, Q7) --------------
+
+   The parked ask is the first DURABLE quiescence point, and the wakeup
+   classes latch there: a steer over it SUPERSEDES (the ask auto-answers,
+   the steer's own append serves the next turn), an interrupt over it
+   REFUSES it (auto-answer + the frame stays idle-resumable — a post-turn
+   interrupt is no mid-cell cut: no poison, no engine end), and both arrive
+   → the interrupt wins while the steer still rides. The harness shapes are
+   this file's scripted model + the interrupt precedent, with the ask flow's
+   park pin (test_frame.cpp's TestAskParksAndBlocksTheTurn) copied — no
+   shared-file restructuring. */
+
+/* The parked ask's minted ask_id (the park's compact pin: the loop returns
+   LIVE rc 2, not done, one "ask" record in place; "" on any miss). */
+static std::string park_and_pin_ask_id(frame_t* f) {
+  EXPECT_EQ(frame_run_loop(f), 2) << "parked awaiting the owner's reply";
+  EXPECT_EQ(frame_is_done(f), 0);
+  json_value_t* events = load_events(f);
+  EXPECT_NE(events, nullptr);
+  if (events == nullptr) return std::string();
+  size_t ask_index = (size_t)-1;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "ask")) {
+      EXPECT_EQ(ask_index, (size_t)-1) << "exactly ONE ask record";
+      ask_index = i;
+    }
+  }
+  std::string ask_id;
+  if (ask_index != (size_t)-1) {
+    json_value_t* payload = json_get(json_at(events, ask_index), "payload");
+    json_value_t* id = (payload != NULL) ? json_get(payload, "askId") : NULL;
+    if (id != NULL) ask_id = json_as_string(id);
+    EXPECT_EQ(ask_id.size(), 8u) << "the mint: the sid allocator's 8-hex shape";
+    EXPECT_EQ(count_type(events, "ask.reply"), 0u)
+        << "nothing resolved while parked";
+  }
+  json_value_destroy(events);
+  return ask_id;
+}
+
+/* The FIRST "ask.reply" record (NULL when absent). */
+static json_value_t* find_ask_reply(json_value_t* events) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "ask.reply")) return rec;
+  }
+  return NULL;
+}
+
+TEST(TestLoop, TestSteerDuringParkSupersedesTheAsk) {
+  /* The steer's latch: the ask parked; the steer over it supersedes — the
+     auto-answer's ask.reply {reject, "superseded by new user input"} rides
+     ONE batch with the steer's msg.append (the input, first), the park
+     clears, and the STEER's turn is the wake: turn 2's derive carries the
+     steer's text. No extra turn for the refusal alone. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "decide: which way?", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  std::vector<std::string> replies = {
+      canned_cell_body("import actor\nactor.ask('which way?', ['left', 'right'])"
+                       "\nprint('asked')"),
+      canned_content_body("did it differently")};
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  std::string ask_id = park_and_pin_ask_id(f);
+  ASSERT_EQ(ask_id.size(), 8u);
+  frame_engine_state_t* e = _frame_engine_state(f);
+  ASSERT_NE(e, nullptr);
+  EXPECT_EQ(e->phase, FRAME_PHASE_ASK) << "the state under test is the park";
+  EXPECT_EQ(e->engine_live, 1u) << "the parked engine stays live";
+
+  /* THE STEER over the park (the FRM_STEER dispatch — the posted steer's
+     route, not the sync append). */
+  EXPECT_EQ(_frame_steer_post(f, "user", "do it differently"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0)
+      << "the wake is honored: the steer's turn ran to its end";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* reply_rec = find_ask_reply(events);
+  ASSERT_NE(reply_rec, nullptr);
+  ASSERT_EQ(count_type(events, "ask.reply"), 1u);
+  json_value_t* reply_payload = json_get(reply_rec, "payload");
+  ASSERT_NE(reply_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "kind")), "ask-reply");
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "askId")), ask_id.c_str());
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "decision")), "reject");
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "value")),
+               "superseded by new user input");
+
+  /* The SAME-batch pair: the steer's durable msg.append is FIRST, the
+     refusal SECOND (consecutive seqs; the pair sits after the close's
+     turn.end). */
+  size_t reply_at = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (json_at(events, i) == reply_rec) reply_at = i;
+  }
+  ASSERT_GE(reply_at, 1u);
+  json_value_t* steer_rec = json_at(events, reply_at - 1);
+  ASSERT_TRUE(event_is(steer_rec, "msg.append"));
+  json_value_t* steer_payload = json_get(steer_rec, "payload");
+  ASSERT_NE(steer_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(steer_payload, "role")), "user");
+  EXPECT_STREQ(json_as_string(json_get(steer_payload, "content")),
+               "do it differently");
+  EXPECT_EQ(rec_seq(steer_rec), rec_seq(reply_rec) - 1)
+      << "ONE atomic batch: the input + its resolution";
+
+  /* No extra turn for the refusal alone: the run holds TWO turns — turn 1
+     (the asking cell's, closed blocked) and the STEER's turn 2. */
+  EXPECT_EQ(count_type(events, "turn.start"), 2u);
+  EXPECT_EQ(count_type(events, "turn.end"), 2u);
+  json_value_t* first_end = life_record_of_turn(events, "turn.end", 1);
+  ASSERT_NE(first_end, nullptr);
+  EXPECT_EQ(turn_end_kind(first_end), "blocked");
+  json_value_t* second_end = life_record_of_turn(events, "turn.end", 2);
+  ASSERT_NE(second_end, nullptr);
+  EXPECT_EQ(turn_end_kind(second_end), "completed");
+  EXPECT_EQ(count_type(events, "msg.append"), 2u)
+      << "the steer's append + the assistant content — never a second "
+         "user-side append for the refusal";
+
+  /* Turn 2's derive carried the steer text (the wake's input). */
+  std::string second = (sm.captured.size() > 1) ? sm.captured[1] : "";
+  EXPECT_NE(second.find("do it differently"), std::string::npos)
+      << "the steer's turn's derive carried the steer text";
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestInterruptDuringParkRefusesAndStaysResumable) {
+  /* The interrupt's latch: the ask parked; the interrupt over it
+     auto-answers {reject, "interrupted at the frame's request"} (ONE batch
+     with its control marker) and leaves the frame IDLE-RESUMABLE — no
+     terminate, no poison; a later steer still yields a turn. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "interrupt the parked ask", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  std::vector<std::string> replies = {
+      canned_cell_body("import actor\nactor.ask('q?', ['yes', 'no'])"
+                       "\nprint('asked')"),
+      canned_content_body("ran after the interruption")};
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  park_and_pin_ask_id(f);
+
+  /* THE INTERRUPT over the park (frame_interrupt's FRM_INT, delivered by
+     the standing idle-interrupt test's manual pump — the parked engine's
+     run loop is not running, and nothing re-enters on an idle wakeup). */
+  frame_interrupt(f);
+  _frame_pump(f);
+
+  EXPECT_EQ(frame_is_done(f), 0) << "no terminate: a post-turn interrupt is "
+                                    "no mid-cell cut";
+  frame_engine_state_t* e = _frame_engine_state(f);
+  ASSERT_NE(e, nullptr);
+  EXPECT_EQ(e->phase, FRAME_PHASE_NONE) << "the frame idles";
+  EXPECT_EQ(e->engine_live, 1u) << "idle-RESUMABLE: the engine stays live";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(count_type(events, "ask.reply"), 1u);
+  json_value_t* reply_rec = find_ask_reply(events);
+  ASSERT_NE(reply_rec, nullptr);
+  json_value_t* reply_payload = json_get(reply_rec, "payload");
+  ASSERT_NE(reply_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "kind")), "ask-reply");
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "decision")), "reject");
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "value")),
+               "interrupted at the frame's request");
+  /* The refusal + its control marker ride ONE batch (the pair's two
+     consecutive seqs, the refusal first); the turn stayed CLOSED (the
+     blocked close stands alone — no extra turn.end, no turn for the
+     refusal). */
+  size_t reply_at = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (json_at(events, i) == reply_rec) reply_at = i;
+  }
+  json_value_t* control_rec = json_at(events, reply_at + 1);
+  ASSERT_NE(control_rec, nullptr);
+  ASSERT_TRUE(event_is(control_rec, "control"));
+  EXPECT_EQ(rec_seq(control_rec), rec_seq(reply_rec) + 1)
+      << "ONE atomic batch: the refusal + its control marker";
+  EXPECT_STREQ(json_as_string(json_get(json_get(control_rec, "payload"),
+                                       "kind")),
+               "ask-interrupted");
+  EXPECT_EQ(count_type(events, "turn.end"), 1u)
+      << "the blocked close stands alone; the refused ask opened nothing";
+  EXPECT_EQ(count_type(events, "control"), 1u)
+      << "the latch's own control marker is the only control record";
+  json_value_destroy(events);
+
+  /* THE RESUME PIN: a later steer still yields a turn (the parked branch is
+     gone — the steer's standing append + the idle wake drive turn 2). */
+  EXPECT_EQ(_frame_steer_post(f, "user", "after the interruption"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0) << "the steer's turn served; the run ends";
+  EXPECT_EQ(frame_is_done(f), 1);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(count_type(events, "turn.start"), 2u)
+      << "the steer's turn opened after the idle resume";
+  std::string second = (sm.captured.size() > 1) ? sm.captured[1] : "";
+  EXPECT_NE(second.find("after the interruption"), std::string::npos)
+      << "turn 2's derive carried the steer text";
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestInterruptWinsOverSteerAtThePark) {
+  /* Both wakeup classes injected while parked: the INTERRUPT wins (cancel
+     first — the reply says interrupted, never superseded) and the steer's
+     msg.append is durable — served by the turn AFTER the idle resume. No
+     ordering machinery: the two independent batches' OUTCOME is the pin. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "decide: which way?", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  std::vector<std::string> replies = {
+      canned_cell_body("import actor\nactor.ask('q?', ['yes', 'no'])"
+                       "\nprint('asked')"),
+      canned_content_body("ran after the wake")};
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  park_and_pin_ask_id(f);
+
+  /* FIFO: the interrupt INJECTED FIRST, then the steer — the interrupt's
+     latch consumes the park (the reply's wording pins WHO won). */
+  frame_interrupt(f);
+  EXPECT_EQ(_frame_steer_post(f, "user", "the steer's text"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0)
+      << "the steer's turn ran to its end after the idle resume";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  /* The interrupt's batch: the ask.reply says INTERRUPTED. */
+  ASSERT_EQ(count_type(events, "ask.reply"), 1u);
+  json_value_t* reply_payload = json_get(find_ask_reply(events), "payload");
+  ASSERT_NE(reply_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "decision")), "reject");
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "value")),
+               "interrupted at the frame's request")
+      << "the interrupt wins (the cancel-first latch consumed the park)";
+  /* The steer's input is DURABLE (the standing append) and the latch's
+     control marker rides. */
+  ASSERT_NE(find_msg_append(events, "user", "the steer's text"), nullptr)
+      << "the steer's msg.append survived (independent batches, the outcome "
+         "pin)";
+  EXPECT_EQ(count_control_kind(events, "ask-interrupted"), 1u);
+
+  /* And it is SERVED: the resumed turn's derive carries it. */
+  std::string second = (sm.captured.size() > 1) ? sm.captured[1] : "";
+  EXPECT_NE(second.find("the steer's text"), std::string::npos)
+      << "the steer served after the idle resume";
+  EXPECT_EQ(count_type(events, "turn.start"), 2u);
+  EXPECT_EQ(count_type(events, "msg.append"), 2u);
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* The park's establishment marker: the atomic count of the FRM_ASK
+   dispatch's own "parked under" line (the mid-cell interrupt test's release
+   gate — the ask verb's publish is only ever OBSERVED at its dispatch, and
+   that dispatch is the park). The mailbox's FIFO then puts the FRM_ASK
+   (and its park) ahead of any FRM_INT the poll releases — the interrupt is
+   never injected over an UNPUBLISHED ask, in fast builds and under
+   valgrind's slow interpreter boot alike. */
+static std::atomic<int> _ask_publish_lines(0);
+static void _ask_publish_recorder(log_Event* ev) {
+  va_list ap;
+  va_copy(ap, ev->ap);
+  char line[512];
+  vsnprintf(line, sizeof(line), ev->fmt, ap);
+  va_end(ap);
+  if (strstr(line, "parked under") != NULL) _ask_publish_lines++;
+}
+
+TEST(TestLoop, TestMidTurnInterruptUnchangedUnderTheAskMachinery) {
+  /* The MID-CELL interrupt is byte-for-byte the pre-slice synthesis (the
+     standing TestFrameInterrupt* suite is the pin) — THIS test pins its new
+     surface: the interrupt closing the ASKING CELL itself (a park stands,
+     the cell still open) resolves the park IN the close batch
+     [cell.result, step.end, ask, ask.reply, turn.end{aborted}]: the owner
+     sees both the question and its refusal — no terminate-time
+     evaporation — and the poison stands on the resumed turn exactly as the
+     plain mid-cell shape pinned it. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  cfg.cell_watchdog_ms = 0;   /* the caller's interrupt, not the timer's (the
+                                 standing interrupt test's pin) */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "interrupt the asking cell", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  /* The asking cell runs LONG after its publish (a sleep the cooperative
+     interrupt cannot cut): the interrupt lands mid-cell with the park
+     standing — the interrupted asking cell's close carries the resolution. */
+  std::string turn1 =
+      canned_cell_body("import time\nimport actor\n"
+                       "actor.ask('q?', ['yes', 'no'])\n"
+                       "time.sleep(3)");
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('after', 1)\"}"}}]}}]})json";
+  std::string turn3 =
+      canned_content_body("the poisoned refusal came through");
+  std::vector<std::string> replies = {turn1, turn2, turn3};
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  /* The killer POLLS the park's own establishment line (never a blind
+     sleep — the pyrt interpreter's boot time varies by order of magnitude
+     between builds), then releases the interrupt: the parked shape is
+     guaranteed by the marker itself (the FRM_ASK dispatch is the park),
+     not by timing. The cell sleeps 3 s after its publish, so the interrupt
+     lands mid-cell. */
+  log_add_callback(_ask_publish_recorder, NULL, LOG_INFO);
+  int armed_lines = _ask_publish_lines.load();
+  std::thread killer([f, armed_lines]() {
+    while (_ask_publish_lines.load() == armed_lines)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    frame_interrupt(f);
+  });
+  EXPECT_EQ(frame_run_loop(f), 1) << "the interrupted asking cell aborts";
+  killer.join();
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(count_type(events, "ask"), 1u);
+  ASSERT_EQ(count_type(events, "ask.reply"), 1u);
+  json_value_t* reply_rec = find_ask_reply(events);
+  ASSERT_NE(reply_rec, nullptr);
+  size_t reply_at = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (json_at(events, i) == reply_rec) reply_at = i;
+  }
+  /* The interrupted close is ONE atomic group of FIVE consecutive records:
+     cell.result (status 1, interrupted) + step.end + ask + ask.reply +
+     turn.end{aborted}. */
+  ASSERT_GE(reply_at, 3u);
+  json_value_t* ask_rec = json_at(events, reply_at - 1);
+  ASSERT_TRUE(event_is(ask_rec, "ask"));
+  EXPECT_EQ(rec_seq(reply_rec), rec_seq(ask_rec) + 1)
+      << "the ask record (never written by an interrupted asking cell) rides "
+         "its own resolution in the close batch";
+  EXPECT_STREQ(json_as_string(json_get(json_get(ask_rec, "payload"),
+                                       "question")),
+               "q?")
+      << "the owner sees the question (the evaporated-park defect's pin)";
+  json_value_t* reply_payload = json_get(reply_rec, "payload");
+  ASSERT_NE(reply_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "decision")), "reject");
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "value")),
+               "interrupted at the frame's request");
+  json_value_t* result_rec = json_at(events, reply_at - 3);
+  json_value_t* turn_end_rec = json_at(events, reply_at + 1);
+  ASSERT_NE(result_rec, nullptr);
+  ASSERT_NE(turn_end_rec, nullptr);
+  ASSERT_TRUE(event_is(result_rec, "cell.result"));
+  ASSERT_TRUE(event_is(turn_end_rec, "turn.end"));
+  EXPECT_EQ(json_as_int(json_get(json_get(result_rec, "payload"), "status")), 1)
+      << "the standing interrupt close's status-1 cell.result";
+  EXPECT_EQ(turn_end_kind(turn_end_rec), "aborted")
+      << "the interrupted asking cell's turn end is UNCHANGED";
+  long long base_seq = rec_seq(result_rec);
+  for (long long off = 0; off <= 4; off++) {
+    EXPECT_EQ(rec_seq(json_at(events, reply_at - 3 + (size_t)off)),
+              base_seq + off)
+        << "FIVE consecutive seqs — one atomic close";
+  }
+  EXPECT_EQ(rec_seq(turn_end_rec), rec_seq(json_at(events, json_size(events) - 1)))
+      << "the aborted turn.end is the log's newest record (the late real "
+         "result drops quietly, the standing keep)";
+  json_value_destroy(events);
+
+  /* Let the interrupted cell's 3 s sleep run out so its REAL pyrt result
+     parks in the mailbox (the standing test's bounded-join discipline). */
+  std::this_thread::sleep_for(std::chrono::milliseconds(4000));
+
+  /* The poison rules stand byte-for-byte: the resumed turn's cell refuses
+     corr-matched loud (the plain mid-cell shape's pin, re-run here against
+     the ask machinery's close). */
+  EXPECT_EQ(frame_run_loop(f), 0);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  int saw_poison = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "cell.result")) continue;
+    json_value_t* p = json_get(rec, "payload");
+    if (p != NULL && json_as_int(json_get(p, "status")) == 1 &&
+        strstr(json_as_string(json_get(p, "text")), "poisoned") != NULL) {
+      saw_poison = 1;
+    }
+  }
+  EXPECT_EQ(saw_poison, 1)
+      << "the resumed turn's cell refuses with the poison text";
+  json_value_destroy(events);
+
+  frame_destroy(f);   /* bounded: the interrupted cell's sleep already ran */
   wave_db_close(db);
 }
 

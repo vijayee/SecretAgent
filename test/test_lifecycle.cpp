@@ -108,6 +108,16 @@ static std::string rec_cell_result(uint64_t seq, uint64_t corr) {
                    seq);
 }
 
+/* The parked ask's "ask" record (the escalation slice's vocabulary; its
+   payload is opaque to the fold — the record type is what matters). */
+static std::string rec_ask(uint64_t seq) {
+  return lc_record("ask",
+                   "{\"kind\":\"ask\",\"askId\":\"ab12cd34\","
+                   "\"question\":\"q?\",\"options\":[\"yes\",\"no\"],"
+                   "\"plan\":null}",
+                   seq);
+}
+
 /* The joint tail text: `as_objects` pastes the records as bare elements
    (the module's other accepted input shape), otherwise each is
    string-wrapped (the scan reply's joint form). */
@@ -977,4 +987,73 @@ TEST(TestLifecycle, TestPayloadComposersDirectEdges) {
   ASSERT_NE(reason, nullptr);
   EXPECT_STREQ(json_as_string(json_get(reason, "text")), "the words");
   json_value_destroy(te);
+}
+
+TEST(TestLifecycle, TestRepairLeavesABlockedTailBalancedAndRepublishless) {
+  /* The parked tail's balance rule (escalation spec §4.1, task 3's repair
+     check): a crash while parked left the tail [ask, step.end,
+     turn.end{blocked}] — the turn closed DURABLY (blocked is fold-known,
+     the composer's :955 row), so the repair's scanner folds it closed and
+     synthesizes NO closers (re-publishless: the ask is a log record any
+     reconnecting client replays, not something the repair composes). */
+  lifecycle_cursor_t c;
+  lifecycle_closers_t out;
+  memset(&c, 0, sizeof(c));
+  memset(&out, 0, sizeof(out));
+
+  /* The BARE tail first: the ask + the closed turn — nothing open. */
+  std::string tail = lc_joint({
+      rec_ask(0),
+      rec_step(1, LIFE_EVENT_STEP_END, 1, 1),
+      rec_turn_end(2, 1, LIFE_REASON_BLOCKED),
+  });
+  uint64_t from = lc_log_start();
+  ASSERT_EQ(lifecycle_cursor_fold(tail.c_str(), &c), 0);
+  EXPECT_EQ(lc_log_logged_since(from, "skipped loud"), 0u)
+      << "every tail record folded clean (blocked is fold-known)";
+  EXPECT_EQ(c.turn_open, 0);
+  EXPECT_EQ(c.cell_inflight, 0);
+  EXPECT_EQ(c.last_seq, 2u);
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  EXPECT_EQ(out.n, 0u) << "NO closers — the blocked tail is balanced";
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+
+  /* The WHOLE parked close's envelope: the turn's full lifecycle with the
+     ask INSIDE it (the ask record moves nothing — the fold's unknown-type
+     pass-through) folds to the same closed truth. */
+  std::string full = lc_joint({
+      rec_turn_start(0, 1),
+      rec_step(1, LIFE_EVENT_STEP_START, 1, 1),
+      rec_cell_run(2, 3, "import actor\nactor.ask('q?')"),
+      rec_ask(3),
+      rec_step(4, LIFE_EVENT_STEP_END, 1, 1),
+      rec_turn_end(5, 1, LIFE_REASON_BLOCKED),
+  });
+  ASSERT_EQ(lifecycle_cursor_fold(full.c_str(), &c), 0);
+  EXPECT_EQ(c.turn_open, 0);
+  EXPECT_EQ(c.cell_inflight, 0);
+  EXPECT_EQ(c.last_seq, 5u);
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  EXPECT_EQ(out.n, 0u)
+      << "the parked close's envelope never synthesizes a spurious closer";
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
+
+  /* The CONTRAST (the rule's edge): remove the turn.end and the SAME tail
+     is an open turn — the repair's closers DO come (the repair's real
+     business). */
+  std::string open_tail = lc_joint({
+      rec_ask(0),
+      rec_turn_start(1, 1),
+      rec_step(2, LIFE_EVENT_STEP_START, 1, 1),
+      rec_ask(3),
+  });
+  ASSERT_EQ(lifecycle_cursor_fold(open_tail.c_str(), &c), 0);
+  EXPECT_EQ(c.turn_open, 1);
+  ASSERT_EQ(lifecycle_closers_compose(&c, &out), 0);
+  EXPECT_GT(out.n, 0u)
+      << "an ask does NOT balance a turn — only the turn.end does";
+  lifecycle_closers_destroy(&out);
+  lifecycle_cursor_destroy(&c);
 }
