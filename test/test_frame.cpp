@@ -1020,6 +1020,97 @@ TEST(TestStore, TestPersonaInstallWritesTheHammerRecords) {
   wave_db_close(db);
 }
 
+TEST(TestStore, TestStoreGetNamedRepliesTheNamedValues) {
+  /* FRM_STORE_GET_NAMED (the persona slice, spec §3): the named direct read
+     answers ONE JSON array record — one {"key", "value"-or-null} entry per
+     REQUESTED key, IN THE REQUESTED ORDER. A missing key is a first-class
+     null (absence is the answer), never a refusal — no positional
+     guessing, the value's key rides attached. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  ASSERT_EQ(persona_records_install(db), 0);
+
+  char* shipped = persona_records_hammer_record();
+  ASSERT_NE(shipped, nullptr);
+
+  /* One record RIDE-ALONG put (the test's boot idiom): the user-context
+     record sits beside the installed hammer records. */
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*bp));
+  bp->ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  bp->ops[0].key = strdup("personas/hammer/user-context");
+  bp->ops[0].value = (uint8_t*)strdup("{\"user_name\":\"Victor\"}");
+  bp->ops[0].value_len = strlen("{\"user_name\":\"Victor\"}");
+  bp->ops[0].is_delete = 0;
+  bp->nops = 1;
+  bp->op_name = "get-named test put";
+  bp->reply_to = NULL;
+  bp->corr = 0;
+  message_t put;
+  put.type = (uint32_t)FRM_STORE_BATCH;
+  put.payload = bp;
+  put.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(wave_db_store_actor(db), &put));
+  wave_db_pump(db);
+
+  scan_capture_t cap;
+  actor_init(&cap.actor, &cap, scan_capture_dispatch, NULL);
+
+  /* The read: three keys, REQUESTED in this order — one present record, one
+     MISSING (never installed), one present context. */
+  const char* keys[3] = {"personas/hammer/record",
+                         "personas/hammer/absent",
+                         "personas/hammer/user-context"};
+  frm_store_get_named_payload_t* gp =
+      (frm_store_get_named_payload_t*)get_clear_memory(sizeof(*gp));
+  gp->keys = (char**)get_clear_memory(3 * sizeof(char*));
+  for (size_t i = 0; i < 3; i++) gp->keys[i] = strdup(keys[i]);
+  gp->nkeys = 3;
+  gp->reply_to = &cap.actor;
+  gp->corr = 4242;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_GET_NAMED;
+  m.payload = gp;
+  m.payload_destroy = frm_store_get_named_payload_destroy;
+  ASSERT_TRUE(actor_send(wave_db_store_actor(db), &m));
+  wave_db_pump(db);
+  actor_run(&cap.actor, ACTOR_BATCH_SIZE);
+
+  ASSERT_EQ(cap.counts.size(), 1u) << "one corr-matched read reply";
+  ASSERT_EQ(cap.rcs[0], 0);
+  ASSERT_EQ(cap.counts[0], 1u) << "the reply is ONE array record";
+  ASSERT_EQ(cap.records_per_reply[0].size(), 1u);
+
+  json_value_t* arr = json_parse(cap.records_per_reply[0][0].c_str(),
+                                 cap.records_per_reply[0][0].size(), NULL);
+  ASSERT_NE(arr, nullptr) << "the reply record is the composed JSON array";
+  ASSERT_EQ(json_type(arr), JSON_ARRAY);
+  ASSERT_EQ(json_size(arr), 3u) << "one entry per REQUESTED key";
+  for (size_t i = 0; i < 3u; i++) {
+    json_value_t* entry = json_at(arr, i);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(entry, "key")), keys[i])
+        << "the requested order holds, keys verbatim";
+  }
+  /* Present record: the stored bytes VERBATIM (unescaped back out). */
+  EXPECT_STREQ(json_as_string(json_at(arr, 0) != NULL
+                                  ? json_get(json_at(arr, 0), "value") : NULL),
+               shipped)
+      << "the record's raw bytes ride attached to their key";
+  /* Missing key: "value": null — absence the answer, rc still 0. */
+  json_value_t* null_value = json_get(json_at(arr, 1), "value");
+  ASSERT_NE(null_value, nullptr);
+  EXPECT_EQ(json_type(null_value), JSON_NULL);
+  /* Present context byte-verbatim. */
+  EXPECT_STREQ(json_as_string(json_get(json_at(arr, 2), "value")),
+               "{\"user_name\":\"Victor\"}");
+  json_value_destroy(arr);
+
+  actor_destroy(&cap.actor);
+  free(shipped);
+  wave_db_close(db);
+}
+
 TEST(TestStore, TestPersonaInstallRefusesAPooledStore) {
   /* The sync install keeps the sync API's inline-store rule: at a POOLED
      store it refuses loud (rc != 0) and installs nothing. NULL also

@@ -103,6 +103,16 @@ void frm_store_keys_payload_destroy(void* p) {
   free(kp);
 }
 
+void frm_store_get_named_payload_destroy(void* p) {
+  frm_store_get_named_payload_t* gp = (frm_store_get_named_payload_t*)p;
+  if (gp == NULL) return;
+  if (gp->keys != NULL) {
+    for (size_t i = 0; i < gp->nkeys; i++) free(gp->keys[i]);
+    free(gp->keys);
+  }
+  free(gp);
+}
+
 void frm_store_sessions_payload_destroy(void* p) {
   frm_store_sessions_payload_t* lp = (frm_store_sessions_payload_t*)p;
   if (lp == NULL) return;
@@ -1861,6 +1871,114 @@ static void _store_behavior(void* state, message_t* msg) {
       frm_store_keys_payload_destroy(kp);
       break;
     }
+    case FRM_STORE_GET_NAMED: {
+      /* The named direct read (the persona slice, spec §3), run INSIDE this
+         dispatch = the serialized reads (the frame's behavior stays lock-
+         free). Each absolute root-level key reads DIRECTLY through
+         database_get_sync_raw — the persona records are STATE (no scan, no
+         walk), and the reply ATTACHES every fetched value to its key: ONE
+         heap JSON array record, [{"key": <verbatim>, "value": <raw text or
+         null>} ...], in the REQUESTED order. A missing key answers
+         "value": null — absence is a first-class answer (the persona
+         fallback reads it), NEVER a refusal. The store never parses JSON
+         here either, but it COMPOSES (the keys-listing's sessions-row
+         precedent): the values' key attachment is exactly the fact a
+         value-only reply cannot carry positionally. */
+      frm_store_get_named_payload_t* gp =
+          (frm_store_get_named_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (gp == NULL) {
+        log_error("store: FRM_STORE_GET_NAMED with no payload — dropping "
+                  "loud");
+        break;
+      }
+      if (gp->reply_to == NULL) {
+        /* The persona trip awaits: no reply target = the read never runs. */
+        log_error("store: FRM_STORE_GET_NAMED with no reply target — "
+                  "refused loud");
+        frm_store_get_named_payload_destroy(gp);
+        break;
+      }
+      int rc = 0;
+      char** records = NULL;
+      json_value_t* array = json_new_array();
+      if (array == NULL) {
+        log_error("store: out of memory composing the named-read reply "
+                  "array");
+        rc = -1;
+      } else {
+        for (size_t i = 0; i < gp->nkeys; i++) {
+          if (gp->keys[i] == NULL || gp->keys[i][0] == '\0') {
+            log_error("store: named-read key %zu is empty — refused loud", i);
+            rc = -1;
+            break;
+          }
+          uint8_t* raw = NULL;
+          size_t len = 0;
+          int grc = database_get_sync_raw(root->db, gp->keys[i],
+                                          strlen(gp->keys[i]), '/', &raw, &len);
+          json_value_t* entry = json_new_object();
+          if (entry == NULL) {
+            log_error("store: out of memory composing the named-read entry");
+            if (raw != NULL) database_raw_value_free(raw);
+            rc = -1;
+            break;
+          }
+          json_object_set(entry, "key", json_new_string(gp->keys[i]));
+          if (grc == 0 && raw != NULL) {
+            /* The value is a TEXT record: a NUL-terminated copy rides the
+               JSON string (the persona records' utf8 scope); the raw copy
+               dies here either way. */
+            char* text = (char*)get_memory(len + 1);
+            if (text == NULL) {
+              log_error("store: out of memory copying the named-read value "
+                        "for '%s'", gp->keys[i]);
+              rc = -1;
+            } else {
+              memcpy(text, raw, len);
+              text[len] = '\0';
+            }
+            database_raw_value_free(raw);
+            if (rc == 0) {
+              json_object_set(entry, "value", json_new_string(text));
+              free(text);
+            }
+          } else {
+            json_object_set(entry, "value", json_new_null());
+          }
+          if (rc != 0) {
+            json_value_destroy(entry);
+            break;
+          }
+          json_array_append(array, entry);
+        }
+        if (rc == 0) {
+          char* text = json_serialize(array);
+          if (text == NULL) {
+            log_error("store: the named-read reply failed to serialize");
+            rc = -1;
+          } else {
+            records = (char**)get_clear_memory(sizeof(char*));
+            if (records == NULL) {
+              free(text);
+              rc = -1;
+            } else {
+              records[0] = text;
+            }
+          }
+        }
+        json_value_destroy(array);
+      }
+      if (rc != 0 && records != NULL) {
+        for (size_t i = 0; i < 1; i++) free(records[i]);
+        free(records);
+        records = NULL;
+      }
+      _store_reply_send(gp->reply_to, gp->corr, rc, records,
+                        records != NULL ? 1 : 0);
+      frm_store_get_named_payload_destroy(gp);
+      break;
+    }
     case FRM_STORE_LIST_SESSIONS: {
       /* The client-API sessions listing (spec §3), run INSIDE this dispatch
          = the one serialized read. The bounded enumeration of the root's
@@ -3585,6 +3703,7 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
     case FRM_STORE_SCAN:
     case FRM_STORE_RECALL:
     case FRM_STORE_KEYS:
+    case FRM_STORE_GET_NAMED:
     case FRM_STORE_LIST_SESSIONS:
     case FRM_STORE_WATCH:
     case FRM_STORE_UNWATCH:

@@ -50,6 +50,12 @@ typedef enum frame_message_type_e {
                              subtree scan (frm_store_keys_payload_t) — the
                              reply carries KEY NAME tail segments, never a
                              value; see the surface-completion spec §3 */
+  FRM_STORE_GET_NAMED,    /* -> store actor: a DIRECT read of NAMED absolute
+                             root-level keys (frm_store_get_named_payload_t)
+                             — the persona read (persona spec §3): the reply
+                             carries ONE JSON array record with the values'
+                             keys attached (no positional ambiguity); see
+                             the payload's shape note below */
   FRM_STORE_LIST_SESSIONS, /* -> store actor: the sessions listing (own
                               payload; the reply-router at the SERVER's
                               actor answers — a frame actor receiving the
@@ -196,6 +202,26 @@ typedef struct frm_store_recall_payload_t {
   uint64_t corr;
 } frm_store_recall_payload_t;
 
+/* The named direct read (the persona slice, spec §3): a LIST of absolute
+   ROOT-LEVEL keys (the scan discipline — never relative bounds), each read
+   DIRECTLY (database_get_sync_raw — the persona records are STATE reads,
+   not walks, not scans). The reply is ONE record (records[0], rc 0): a JSON
+   array with one {"key": <the requested key verbatim>, "value": <the raw
+   text or null>} entry per REQUESTED key, IN THE REQUESTED ORDER — the
+   store ATTACHES each fetched value to its key, so a missing key answers
+   "value": null as a first-class fact (the persona fallback reads it) and
+   no reply ever leaves the reader guessing which value came from where.
+   Values are TEXT records read as C strings (the persona records' scope:
+   utf8 text; a value's interior NUL never appears in a text record). */
+typedef struct frm_store_get_named_payload_t {
+  char** keys;          /* OWNED; nkeys absolute root-level key texts
+                           (ownership of every string transfers with the
+                           payload, on every path) */
+  size_t nkeys;
+  actor_t* reply_to;    /* BORROWED; never NULL (the persona trip awaits) */
+  uint64_t corr;
+} frm_store_get_named_payload_t;
+
 /* The keys verb's bounded scan (surface-completion spec §3): the reverse
    range read over OWN sid_path/state/<scope> (absolute composed bounds —
    the root-level discipline); the reply's records[] carry the scanned keys'
@@ -283,6 +309,7 @@ void frm_store_notice_destroy(void* p);
 void frm_store_scan_payload_destroy(void* p);
 void frm_store_recall_payload_destroy(void* p);
 void frm_store_keys_payload_destroy(void* p);
+void frm_store_get_named_payload_destroy(void* p);
 void frm_store_reply_payload_destroy(void* p);
 void frm_report_bind_payload_destroy(void* p);
 void frm_steer_payload_destroy(void* p);

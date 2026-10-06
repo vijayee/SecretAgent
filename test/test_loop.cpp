@@ -15,6 +15,8 @@ extern "C" {
 #include "../src/Frame/frame_messages.h"
 #include "../src/Frame/model.h"
 #include "../src/Frame/loop.h"
+#include "../src/Frame/persona.h"          /* the compose expectations' pure API */
+#include "../src/Frame/persona_records.h"  /* the shipped hammer record */
 #include "../src/Scheduler/scheduler.h"   /* the pooled tests' pool API */
 #include "../src/Util/json.h"
 #include "../src/Util/allocator.h"
@@ -3123,6 +3125,233 @@ TEST(TestLoop, TestRestartRepairsTheCutBeforeTheCellAudit) {
   std::filesystem::remove_all(dir);
 }
 
+/* --- the persona injection (the persona slice, spec §2-§3) ----------------
+
+   The derive's second store trip (FRM_STORE_GET_NAMED over the persona
+   subtree) composes the persona GROUP into the system prompt's FIRST block;
+   a persona-less frame keeps today's byte-identical shape. The expected
+   bytes are composed here through the PURE persona API with the turn
+   instruction's byte-pinned text — the loop composes with the SAME base,
+   so a prefix match pins the whole injection's shape. */
+
+/* The turn instruction's bytes, pinned here byte-for-byte (loop.c's
+   SA_LOOP_INSTRUCTION — the no-persona pin below is that text's proof). */
+static const char TEST_LOOP_INSTRUCTION[] =
+    "You drive one frame of an agent session. Your only tool is `execute`: "
+    "its `code` argument is ONE python cell run in this frame's interpreter "
+    "(one shared namespace per frame). Inside cells the injected `actor` "
+    "module provides the verbs: actor.remember(key, value), "
+    "actor.recall(key), actor.spawn(goal, context=None), actor.report(value).\n"
+    "Finish the frame by calling actor.report inside your last cell (a "
+    "completion declaration), or simply by answering WITHOUT a tool call.\n";
+
+/* ONE direct store put through the store actor (the test's boot idiom —
+   the same fire-and-post batch shape persona_records_install's install
+   takes, pumped to quiescence): key/value as raw utf8 texts. */
+static void test_store_put(wave_database_root_t* db, const char* key,
+                           const char* value) {
+  frm_store_batch_payload_t* bp =
+      (frm_store_batch_payload_t*)get_clear_memory(sizeof(*bp));
+  bp->ops = (frm_store_op_t*)get_clear_memory(sizeof(frm_store_op_t));
+  bp->ops[0].key = strdup(key);
+  bp->ops[0].value = (uint8_t*)strdup(value);
+  bp->ops[0].value_len = strlen(value);
+  bp->ops[0].is_delete = 0;
+  bp->nops = 1;
+  bp->op_name = "persona test put";
+  bp->reply_to = NULL;
+  bp->corr = 0;
+  message_t m;
+  m.type = (uint32_t)FRM_STORE_BATCH;
+  m.payload = bp;
+  m.payload_destroy = frm_store_batch_payload_destroy;
+  ASSERT_TRUE(actor_send(wave_db_store_actor(db), &m));
+  wave_db_pump(db);
+}
+
+/* The system prompt of a captured (serialized messages-array) model call.
+   Malformed captures answer "" (EXPECT'd loud — the caller's asserts fail
+   on the shape). */
+static std::string test_system_content(const std::string& serialized) {
+  json_value_t* arr =
+      json_parse(serialized.c_str(), serialized.size(), NULL);
+  EXPECT_NE(arr, nullptr) << serialized;
+  std::string out;
+  if (arr == nullptr) return out;
+  EXPECT_EQ(json_type(arr), JSON_ARRAY);
+  if (json_type(arr) == JSON_ARRAY && json_size(arr) >= 1) {
+    json_value_t* sys = json_at(arr, 0);
+    EXPECT_NE(sys, nullptr);
+    json_value_t* content = (sys != nullptr) ? json_get(sys, "content") : NULL;
+    EXPECT_NE(content, nullptr);
+    if (content != NULL) out = std::string(json_as_string(content));
+  }
+  json_value_destroy(arr);
+  return out;
+}
+
+/* The hammer's record through the pure loader (the injection expectations'
+   source of the record's verbatim text). */
+static persona_record_t* test_hammer_record(void) {
+  char* record_json = persona_records_hammer_record();
+  EXPECT_NE(record_json, nullptr);
+  persona_record_t* rec = NULL;
+  EXPECT_EQ(persona_record_load(record_json, &rec), 0);
+  EXPECT_NE(rec, nullptr);
+  free(record_json);
+  return rec;   /* the caller destroys */
+}
+
+TEST(TestLoop, TestNoPersonaIsByteIdentical) {
+  /* A persona-less frame's captured prompt == the pre-slice shape EXACTLY:
+     the first bytes are the turn instruction's, then the goal line — the
+     whole system block pinned byte-for-byte (the standing derive pins all
+     prove the same shape; this one names it). */
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "pin the shape", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"pinned"}}]})json");
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  ASSERT_EQ(rm.captured.size(), 1u);
+  std::string content = test_system_content(rm.captured[0]);
+
+  std::string expected = std::string(TEST_LOOP_INSTRUCTION) + "Goal: pin the shape\n";
+  EXPECT_EQ(content, expected) << "the persona-less system block moved";
+  EXPECT_EQ(content.find("PERSONA SPEC"), std::string::npos);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestPersonaMissingRecordFallsBackLoud) {
+  /* cfg carries a persona name whose record is NOT installed: the derive
+     NEVER fails on the persona read — the built-in base rides (byte-
+     identical to the no-persona shape) and a REAL model turn ran. */
+  frame_config_t cfg = test_config();
+  cfg.persona_name = "hammer";
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);   /* deliberately NOT persona_records_install'd */
+  frame_t* f = frame_create(db, NULL, "fallback turns", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"the turn ran"}}]})json");
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0) << "a persona read never fails a turn";
+  ASSERT_EQ(rm.captured.size(), 1u);
+  std::string content = test_system_content(rm.captured[0]);
+
+  std::string expected =
+      std::string(TEST_LOOP_INSTRUCTION) + "Goal: fallback turns\n";
+  EXPECT_EQ(content, expected)
+      << "the fallback is the built-in base alone — the byte-identical shape";
+  EXPECT_EQ(content.find("PERSONA SPEC"), std::string::npos)
+      << "never a half-persona render";
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestPersonaPlaceholderCatalogResolvesLive) {
+  /* The {…} placeholder catalog rides the LIVE derive exactly as the pure
+     tests pin it: {USER_NAME} resolves from the user-context record, a
+     recognized-but-missing key substitutes "" (never a raw token), an
+     unrecognized token stays VISIBLE verbatim. */
+  frame_config_t cfg = test_config();
+  cfg.persona_name = "greeter";
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  test_store_put(db, "personas/greeter/record",
+                 "{\"version\":1,\"name\":\"greeter\",\"text\":\"Hello "
+                 "{USER_NAME}, dear {USER_TITLE}, keep {WHATEVER} visible.\","
+                 "\"placement\":\"first\"}");
+  /* The context record's field key = the placeholder's lowercased REMAINDER
+     (persona.h's catalog pin): {USER_NAME} reads the "name" field. */
+  test_store_put(db, "personas/greeter/user-context",
+                 "{\"name\":\"Victor\"}");
+  frame_t* f = frame_create(db, NULL, "greet me", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"greeted"}}]})json");
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  ASSERT_EQ(rm.captured.size(), 1u);
+  std::string content = test_system_content(rm.captured[0]);
+
+  /* The compose's group order: the substituted persona text, THEN the
+     context record's render (the "name: Victor" block), then the base. */
+  std::string expected =
+      "Hello Victor, dear , keep {WHATEVER} visible.\n\nname: Victor\n\n" +
+      std::string(TEST_LOOP_INSTRUCTION) + "Goal: greet me\n";
+  EXPECT_EQ(content, expected);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestPersonaInheritsIntoTheSpawnedChild) {
+  /* The config inheritance's END-TO-END half (spec §3): a spawned child
+     adopts the parent's persona record — the child's OWN derive composes
+     the block into ITS prompt. */
+  frame_config_t cfg = test_config();
+  cfg.persona_name = "hammer";
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  ASSERT_EQ(persona_records_install(db), 0);
+  test_store_put(db, "personas/hammer/user-context",
+                 "{\"user_name\":\"Victor\"}");
+  frame_t* parent = frame_create(db, NULL, "parent goal", &cfg);
+  ASSERT_NE(parent, nullptr);
+
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"the child replied"}}]})json");
+  frame_set_model_backend(parent, &rm.base);   /* the borrowed override the
+                                                  spawn hands the child */
+
+  frame_t* child = frame_spawn(parent, "child goal", NULL);
+  ASSERT_NE(child, nullptr);
+  /* Admission-only spawn (no live engine on the parent): the caller drives
+     the adopted child — the engine-side backend inheritance never ran, so
+     the driver-injected backend is set on the child directly (the spawn
+     inheritance under test is the PERSONA name's, Task 3's create site). */
+  frame_set_model_backend(child, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(child), 0);
+  ASSERT_EQ(rm.captured.size(), 1u);
+  std::string content = test_system_content(rm.captured[0]);
+
+  persona_record_t* rec = test_hammer_record();
+  ASSERT_NE(rec->text, nullptr);
+  std::string hammer_text = std::string(rec->text);
+  persona_record_destroy(rec);
+  ASSERT_GE(content.size(), hammer_text.size());
+  EXPECT_EQ(content.compare(0, hammer_text.size(), hammer_text), 0)
+      << "the child's prompt opens with the inherited persona block";
+  EXPECT_NE(content.find("user_name: Victor"), std::string::npos);
+  EXPECT_NE(content.find("Goal: child goal\n"), std::string::npos);
+
+  frame_destroy(parent);
+  frame_destroy(child);
+  wave_db_close(db);
+}
+
 #endif /* SA_HAS_WDB */
 
 /* The reopened-walk probe runs REAL tool cycles through the frame's own
@@ -3223,6 +3452,97 @@ TEST(TestLoop, TestResumedEngineSeesItsOwnInSessionRecords) {
          "own turn-2 derive (the fresh view printed the full 12-record log)";
 
   std::filesystem::remove_all(dir);
+}
+
+/* --- the persona's FIRST-BLOCK pin, over two REAL turns (the persona
+   slice, spec §2): two model calls share the persona GROUP's bytes exactly
+   — the cache-stable prefix rules (matrix row 36) hold through the live
+   derive, and the block sits before the turn instruction. Uses the
+   python-gated scripted model: turn 1 calls execute (a cell), turn 2
+   answers content. */
+TEST(TestLoop, TestPersonaInjectedAsTheFirstBlock) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  cfg.persona_name = "hammer";
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  ASSERT_EQ(persona_records_install(db), 0);
+  test_store_put(db, "personas/hammer/user-context",
+                 "{\"user_name\":\"Victor\"}");
+  frame_t* f = frame_create(db, NULL, "do a thing", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  std::string turn1 =
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":"{\"code\":\"import actor\\nactor.remember('n', 7)\"}"}}]}}]})json";
+  std::string turn2 =
+      R"json({"choices":[{"message":{"role":"assistant","content":"all done"}}]})json";
+  std::vector<std::string> replies = {turn1, turn2};
+
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  sm.replies = &replies;
+  sm.steer_frame = NULL;
+  sm.steer_text = NULL;
+  sm.steer_on = 0;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  ASSERT_EQ(sm.captured.size(), 2u) << "two real model turns ran";
+
+  /* The expected FIRST block: the hammer GROUP composed through the PURE
+     api with the SAME base the loop composes with — the pinned instruction
+     text — plus the user-context record and the execute guidance attached.
+     Whatever the loop's placement rules do, they must agree byte-for-byte. */
+  persona_record_t* rec = test_hammer_record();
+  ASSERT_NE(rec, nullptr);
+  const char* tools[] = {"execute"};
+  char* expected_prefix_c = persona_compose(
+      rec, "{\"user_name\":\"Victor\"}", tools, 1, TEST_LOOP_INSTRUCTION);
+  ASSERT_NE(expected_prefix_c, nullptr);
+  std::string expected_prefix(expected_prefix_c);
+  free(expected_prefix_c);
+  persona_record_destroy(rec);
+
+  std::string c0 = test_system_content(sm.captured[0]);
+  std::string c1 = test_system_content(sm.captured[1]);
+
+  /* The persona block IS the prompt's first block: the composed GROUP's
+     exact bytes open the prompt, on BOTH turns. */
+  ASSERT_GE(c0.size(), expected_prefix.size());
+  ASSERT_GE(c1.size(), expected_prefix.size());
+  EXPECT_EQ(c0.compare(0, expected_prefix.size(), expected_prefix), 0)
+      << "turn 1: the prompt does not open with the composed persona block: "
+      << c0;
+  EXPECT_EQ(c1.compare(0, expected_prefix.size(), expected_prefix), 0)
+      << "turn 2: the prompt does not open with the composed persona block: "
+      << c1;
+
+  /* Byte-stability across turns: the FIRST-block bytes are IDENTICAL — the
+     cache-stable prefix claim, made observable. */
+  EXPECT_EQ(c0.substr(0, expected_prefix.size()),
+            c1.substr(0, expected_prefix.size()));
+
+  /* The hammer's text rides VERBATIM (the record's body inside the block),
+     the context record renders its key: value line, the execute guidance
+     attaches (the frame's canned tool surface), and the base instructions
+     follow the block. */
+  EXPECT_NE(c0.find("## Core stance"), std::string::npos)
+      << "the hammer's markdown inside the block";
+  EXPECT_NE(c0.find("user_name: Victor"), std::string::npos);
+  EXPECT_NE(c0.find("## execute"), std::string::npos);
+  EXPECT_NE(c0.find("You drive one frame"), std::string::npos)
+      << "the base instructions follow the persona block";
+  size_t persona_pos = c0.find("# PERSONA SPEC v1");
+  size_t instr_pos = c0.find("You drive one frame");
+  ASSERT_NE(persona_pos, std::string::npos);
+  ASSERT_NE(instr_pos, std::string::npos);
+  EXPECT_LT(persona_pos, instr_pos) << "persona block FIRST, then the base";
+
+  frame_destroy(f);
+  wave_db_close(db);
 }
 
 #endif /* the reopened-walk probe's WDB+PYTHON gate */

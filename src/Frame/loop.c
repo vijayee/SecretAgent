@@ -14,7 +14,13 @@
 //                             │        └─▶ phase=STORE, yield
 // (the store's FRM_STORE_REPLY routes back via frame.c's reply-router
 //  step 4 into _frame_engine_store_reply):
-//   FRAME_STORE_DERIVE ─▶ parse the raw records + the projection (µs) ─▶
+//   FRAME_STORE_DERIVE ─▶ parse the raw records (µs); a persona-carrying
+//                            frame PARKS the DOM + posts the persona's
+//                            GET_NAMED read ─▶ phase=STORE, yield
+//   FRAME_STORE_PERSONA ─▶ compose the persona GROUP (the prompt's FIRST
+//                            block; a refused/missing read = the base
+//                            alone, LOUD — a turn NEVER fails on a persona
+//                            read) with the parked DOM ─▶ the model path:
 //                            async backend: submit() ─▶ phase=MODEL, yield
 //                            sync backend:  complete() INLINE (test driver)
 //   FRM_MODEL_RESULT ─▶ decode (µs) ─▶ tool path / content path
@@ -126,6 +132,11 @@
 #include "lifecycle.h"
 #include "model.h"
 #include "model_internal.h"
+#include "persona.h"    /* the persona GROUP's compose (persona spec §2): the
+                           derive's second store trip reads the persona
+                           records as state and composes here — the loop
+                           owns no persona logic beyond the read + compose
+                           + the first-block placement */
 #include "../Actor/actor.h"
 #include "../Platform/platform_time.h"
 #include "../Util/allocator.h"
@@ -195,6 +206,15 @@ static const char SA_LOOP_INSTRUCTION[] =
     "actor.recall(key), actor.spawn(goal, context=None), actor.report(value).\n"
     "Finish the frame by calling actor.report inside your last cell (a "
     "completion declaration), or simply by answering WITHOUT a tool call.\n";
+
+/* The frame's tool-id surface, as persona_compose (persona spec §2 item 4)
+   reads it: the tool-conditional guidance entries attach on these ids.
+   Today's surface is the model layer's ONE canned `execute` tool (loop.c's
+   instruction above says so; model.c serves it) — the id list pinned here,
+   where the compose happens. A second tool grows this list with model.c's
+   surface. */
+static const char* const _LOOP_TOOL_IDS[] = {"execute"};
+#define _LOOP_TOOL_IDS_N (sizeof(_LOOP_TOOL_IDS) / sizeof(_LOOP_TOOL_IDS[0]))
 
 /* ---------------------------------------------------------------------------
  * Small text helpers. get_memory aborts on OOM (style guide), so these
@@ -339,10 +359,26 @@ static void _loop_flush_results(json_value_t* out, char** ring, size_t* n) {
 }
 
 static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t nsnaps,
-                                  const loop_report_t* reports, size_t nreports) {
+                                  const loop_report_t* reports, size_t nreports,
+                                  const char* persona_prefix) {
   loop_sb_t sb;
   _loop_sb_init(&sb);
-  _loop_sb_puts(&sb, SA_LOOP_INSTRUCTION);
+  if (persona_prefix != NULL) {
+    /* The persona GROUP (persona spec §2): the composed prefix IS the
+       prompt's first block — the record carries its placement, and it was
+       composed WITH SA_LOOP_INSTRUCTION as the base, so the instruction's
+       bytes live INSIDE the prefix (placement "first" = persona block +
+       context + guidance, then the instructions; "below" = instructions
+       first, then the persona group). The sb replaces its own instruction
+       put with the prefix verbatim and continues with the goal — the
+       composed string is byte-stable per inputs (the cache-stable prefix,
+       matrix row 36: the persona re-composes every derive, and a record
+       that carries no {CURRENT_DATETIME} stamps nothing). */
+    _loop_sb_puts(&sb, persona_prefix);
+  } else {
+    _loop_sb_puts(&sb, SA_LOOP_INSTRUCTION);   /* the NO-PERSONA path: today's
+                                                  bytes, untouched */
+  }
 
   const char* goal = _frame_goal(f);
   if (goal != NULL) {
@@ -377,8 +413,11 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
 /* ONE helper builds the whole messages array (the projection, byte-
    equivalent to the old loop's derive): returns a fresh JSON array value the
    engine destroys after the model call; NULL on failure (the caller logs a
-   control event). `events` = the derive's parsed DOM (consumed). */
-static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
+   control event). `events` = the derive's parsed DOM (consumed).
+   `persona_prefix` = the composed persona GROUP (borrowed; NULL = none —
+   every persona-less frame's prompts stay byte-identical). */
+static json_value_t* _loop_project(frame_t* f, json_value_t* events,
+                                   const char* persona_prefix) {
   if (events == NULL || json_type(events) != JSON_ARRAY) {
     json_value_destroy(events);
     return NULL;
@@ -423,7 +462,8 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events) {
     json_value_destroy(events);
     return NULL;
   }
-  char* sys_text = _loop_system_content(f, snaps, nsnaps, reports, nreports);
+  char* sys_text = _loop_system_content(f, snaps, nsnaps, reports, nreports,
+                                        persona_prefix);
   json_value_t* sys = json_new_object();
   json_object_set(sys, "role", json_new_string("system"));
   json_object_set(sys, "content", json_new_string(sys_text));
@@ -772,6 +812,15 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
                                (the FINISH reply that consumed it ran already,
                                or the frame died mid-yield) */
   e->finish_text = NULL;
+  /* The persona trip's window state dies with the engine too (mirror
+     finish_text: the parked derive DOM and the composed GROUP are this
+     derive's facts — a restarted engine re-derives and re-composes). */
+  if (e->derive_events != NULL) {
+    json_value_destroy(e->derive_events);
+    e->derive_events = NULL;
+  }
+  free(e->persona_prefix);
+  e->persona_prefix = NULL;
   /* The doom breaker's streak dies with the engine too (frame_internal.h's
      field contract; guards spec §1): a DEAD engine never carries a streak
      across a restart — the next run's re-derive relearns the input facts
@@ -1241,10 +1290,273 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
   _loop_content_path(f, e, reply);
 }
 
+/* The model path (the derive continuation's tail, shared by BOTH arrivals —
+   the persona-less derive and the persona trip's reply): project with the
+   engine's persona prefix (NULL = the built-in base alone, today's exact
+   bytes) and take the submit/complete path. CONSUMES `events` on every
+   path. */
+static void _loop_engine_model_path(frame_t* f, frame_engine_state_t* e,
+                                    json_value_t* events) {
+  json_value_t* messages = _loop_project(f, events, e->persona_prefix);   /* consumes the DOM */
+  if (messages == NULL) {
+    log_error("loop: the projection failed at '%s'", frame_sid(f));
+    _loop_fail(f, e, "derive-error", NULL);
+    return;
+  }
+
+  model_backend_t* mb = _frame_backend_get(f);
+  if (mb == NULL) {
+    log_error("loop: '%s' has no usable model backend", frame_sid(f));
+    _loop_fail(f, e, "model-missing", NULL);
+    json_value_destroy(messages);
+    return;
+  }
+
+  if (mb->submit != NULL) {
+    /* The ASYNC shape (Task 4's http submit): rc 0 → the sink fires EXACTLY
+       ONCE (FRM_MODEL_RESULT) and the engine yields in FRAME_PHASE_MODEL;
+       rc != 0 = rejected before any I/O — the sink will NEVER fire. */
+    /* The lifetime handoff's begin: ONE pending-submit slot held from
+       BEFORE the submit until the sink's release (frame.c's claim protocol)
+       — frame_destroy mid-turn then DEFERS its teardown to that sink's last
+       release instead of freeing the record under the completion it still
+       carries. The sync path (below) never acquires: only a real in-flight
+       submit counts. `_frame_engine_submit_settle` right after the submit
+       clears the in-flight marker and — a destroy having raced the call —
+       runs the deferred teardown on this, the record's last-owner thread:
+       a settle returning 1 means the record is GONE and nothing of `f`/`e`
+       may follow that return. */
+    _frame_engine_submit_begin(f);
+    int src = mb->submit(mb, messages, NULL, _loop_model_sink, f);
+    json_value_destroy(messages);
+    if (_frame_engine_submit_settle(f) != 0) return;
+    if (src != 0) {
+      /* Rejected before any I/O: the sink will never fire, so THIS caller
+         releases its slot. A concurrent destroy's deferral ends here too:
+         a release that returns 1 means the record is GONE — the engine
+         state died inside the release and nothing of `f` may follow. */
+      if (_frame_engine_submit_release(f) != 0) return;
+      log_error("loop: the model submit was rejected (the sink will never "
+                "fire) at '%s'", frame_sid(f));
+      _loop_fail(f, e, "submit-failed", NULL);
+      return;
+    }
+    e->phase = FRAME_PHASE_MODEL;
+    return;                    /* yield: the completion arrives as a message */
+  }
+
+  /* The SYNC shape (every scripted test backend): complete() runs INLINE
+     inside this dispatch — blocking the actor, acceptable ONLY on the
+     documented inline/test driver (§6), never on a pool worker in
+     production (a production backend implements submit). raw_out = NULL:
+     the documented NULL-tolerant body out-param — the engine keeps only the
+     parsed reply. The derived array's lifetime ends here either way (the
+     model-error retry re-derives; nothing retains it). */
+  model_reply_t* reply = NULL;
+  char* err = NULL;
+  int crc = mb->complete(mb, messages, NULL, NULL, &reply, &err);
+  json_value_destroy(messages);
+  /* The sync drain has NO status facts: a scripted sync backend speaks no
+     HTTP — complete()'s rc is its own contract, not a status code — so the
+     arrival passes 0/0 = absent both ways. The guards table then reads the
+     fallback class for a sync failure, which keeps the standing once-only
+     retry rule byte-identical (Task 5). */
+  _frame_engine_reply(f, e, crc, reply, err, 0, 0);
+}
+
+/* --- the derive's PERSONA TRIP (the persona slice, spec §3) ---------------
+   A persona-carrying frame reads the persona's two state records with ONE
+   second bounded store trip before the model path: FRM_STORE_GET_NAMED over
+   the absolute root-level keys personas/<name>/record and
+   personas/<name>/user-context. The reply (FRAME_STORE_PERSONA) composes
+   the persona GROUP into e->persona_prefix — the fallback (a refused read,
+   a missing record, a record failing the rules) answers the built-in base
+   alone, LOUD: a persona is presentation, and a turn NEVER fails on a
+   persona read. The parsed derive DOM parks on e->derive_events across the
+   trip (the finish_text lifetime rule; a dead engine frees it). */
+
+/* The persona record-key shape: ONE path segment (a '/' in the name would
+   compose a foreign subtree; the bound keeps the snprintf honest). */
+#define _LOOP_PERSONA_NAME_MAX 256
+
+static int _loop_persona_key_ok(const char* persona_name) {
+  return persona_name != NULL && persona_name[0] != '\0' &&
+         strlen(persona_name) <= _LOOP_PERSONA_NAME_MAX &&
+         strchr(persona_name, '/') == NULL;
+}
+
+/* One subtree key under the persona's name (the absolute root-level text
+   "personas/<name>/<leaf>"): a heap string the caller frees. */
+static char* _loop_persona_key(const char* persona_name, const char* leaf) {
+  char* out = get_memory(strlen("personas/") + strlen(persona_name) +
+                         strlen(leaf) + 2);
+  snprintf(out, strlen("personas/") + strlen(persona_name) + strlen(leaf) + 2,
+           "personas/%s/%s", persona_name, leaf);
+  return out;
+}
+
+/* The persona trip's post (_loop_post_derive's second-trip sibling): the
+   GET_NAMED read of the persona subtree's TWO keys, posted as a FRAME_
+   STORE_PERSONA round trip. The parked DOM must already sit on
+   e->derive_events. */
+static void _loop_post_persona(frame_t* f, frame_engine_state_t* e) {
+  const char* persona = (f != NULL) ? _frame_persona_name(f) : NULL;
+  if (persona == NULL || !_loop_persona_key_ok(persona)) {
+    /* Unreachable through the calling branch (it checks first) — a
+       defensive loud fail, never a silent wrong trip. */
+    log_error("loop: the persona trip at '%s' carries no valid persona name",
+              (f != NULL) ? frame_sid(f) : "?");
+    _loop_fail(f, (f != NULL) ? e : NULL, "derive-error", NULL);
+    return;
+  }
+  char* record_key = _loop_persona_key(persona, "record");
+  char* context_key = _loop_persona_key(persona, "user-context");
+  frm_store_get_named_payload_t* gp =
+      (frm_store_get_named_payload_t*)get_clear_memory(sizeof(*gp));
+  if (record_key == NULL || context_key == NULL || gp == NULL) {
+    log_error("loop: out of memory composing the persona read at '%s'",
+              (f != NULL) ? frame_sid(f) : "?");
+    free(record_key);
+    free(context_key);
+    free(gp);
+    _loop_fail(f, e, "derive-error", NULL);
+    return;
+  }
+  gp->keys = (char**)get_clear_memory(2 * sizeof(char*));
+  if (gp->keys == NULL) {
+    log_error("loop: out of memory composing the persona read at '%s'",
+              frame_sid(f));
+    free(record_key);
+    free(context_key);
+    free(gp);
+    _loop_fail(f, e, "derive-error", NULL);
+    return;
+  }
+  gp->keys[0] = record_key;
+  gp->keys[1] = context_key;
+  gp->nkeys = 2;
+  gp->reply_to = _frame_actor(f);
+  gp->corr = _frame_store_corr_next(f);
+  e->phase = FRAME_PHASE_STORE;
+  e->store_kind = FRAME_STORE_PERSONA;
+  e->store_corr = gp->corr;
+  _frame_post(_frame_store_actor(f), (uint32_t)FRM_STORE_GET_NAMED, gp,
+              frm_store_get_named_payload_destroy, "persona read");
+}
+
+/* The reply array's named lookup: the value text of the entry whose "key"
+   matches (borrowed, lives while the array does), NULL when the key is
+   absent or its value is null — ABSENCE IS THE ANSWER (the store's GET_
+   NAMED shape: no positional guessing). */
+static const char* _loop_get_named_value(json_value_t* array,
+                                         const char* key) {
+  for (size_t i = 0; i < json_size(array); i++) {
+    json_value_t* entry = json_at(array, i);
+    if (entry == NULL) continue;
+    json_value_t* k = json_get(entry, "key");
+    if (k == NULL || strcmp(json_as_string(k), key) != 0) continue;
+    json_value_t* v = json_get(entry, "value");
+    if (v == NULL || json_type(v) == JSON_NULL) return NULL;
+    return json_as_string(v);
+  }
+  return NULL;
+}
+
+/* The persona GROUP's compose from the fetched records: the voice record
+   loads (a refusal is LOUD and answers NULL = the built-in base alone —
+   the spec §2 fallback, never a half-persona render) and composes with the
+   turn instruction as the base — placement "first" rides the group up
+   front, "below" the base ahead; the compose's byte rules (persona spec
+   §2) pin the rest. */
+static char* _loop_persona_compose(frame_t* f, const char* record_json,
+                                   const char* context_text) {
+  persona_record_t* record = NULL;
+  if (persona_record_load(record_json, &record) != 0) {
+    log_error("loop: the persona '%s' at '%s' failed the record rules — the "
+              "built-in base rides this derive (a persona is presentation; "
+              "the turn NEVER fails on a persona read)",
+              (f != NULL) ? _frame_persona_name(f) : "?",
+              (f != NULL) ? frame_sid(f) : "?");
+    return NULL;
+  }
+  char* composed = persona_compose(record, context_text, _LOOP_TOOL_IDS,
+                                   _LOOP_TOOL_IDS_N, SA_LOOP_INSTRUCTION);
+  persona_record_destroy(record);
+  return composed;
+}
+
+/* The FRAME_STORE_PERSONA reply's continuation: the persona read's answer —
+   ONE JSON array record with the values' keys attached — composes the
+   engine's persona_prefix (the fallback = the base alone, loud), unparks
+   the derive DOM, and continues to the model path. */
+static void _loop_engine_on_persona(frame_t* f, frame_engine_state_t* e,
+                                    frm_store_reply_payload_t* r) {
+  json_value_t* events = e->derive_events;
+  e->derive_events = NULL;
+  if (events == NULL) {
+    /* Defensive only (the trip posts the DOM before the reply can route):
+       a parked DOM gone means incoherent engine state — loud fail. */
+    log_error("loop: the persona reply at '%s' found no parked derive DOM",
+              frame_sid(f));
+    _loop_fail(f, e, "derive-error", NULL);
+    return;
+  }
+
+  const char* persona = _frame_persona_name(f);
+  char* prefix = NULL;
+  json_value_t* array = NULL;
+  char* perr = NULL;
+  if (r->rc != 0 || r->n != 1 || r->records[0] == NULL) {
+    log_error("loop: the persona read at '%s' was refused by the store (%d)"
+              " — the built-in base rides this derive (a persona is "
+              "presentation; the turn NEVER fails on a persona read)",
+              frame_sid(f), r->rc);
+  } else {
+    array = json_parse(r->records[0], strlen(r->records[0]), &perr);
+    if (perr != NULL) free(perr);
+    if (array == NULL || json_type(array) != JSON_ARRAY) {
+      log_error("loop: the persona read's reply at '%s' is not the GET_"
+                "NAMED array — the built-in base rides this derive (a "
+                "persona is presentation; the turn NEVER fails on a persona "
+                "read)", frame_sid(f));
+      if (array != NULL) {
+        json_value_destroy(array);
+        array = NULL;
+      }
+    }
+  }
+  if (array != NULL) {
+    char* record_key = _loop_persona_key(persona, "record");
+    char* context_key = _loop_persona_key(persona, "user-context");
+    const char* record_json = (record_key != NULL)
+        ? _loop_get_named_value(array, record_key) : NULL;
+    const char* context_text = (context_key != NULL)
+        ? _loop_get_named_value(array, context_key) : NULL;
+    free(record_key);
+    free(context_key);
+    if (record_json == NULL) {
+      /* NOT installed: the stable missing-persona state — the base alone,
+         loud (spec §2: never silent, never a half-persona render). */
+      log_error("loop: the persona '%s' carries no installed record (the "
+                "store answered null) at '%s' — the built-in base rides "
+                "this derive (a persona is presentation; the turn NEVER "
+                "fails on a persona read)", persona, frame_sid(f));
+    } else {
+      prefix = _loop_persona_compose(f, record_json, context_text);
+    }
+  }
+  json_value_destroy(array);
+  e->persona_prefix = prefix;
+  _loop_engine_model_path(f, e, events);
+}
+
 /* The FRAME_STORE_DERIVE reply's continuation: parse the materialized raw
    records into the DOM (µs, bounded 512, unparseable dropped loud — the old
    frame_debug_events tail's shape MOVED here: the store worker carried raw
-   texts), run the UNCHANGED two-pass projection, and take the model path. */
+   texts), run the UNCHANGED two-pass projection, and take the model path —
+   with the persona trip between them for a persona-carrying frame (the
+   spec §3 second store trip; a persona-less frame continues directly, no
+   extra store traffic, byte-identical). */
 static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
                                    frm_store_reply_payload_t* r) {
   if (r->rc != 0) {
@@ -1324,71 +1636,33 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
     _loop_turn_entry(f, e);
   }
 
-  json_value_t* messages = _loop_project(f, events);   /* consumes the DOM */
-  if (messages == NULL) {
-    log_error("loop: the projection failed at '%s'", frame_sid(f));
-    _loop_fail(f, e, "derive-error", NULL);
-    return;
+  /* --- the persona trip (persona spec §3) --------------------------------
+     A persona-carrying frame parks the parsed DOM and posts the SECOND
+     bounded store trip (the named read of the persona subtree's records)
+     BEFORE the model path; the trip's reply composes the persona GROUP
+     into e->persona_prefix and continues to the model path. A persona-less
+     frame (no name, the empty-none normalization, an impossible key) takes
+     the model path DIRECTLY: no extra store traffic, byte-identical
+     prompt. The prefix rebuilt per derive — the records are STATE that can
+     change between turns; the old one dies here. */
+  const char* persona = _frame_persona_name(f);
+  if (_loop_persona_key_ok(persona)) {
+    free(e->persona_prefix);
+    e->persona_prefix = NULL;
+    e->derive_events = events;   /* parked until the persona reply */
+    _loop_post_persona(f, e);
+    return;                      /* yield: the trip's reply continues */
   }
-
-  model_backend_t* mb = _frame_backend_get(f);
-  if (mb == NULL) {
-    log_error("loop: '%s' has no usable model backend", frame_sid(f));
-    _loop_fail(f, e, "model-missing", NULL);
-    json_value_destroy(messages);
-    return;
+  if (persona != NULL && persona[0] != '\0') {
+    /* A configured name that cannot form the key (interior '/', over the
+       bound): the loud base-only fallback — the turn NEVER fails on a
+       persona read. */
+    log_error("loop: the persona name '%s' at '%s' is not a valid record "
+              "key — the built-in base rides this derive (a persona is "
+              "presentation; the turn NEVER fails on a persona read)",
+              persona, frame_sid(f));
   }
-
-  if (mb->submit != NULL) {
-    /* The ASYNC shape (Task 4's http submit): rc 0 → the sink fires EXACTLY
-       ONCE (FRM_MODEL_RESULT) and the engine yields in FRAME_PHASE_MODEL;
-       rc != 0 = rejected before any I/O — the sink will NEVER fire. */
-    /* The lifetime handoff's begin: ONE pending-submit slot held from
-       BEFORE the submit until the sink's release (frame.c's claim protocol)
-       — frame_destroy mid-turn then DEFERS its teardown to that sink's last
-       release instead of freeing the record under the completion it still
-       carries. The sync path (below) never acquires: only a real in-flight
-       submit counts. `_frame_engine_submit_settle` right after the submit
-       clears the in-flight marker and — a destroy having raced the call —
-       runs the deferred teardown on this, the record's last-owner thread:
-       a settle returning 1 means the record is GONE and nothing of `f`/`e`
-       may follow that return. */
-    _frame_engine_submit_begin(f);
-    int src = mb->submit(mb, messages, NULL, _loop_model_sink, f);
-    json_value_destroy(messages);
-    if (_frame_engine_submit_settle(f) != 0) return;
-    if (src != 0) {
-      /* Rejected before any I/O: the sink will never fire, so THIS caller
-         releases its slot. A concurrent destroy's deferral ends here too:
-         a release that returns 1 means the record is GONE — the engine
-         state died inside the release and nothing of `f` may follow. */
-      if (_frame_engine_submit_release(f) != 0) return;
-      log_error("loop: the model submit was rejected (the sink will never "
-                "fire) at '%s'", frame_sid(f));
-      _loop_fail(f, e, "submit-failed", NULL);
-      return;
-    }
-    e->phase = FRAME_PHASE_MODEL;
-    return;                    /* yield: the completion arrives as a message */
-  }
-
-  /* The SYNC shape (every scripted test backend): complete() runs INLINE
-     inside this dispatch — blocking the actor, acceptable ONLY on the
-     documented inline/test driver (§6), never on a pool worker in
-     production (a production backend implements submit). raw_out = NULL:
-     the documented NULL-tolerant body out-param — the engine keeps only the
-     parsed reply. The derived array's lifetime ends here either way (the
-     model-error retry re-derives; nothing retains it). */
-  model_reply_t* reply = NULL;
-  char* err = NULL;
-  int crc = mb->complete(mb, messages, NULL, NULL, &reply, &err);
-  json_value_destroy(messages);
-  /* The sync drain has NO status facts: a scripted sync backend speaks no
-     HTTP — complete()'s rc is its own contract, not a status code — so the
-     arrival passes 0/0 = absent both ways. The guards table then reads the
-     fallback class for a sync failure, which keeps the standing once-only
-     retry rule byte-identical (Task 5). */
-  _frame_engine_reply(f, e, crc, reply, err, 0, 0);
+  _loop_engine_model_path(f, e, events);
 }
 
 /* The FRAME_STORE_CELL_RUN reply's continuation: rc != 0 → the old loop's
@@ -1606,6 +1880,10 @@ int _frame_engine_start(frame_t* f) {
   e->engine_failed = 0;
   e->live_children = 0;
   e->finish_text = NULL;
+  /* The persona trip's window state starts parked-free (the derive is the
+     only writer of either field; a restart re-derives and re-composes). */
+  e->derive_events = NULL;
+  e->persona_prefix = NULL;
   /* The doom breaker's streak never survives a restart either (the
      _loop_engine_end clear owns the free — a stale copy here would mean a
      leak the freed-engine discipline never wrote). */
@@ -1728,6 +2006,9 @@ void _frame_engine_store_reply(frame_t* f, frm_store_reply_payload_t* r) {
       break;
     case FRAME_STORE_FINISH:
       _loop_engine_on_finish(f, e, rc);
+      break;
+    case FRAME_STORE_PERSONA:
+      _loop_engine_on_persona(f, e, r);
       break;
     default:
       break;

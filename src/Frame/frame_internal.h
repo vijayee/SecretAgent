@@ -84,9 +84,17 @@ typedef enum frame_store_kind_e {
                                and runs the projection + submit/reply processing */
   FRAME_STORE_CELL_RUN,     /* the cell.run audit commit; the reply dispatches
                                FRM_CELL_EXECUTE (no untracked cell ever runs) */
-  FRAME_STORE_FINISH        /* msg.append (+ meta/status=done for a top frame) in ONE
+  FRAME_STORE_FINISH,       /* msg.append (+ meta/status=done for a top frame) in ONE
                                batch; the reply ends the engine (top) or drives the
                                child's quiet-completion report bind (child) */
+  FRAME_STORE_PERSONA       /* the named persona read (persona spec §3): the
+                               FRM_STORE_GET_NAMED direct read of
+                               personas/<name>/{record,user-context}; the reply
+                               composes the persona GROUP into the engine's
+                               persona_prefix and continues to the model path
+                               (a scan refusal / absent record = the built-in
+                               base only, loud — a persona is presentation, a
+                               turn NEVER fails on a persona read) */
 } frame_store_kind_e;
 
 /* The turn engine's STATE — embedded in frame_t (frame.c) as ONE of its
@@ -126,6 +134,27 @@ typedef struct frame_engine_state_t {
                                   reply's end rule — the CHILDREN yield, the
                                   child's quiet-completion report bind, or
                                   the top end consume/free it there */
+
+  /* --- the derive's persona GROUP (persona spec §3; the persona slice's
+     Task 4) ---------------------------------------------------------------
+
+     derive_events: the parse events DOM of the derive whose continuation is
+     parked at the persona read, OWNED by the engine for exactly the
+     persona-trip window (the derive reply stashes it, the persona reply's
+     projection consumes it, or the engine end frees it — the finish_text
+     lifetime rule: a DEAD engine never carries it across a restart).
+
+     persona_prefix: the COMPOSED persona GROUP (persona block + context
+     block + attached guidance + the base instructions ride the compose's
+     placement), byte-stable per inputs — the system prompt's FIRST block
+     (the cache-stable prefix, spec §2). OWNED; rebuilt per derive (the
+     records are state and can change between turns; the compose re-runs
+     every derive), freed with the engine. NULL = no persona rides (the
+     built-in base alone — today's byte-identical shape). */
+  json_value_t* derive_events; /* the parked derive DOM across the persona
+                                  trip (NULL outside that window) */
+  char* persona_prefix;        /* the composed persona block's bytes, or
+                                  NULL for none */
 
   /* --- the DOOM-LOOP breaker's streak (guards spec §1) -------------------
 
@@ -261,8 +290,10 @@ void _frame_engine_turn(frame_t* f);
    the reply's records into the DOM (µs, bounded 512, unparseable dropped loud)
    and run the projection + backend resolve; CELL_RUN → rc != 0 = control
    "audit-error" + terminate, rc == 0 = dispatch FRM_CELL_EXECUTE; FINISH →
-   end the engine (top) / drive the child's report bind (child).
-   CONSUMES the payload on every path. */
+   end the engine (top) / drive the child's report bind (child);
+   PERSONA → compose the persona GROUP into persona_prefix (the fallback =
+   the base alone, loud) and continue to the model path with the parked
+   derive DOM. CONSUMES the payload on every path. */
 void _frame_engine_store_reply(frame_t* f, frm_store_reply_payload_t* payload);
 
 /* The FRM_MODEL_RESULT behavior: decode the raw completion (model.c's error
