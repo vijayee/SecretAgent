@@ -34,6 +34,13 @@ size_t      json_size(const json_value_t* v);            /* object/array length 
 json_value_t* json_get(const json_value_t* obj, const char* key);   /* NULL if absent */
 json_value_t* json_at(const json_value_t* array, size_t index);
 
+/* Object iteration (borrowed): the pair at `index`'s key / value — NULL when
+   `obj` is not an object or the index is past its size. The index order is
+   the object's INSERTION order (see json.c's contract notes); a caller that
+   needs a canonical render sorts the pairs itself. */
+const char*   json_key_at(const json_value_t* obj, size_t index);
+json_value_t* json_value_at(const json_value_t* obj, size_t index);
+
 /* Construction (heap-owned values; json_value_destroy frees recursively): */
 json_value_t* json_new_null(void);
 json_value_t* json_new_bool(int b);

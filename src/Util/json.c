@@ -677,6 +677,20 @@ json_value_t* json_at(const json_value_t* array, size_t index) {
   return array->children[index];
 }
 
+const char* json_key_at(const json_value_t* obj, size_t index) {
+  if (obj == NULL || obj->type != JSON_OBJECT || index >= obj->size) {
+    return NULL;
+  }
+  return obj->pairs[index].key;
+}
+
+json_value_t* json_value_at(const json_value_t* obj, size_t index) {
+  if (obj == NULL || obj->type != JSON_OBJECT || index >= obj->size) {
+    return NULL;
+  }
+  return obj->pairs[index].value;
+}
+
 /* ------------------------------------------------------------------ */
 /* Construction                                                       */
 /* ------------------------------------------------------------------ */

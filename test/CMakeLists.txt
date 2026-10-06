@@ -49,6 +49,9 @@ if (BUILD_TESTING)
             # The guards suite is PURE (the doom fold + the retry table):
             # no WDB, no streams.
             test_guards.cpp
+            # The persona suite is PURE (the record load + the compose over
+            # Util/json): no WDB, no streams — same plain gate.
+            test_persona.cpp
             # The stream-framer suite is PURE (the ported byte-framer over
             # Util/allocator): no WDB, no streams — same plain gate.
             test_stream_framer.cpp
