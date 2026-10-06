@@ -796,6 +796,10 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
   e->store_corr = 0;
   e->turn_cell_corr = 0;
   e->model_retry_step = 0;
+  /* The wake latch resets with the engine (a dying engine's queued
+     continuation is either consumed or dead-queued — a resumed run must
+     wake on its own inputs, never inherit a stale one). */
+  atomic_store(&e->continuation_queued, 0);
   /* The envelope's compose-time facts die with the engine (the store's
      records stay the truth): a DEAD engine never carries the counter or an
      open-turn fact across a restart — the next run's first entry restores
@@ -889,7 +893,12 @@ static int _loop_doom_close(frame_t* f, frame_engine_state_t* e,
    refusal here is the DESTROY flag only — actor_send answers
    delivered-vs-refused (busy included: a continuation pushed into a
    non-empty mailbox is still delivered; false is the only refusal, never
-   re-judged from the return below). */
+   re-judged from the return below).
+   THE WAKE LATCH rides the continuation: between this queueing and the
+   continuation's dispatch the transient phase-NONE gap lets a CONCURRENT
+   steer's enqueue race ahead of the continuation — the steer's wake guard
+   reads the latch and rides this continuation's derive instead of posting
+   a duplicate FRM_TURN (the review's extra-turn-step leak). */
 static int _loop_post_turn(frame_t* f) {
   actor_t* actor = _frame_actor(f);
   if (actor == NULL || (atomic_load(&actor->flags) & ACTOR_FLAG_DESTROY)) {
@@ -899,6 +908,8 @@ static int _loop_post_turn(frame_t* f) {
     _loop_engine_end(f, _frame_engine_state(f), 1);
     return -1;
   }
+  frame_engine_state_t* e = _frame_engine_state(f);
+  if (e != NULL) atomic_store(&e->continuation_queued, 1);
   message_t m;
   m.type = (uint32_t)FRM_TURN;
   m.payload = NULL;
@@ -1882,6 +1893,8 @@ int _frame_engine_start(frame_t* f) {
   e->turns_issued = 0;
   e->model_retries = 0;
   e->model_retry_step = 0;
+  atomic_store(&e->continuation_queued, 0);   /* the wake latch is a per-run
+                                   knob: a restart wakes on its own inputs */
   e->engine_failed = 0;
   e->live_children = 0;
   e->finish_text = NULL;

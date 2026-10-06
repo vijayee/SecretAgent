@@ -999,7 +999,13 @@ static void _frame_delayed_post_reap(frame_t* f) {
 }
 
 /* Arm one delayed FRM_TURN; delay_ms > 0 ONLY (0 posts directly, today's
-   shape). The thread is JOINABLE so the completion sites reap it. */
+   shape). The thread is JOINABLE so the completion sites reap it.
+   The ARM sets the wake latch (the retry backoff's continuation window: the
+   engine rests at phase NONE while the timer sleeps — a plain steer landing
+   there would otherwise post a duplicate FRM_TURN that a later NONE window
+   turns into an extra turn step; the queued re-derive reads the store, so
+   the wake's append rides it instead). An arm refusal leaves the latch to
+   the caller's immediate same-dispatch repost (FIFO-safe, no window). */
 int _frame_delayed_post(frame_t* f, uint32_t delay_ms) {
   if (f == NULL || f->st == NULL) return -1;
   if (f->delayed_post_thread != NULL) {
@@ -1021,6 +1027,7 @@ int _frame_delayed_post(frame_t* f, uint32_t delay_ms) {
     return -1;
   }
   f->delayed_post_thread = t;
+  atomic_store(&f->engine.continuation_queued, 1);
   return 0;
 }
 
@@ -2710,8 +2717,11 @@ void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
         "interrupted at the frame's request");
     if (ask_reply_payload == NULL) {
       log_error("frame: out of memory composing the interrupted asking "
-                "cell's ask.reply at '%s' — the batch rides WITHOUT it loud",
-                f->sid_path);
+                "cell's ask.reply at '%s' (ask %s) — the batch rides WITHOUT "
+                "it loud: the replayed ask %s has no resolution record — the "
+                "repair view will show an open question",
+                f->sid_path, f->engine.pending_ask.ask_id,
+                f->engine.pending_ask.ask_id);
     }
   }
   if (cell_was_pending != 0) {
@@ -3860,7 +3870,11 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          to the remaining backoff. Bounded either way: never joins a
          detached thread, never longer than the guards table's 5 s
          backoff cap; a timer post that lands after the reap
-         late-drops loud. Idempotent (NULL = none). */
+         late-drops loud. Idempotent (NULL = none).
+         The QUEUED CONTINUATION ARRIVED: the wake latch clears here — while
+         this FRM_TURN was still queued, the wake guards read the latch and
+         skipped their own repost. */
+      atomic_store(&f->engine.continuation_queued, 0);
       _frame_delayed_post_reap(f);
       _frame_engine_turn(f);
       break;
@@ -4074,13 +4088,20 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       /* The steer's own re-entry: a live engine resting at phase NONE (the
          park just cleared, or the idle-post-turn engine the interrupt latch
          left) serves the steer's input; the repost's refusal is the DESTROY
-         flag only, loud, never silent. */
-      if (f->engine.engine_live != 0 && f->engine.phase == FRAME_PHASE_NONE) {
+         flag only, loud, never silent. The LATCH reads in: a continuation
+         already queued (a wake's own FRM_TURN, or the retry backoff's armed
+         re-derive — its scan re-reads the store, so this steer's append
+         rides it) means the engine wakes on its own — posting here would
+         duplicate the FRM_TURN and, at a later NONE window, run an extra
+         turn step past the loop's gate (the review's turn-cap leak). */
+      if (f->engine.engine_live != 0 && f->engine.phase == FRAME_PHASE_NONE &&
+          atomic_load(&f->engine.continuation_queued) == 0) {
         if (atomic_load(&f->actor.flags) & ACTOR_FLAG_DESTROY) {
           log_error("frame: the steer's turn continuation was refused at "
                     "'%s' — the mailbox is gone; the frame idles",
                     f->sid_path);
         }
+        atomic_store(&f->engine.continuation_queued, 1);
         _frame_post(&f->actor, (uint32_t)FRM_TURN, NULL, NULL,
                     "the steer's turn continuation");
       }
@@ -4290,7 +4311,10 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          carries the answer): the same repost idiom frame_interrupt's
          continuation uses on its own mailbox. The repost's refusal (the
          DESTROY flag only — _loop_post_turn's shape) leaves a live engine
-         at phase NONE with nothing pending: loud here, never silent. */
+         at phase NONE with nothing pending: loud here, never silent. The
+         LATCH rides the post: a steer landing before this continuation
+         dispatches sees it queued and skips its own wake repost (its append
+         rides the reply's derive). */
       _frame_engine_ask_clear(f);
       f->engine.phase = FRAME_PHASE_NONE;
       if (atomic_load(&f->actor.flags) & ACTOR_FLAG_DESTROY) {
@@ -4298,6 +4322,7 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
                   "'%s' — the mailbox is gone; the frame idles",
                   f->sid_path);
       }
+      atomic_store(&f->engine.continuation_queued, 1);
       _frame_post(&f->actor, (uint32_t)FRM_TURN, NULL, NULL,
                   "the ask's resolution turn continuation");
       break;

@@ -253,6 +253,19 @@ typedef struct frame_engine_state_t {
                                           there stands down its teardown — the
                                           engine stays the record's owner until
                                           it settles (frame.c) */
+  ATOMIC(uint8_t) continuation_queued; /* 1 = a FRM_TURN continuation is
+                                          already queued (the wake posts and
+                                          the retry backoff's arm set it; the
+                                          FRM_TURN dispatch's entry and
+                                          _loop_engine_end clear it). The wake
+                                          latches read it to tell a TRUE rest
+                                          at phase NONE from the TRANSIENT
+                                          gap between a yield and the queued
+                                          continuation's dispatch — a steer
+                                          posting there would duplicate the
+                                          FRM_TURN and, at a later NONE
+                                          window, buy an extra turn step past
+                                          the turn cap's gate. */
 } frame_engine_state_t;
 
 /* The teardown CLAIM marker inside pending_submits: exactly one agent (the

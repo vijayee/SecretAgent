@@ -189,6 +189,30 @@ int log_add_callback(log_LogFn fn, void *udata, int level) {
   return -1;
 }
 
+/* Remove the first callback matching fn and udata (the level is ignored on
+   the way out — one fn/udata pair is one registration; this mirrors the
+   upstream remove's shape). The array is prefix-dense (the dispatch's scan
+   stops at the first empty slot), so the live tail compacts down one slot —
+   a mid-array removal must not leave a hole that would orphan its later
+   callbacks. Returns 0 removed, -1 nothing matched. */
+int log_remove_callback(log_LogFn fn, void *udata, int level) {
+  (void)level;
+  for (int index = 0; index < MAX_CALLBACKS; index++) {
+    if (L.callbacks[index].fn != fn || L.callbacks[index].udata != udata) {
+      continue;
+    }
+    int shift;
+    for (shift = index;
+         shift + 1 < MAX_CALLBACKS && L.callbacks[shift + 1].fn != NULL;
+         shift++) {
+      L.callbacks[shift] = L.callbacks[shift + 1];
+    }
+    L.callbacks[shift] = (Callback) { NULL, NULL, 0 };
+    return 0;
+  }
+  return -1;
+}
+
 int log_add_fp(FILE *fp, int level) {
   return log_add_callback(file_callback, fp, level);
 }

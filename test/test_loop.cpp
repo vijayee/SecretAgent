@@ -2097,6 +2097,9 @@ TEST(TestLoop, TestMidTurnInterruptUnchangedUnderTheAskMachinery) {
   });
   EXPECT_EQ(frame_run_loop(f), 1) << "the interrupted asking cell aborts";
   killer.join();
+  /* The recorder leaves with the test: its armed-lines counter and the log
+     slot must not leak into the suite's later tests. */
+  log_remove_callback(_ask_publish_recorder, NULL, LOG_INFO);
 
   json_value_t* events = load_events(f);
   ASSERT_NE(events, nullptr);
