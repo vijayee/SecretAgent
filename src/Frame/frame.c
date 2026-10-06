@@ -154,6 +154,8 @@ void frm_steer_payload_destroy(void* p) {
 #ifdef SA_HAS_WDB
 
 #include "model.h"
+#include "persona.h"
+#include "persona_records.h"
 
 #include <Database/database.h>
 #include <Database/database_subtree.h>
@@ -4137,6 +4139,90 @@ int wave_db_pump(wave_database_root_t* db) {
     return -2;
   }
   actor_run(&db->store_actor, ACTOR_BATCH_SIZE);
+  return 0;
+}
+
+/* --- persona_records_install (spec §1; frame.h's contract) -----------------
+   The boot/demo path's direct write: the same carve-out the birth batch
+   takes (one caller thread, one atomic root batch, no engine running yet).
+   The batch is the TWO puts — personas/hammer/record carrying the shipped
+   record's canonical JSON bytes VERBATIM (its utf8, strlen bytes, no NUL —
+   the store's values are raw bytes) and personas/hammer/meta carrying
+   {"created": "<iso>"}. A put overwrites, so idempotency is the
+   installer's (frame.h's doc line); nothing half-commits — the batch is
+   atomic root-level, and a refusal leaves the store untouched. */
+int persona_records_install(wave_database_root_t* db) {
+  if (db == NULL) {
+    log_error("persona_records_install: NULL root — refused loud");
+    return -1;
+  }
+  /* The sync write's inline-store rule (§5): a POOLED store's pacing
+     belongs to its workers — the boot install refuses loud rather than
+     mix an arbitrary caller's thread into pool-driven serialization. */
+  if (db->store_pool != NULL) {
+    log_error("persona_records_install: the root's store actor is POOLED "
+              "— the synchronous install is the boot/demo path only; "
+              "refused loud");
+    return -1;
+  }
+
+  char* record = persona_records_hammer_record();
+  if (record == NULL) {
+    log_error("persona_records_install: the hammer's record JSON failed "
+              "to compose — nothing installed");
+    return -1;
+  }
+  /* The boot self-check: the shipped record must pass the record rules
+     AND the falsifiability meta-rule before it touches the store — a
+     shipped record that cannot load would poison every derive that reads
+     it, so the install refuses before the batch. */
+  persona_record_t* check = NULL;
+  if (persona_record_load(record, &check) != 0) {
+    log_error("persona_records_install: the shipped hammer record fails "
+              "the record rules — nothing installed");
+    free(record);
+    return -1;
+  }
+  persona_record_destroy(check);
+
+  size_t record_len = strlen(record);
+  if (record_len > SA_FRAME_MAX_BATCH_BYTES) {
+    log_error("persona_records_install: the record is %zu bytes, exceeding "
+              "the %d-byte WAL batch cap — refusing, never truncating",
+              record_len, (int)SA_FRAME_MAX_BATCH_BYTES);
+    free(record);
+    return -1;
+  }
+  /* The meta record composes by hand — the "created" value is the event
+     records' one ISO stamp (digits, 'T', 'Z', ':' only; nothing to
+     escape) and the key pair reads honestly as literal JSON. */
+  char iso[25];
+  _frame_iso_now(iso);
+  char meta_buf[48];
+  snprintf(meta_buf, sizeof(meta_buf), "{\"created\":\"%s\"}", iso);
+
+  raw_op_t ops[2];
+  size_t nops = 0;
+  ops[nops].key = "personas/hammer/record";
+  ops[nops].key_len = strlen("personas/hammer/record");
+  ops[nops].value = (const uint8_t*)record;
+  ops[nops].value_len = record_len;
+  ops[nops].type = 0;   /* all frame-layer writes are puts */
+  nops++;
+  ops[nops].key = "personas/hammer/meta";
+  ops[nops].key_len = strlen("personas/hammer/meta");
+  ops[nops].value = (const uint8_t*)meta_buf;
+  ops[nops].value_len = strlen(meta_buf);
+  ops[nops].type = 0;
+  nops++;
+
+  int rc = database_batch_sync_raw(db->db, '/', ops, nops);
+  free(record);
+  if (rc != 0) {
+    log_error("persona_records_install: the personas batch failed (%d) at "
+              "the root — nothing committed", rc);
+    return -1;
+  }
   return 0;
 }
 

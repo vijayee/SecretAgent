@@ -10,6 +10,7 @@
 #include <vector>
 extern "C" {
 #include "../src/Frame/frame.h"
+#include "../src/Frame/persona_records.h"
 #include "../src/Frame/frame_messages.h"
 #include "../src/Frame/frame_bridge.h"
 #include "../src/Frame/frame_internal.h"
@@ -843,6 +844,117 @@ TEST(TestStore, TestStoreScanHonorsRequestedLimit) {
   actor_destroy(&cap.actor);
   frame_destroy(f);
   wave_db_close(db);
+}
+
+TEST(TestStore, TestPersonaInstallWritesTheHammerRecords) {
+  /* persona_records_install (spec §1): the boot/direct batch puts
+     personas/hammer/record (the shipped record's canonical JSON) and
+     personas/hammer/meta ({"created": the ISO now}). The keys come back
+     through the store actor's own bounded scan (absolute root-level
+     bounds); the RE-INSTALL is idempotent-safe (a put overwrites — the
+     installer decides): rc 0 again and the record's bytes identical. */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  ASSERT_EQ(persona_records_install(db), 0);
+
+  char* shipped = persona_records_hammer_record();
+  ASSERT_NE(shipped, nullptr);
+
+  /* Scan the personas subtree back (the store's own scan, root-level
+     bounds; ascending order — meta sorts before record). */
+  auto scan_once = [&](scan_capture_t* cap) {
+    cap->rcs.clear();
+    cap->counts.clear();
+    cap->records_per_reply.clear();
+    frm_store_scan_payload_t* sp =
+        (frm_store_scan_payload_t*)get_clear_memory(sizeof(*sp));
+    sp->start = strdup("personas/");
+    sp->end = strdup("personas0");
+    sp->limit = 6;
+    sp->reply_to = &cap->actor;
+    sp->corr = 151;
+    message_t m;
+    m.type = (uint32_t)FRM_STORE_SCAN;
+    m.payload = sp;
+    m.payload_destroy = frm_store_scan_payload_destroy;
+    ASSERT_TRUE(actor_send(wave_db_store_actor(db), &m));
+    wave_db_pump(db);
+    actor_run(&cap->actor, ACTOR_BATCH_SIZE);
+    ASSERT_EQ(cap->counts.size(), 1u) << "one corr-matched scan reply";
+    ASSERT_EQ(cap->rcs[0], 0);
+  };
+  scan_capture_t cap;
+  actor_init(&cap.actor, &cap, scan_capture_dispatch, NULL);
+  scan_once(&cap);
+  ASSERT_EQ(cap.counts[0], 2u) << "meta + record, exactly";
+  const std::string meta_text = cap.records_per_reply[0][0];
+  const std::string record_text = cap.records_per_reply[0][1];
+
+  /* The stored record's bytes ARE the shipped record's canonical bytes. */
+  ASSERT_EQ(record_text, std::string(shipped));
+  json_value_t* rec = json_parse(record_text.c_str(), record_text.size(), NULL);
+  ASSERT_NE(rec, nullptr) << "the installed record is a JSON document";
+  EXPECT_EQ(json_as_int(json_get(rec, "version")), 1);
+  EXPECT_STREQ(json_as_string(json_get(rec, "name")), "hammer");
+  EXPECT_STREQ(json_as_string(json_get(rec, "placement")), "first");
+  json_value_destroy(rec);
+
+  /* The meta record: {"created": <the ISO stamp>} — the one stamp shape
+     (20 chars, digits with T/Z separators). */
+  json_value_t* meta = json_parse(meta_text.c_str(), meta_text.size(), NULL);
+  ASSERT_NE(meta, nullptr) << "the installed meta is a JSON document";
+  const char* created = json_as_string(json_get(meta, "created"));
+  ASSERT_NE(created, nullptr);
+  ASSERT_EQ(strlen(created), 20u);
+  EXPECT_EQ(created[4], '-');
+  EXPECT_EQ(created[10], 'T');
+  EXPECT_EQ(created[19], 'Z');
+  json_value_destroy(meta);
+
+  /* Re-install: idempotent-safe — rc 0, the same record bytes back, and
+     the meta still parses a proper created stamp (a put overwrites: the
+     installer's idempotency, re-stamping nothing but meta/created). */
+  ASSERT_EQ(persona_records_install(db), 0);
+  scan_once(&cap);
+  ASSERT_EQ(cap.counts[0], 2u);
+  EXPECT_EQ(cap.records_per_reply[0][1], record_text)
+      << "the re-installed record is byte-identical (a put overwrites)";
+  json_value_t* remeta = json_parse(cap.records_per_reply[0][0].c_str(),
+                                    cap.records_per_reply[0][0].size(), NULL);
+  ASSERT_NE(remeta, nullptr);
+  const char* recreated = json_as_string(json_get(remeta, "created"));
+  ASSERT_NE(recreated, nullptr);
+  ASSERT_EQ(strlen(recreated), 20u);
+  EXPECT_EQ(recreated[10], 'T');
+  json_value_destroy(remeta);
+
+  actor_destroy(&cap.actor);
+  free(shipped);
+  wave_db_close(db);
+}
+
+TEST(TestStore, TestPersonaInstallRefusesAPooledStore) {
+  /* The sync install keeps the sync API's inline-store rule: at a POOLED
+     store it refuses loud (rc != 0) and installs nothing. NULL also
+     refuses loud. */
+  EXPECT_EQ(persona_records_install(nullptr), -1);
+
+  frame_config_t cfg = test_config();
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  scheduler_pool_start(pool);
+  cfg.pool = pool;
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  EXPECT_EQ(persona_records_install(db), -1)
+      << "pooled store: the boot install refuses loud";
+  wave_db_close(db);            /* documented order: stop, close, destroy */
+  scheduler_pool_stop(pool);
+  scheduler_pool_destroy(pool);
 }
 
 TEST(TestFrame, TestStoreBatchCarriesDeleteOpsAtomic) {

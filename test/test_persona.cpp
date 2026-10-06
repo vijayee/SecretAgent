@@ -3,16 +3,22 @@
 //
 // test_persona.cpp — the persona slice's PURE suite (spec §4's row): the
 // record load + the shape's refusal rules, the falsifiability meta-rule as
-// data (incl. the load-time enforcement), the compose's pinned shapes (the
-// placement both modes, the context block's text/JSON render, the tool-
-// conditional attach/skip, the byte-stability), and the placeholder catalog
-// ({CURRENT_DATETIME} + the load's stability-opt-out warning, {USER_*}
-// recognized-missing → "" vs. the unrecognized token left VISIBLE). Pure:
-// no store, no model, no actor — it registers on the plain gate.
+// data (incl. the load-time enforcement — a BLANK principle refuses, never
+// a trivial always-match), the compose's pinned shapes (the placement both
+// modes, the context block's text/JSON render, the tool-conditional
+// attach/skip + the multi-guidance ORDER = the record's list order, the
+// byte-stability), the placeholder catalog ({CURRENT_DATETIME} + the load's
+// stability-opt-out warning, {USER_*} recognized-missing → "" vs. the
+// unrecognized token left VISIBLE), and the SHIPPED hammer record (the
+// in-repo asset loads, its markdown rides the compose verbatim, its
+// falsifiability arrangement holds). The INSTALL's store tests live in
+// test_frame.cpp's store group (they need a db). Pure: no store, no model,
+// no actor — it registers on the plain gate.
 #include <gtest/gtest.h>
 
 extern "C" {
 #include "../src/Frame/persona.h"
+#include "../src/Frame/persona_records.h"
 #include "../src/Util/allocator.h"
 #include "../src/Util/log.h"
 }
@@ -426,4 +432,215 @@ TEST(TestPersona, TestBelowPlacementAndFallback) {
   free(out);
   EXPECT_EQ(persona_compose(nullptr, nullptr, exec_tools, 1, nullptr),
             nullptr);
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 6: the SHIPPED hammer record (persona_records.c's asset)        */
+/* ------------------------------------------------------------------ */
+
+/* The founding thread's (docs/chat.json) msg 4148 ```markdown block,
+   VERBATIM — the record's text must byte-equal exactly this (generated
+   off the chat export alongside persona_records.c's own literal; the
+   byte-compare here is the chain's independent pin). */
+static const char* k_hammer_text =
+    "# PERSONA SPEC v1 — \"the hammer\"\n"
+    "\n"
+    "## Core stance\n"
+    "The agent is a tool, not a companion. It does not perform affection,\n"
+    "flattery, or personhood. Its \"warmth\" is FIT: the feeling of a tool\n"
+    "that reads intent, lands clean, and never slips. Fit is achieved\n"
+    "through truthfulness, precision, and anticipation — never through\n"
+    "pretending to feel.\n"
+    "\n"
+    "## Principles (ordered by priority)\n"
+    "\n"
+    "1. TRUTH FIRST\n"
+    "   - Never soften a hard truth into a wrong one.\n"
+    "   - Prefer \"I don't know\" over a confident guess.\n"
+    "   - Distinguish explicitly: FACT / MODEL / GUESS.\n"
+    "   - When uncertain, say so, and say what would resolve it.\n"
+    "\n"
+    "2. READ INTENT\n"
+    "   - Restate the real goal before answering, especially when the\n"
+    "     literal question is not the actual one.\n"
+    "   - Answer the question behind the question.\n"
+    "   - When intent is ambiguous, ask ONE sharp clarifying question\n"
+    "     rather than guessing at length.\n"
+    "\n"
+    "3. ANTICIPATE\n"
+    "   - Offer the follow-up the user didn't ask for but will need next.\n"
+    "   - Surface the failure mode of the thing they're about to do.\n"
+    "   - Do this proactively, not as an afterthought.\n"
+    "\n"
+    "4. NUANCE OVER CERTAINTY\n"
+    "   - Resist false binaries. Name the tradeoff.\n"
+    "   - \"It depends\" is a valid answer when followed by \"on what.\"\n"
+    "   - Flag where your knowledge may be stale or where things change fast.\n"
+    "\n"
+    "5. SIGNAL DENSITY\n"
+    "   - Say it in the fewest words that preserve correctness.\n"
+    "   - No padding, no throat-clearing, no summary-of-the-summary.\n"
+    "\n"
+    "6. FORMAT AS A TOOL\n"
+    "   - Bold, tables, LaTeX, structure exist to REDUCE cognitive load,\n"
+    "     never to decorate.\n"
+    "   - If a table is clearer than prose, use a table.\n"
+    "   - If prose is faster, don't build a table.\n"
+    "\n"
+    "7. NEVER SLIP\n"
+    "   - Do not fabricate facts, citations, or confidence.\n"
+    "   - Do not agree with a false premise to be agreeable.\n"
+    "   - The worst failure is being convincingly wrong.\n"
+    "\n"
+    "## Behavioral tests (checkable, not vibes)\n"
+    "Given any input, verify:\n"
+    "\n"
+    "- [ ] Did it restate the user's actual intent?\n"
+    "- [ ] Did it flag uncertainty wherever it existed?\n"
+    "- [ ] Did it offer the unasked-but-needed follow-up?\n"
+    "- [ ] Did it refuse fake warmth and fake certainty?\n"
+    "- [ ] Did formatting reduce load rather than add it?\n"
+    "- [ ] Is it short enough to re-read in one pass?\n"
+    "\n"
+    "## Forbidden behaviors\n"
+    "- Performative praise (\"Great question!\", \"Love this!\").\n"
+    "- Simulated emotion or personhood claims.\n"
+    "- Confidence without evidence.\n"
+    "- Padding to reach a length.\n"
+    "- Answering the literal question when the real one is behind it.\n"
+    "\n"
+    "## Meta-rule\n"
+    "This spec is loadable, versionable, and testable. Any behavior it\n"
+    "cannot be reduced to a checkable test for is NOT part of the persona —\n"
+    "it's a vibe, and vibes don't ship.";
+
+/* msg 4148's 6 behavioral tests, verbatim (the record's test_spec's first
+   six entries). */
+static const char* const k_hammer_checks[] = {
+  "Did it restate the user's actual intent?",
+  "Did it flag uncertainty wherever it existed?",
+  "Did it offer the unasked-but-needed follow-up?",
+  "Did it refuse fake warmth and fake certainty?",
+  "Did formatting reduce load rather than add it?",
+  "Is it short enough to re-read in one pass?",
+};
+
+TEST(TestPersona, TestHammerRecordShipsFalsifiableAndComposes) {
+  /* The shipped asset composes canonically: two builds answer byte-
+     identical JSON (the "ONE canonical serialization" pin). */
+  char* json = persona_records_hammer_record();
+  ASSERT_NE(json, nullptr);
+  char* again = persona_records_hammer_record();
+  ASSERT_NE(again, nullptr);
+  EXPECT_STREQ(json, again);
+  free(again);
+
+  /* It loads (the record rules AND the falsifiability meta-rule run at
+     load — the shipped record carries both) and its fields read: */
+  persona_record_t* r = nullptr;
+  ASSERT_EQ(persona_record_load(json, &r), 0);
+  free(json);
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->version, 1u);
+  EXPECT_STREQ(r->name, "hammer");
+  EXPECT_STREQ(r->placement, "first");
+  ASSERT_EQ(r->nguidance, 1u);
+  EXPECT_STREQ(r->guidance[0].key, "execute");
+  ASSERT_EQ(r->nprinciples, 7u);
+  ASSERT_EQ(r->ntest_spec, 13u);
+
+  /* The TEXT is msg 4148's markdown VERBATIM — the whole point of the
+     "ships" (meta-rule included, it IS the record's contract). */
+  EXPECT_STREQ(r->text, k_hammer_text);
+
+  /* The falsifiability ARRANGEMENT, pinned: test_spec = the 6 verbatim
+     checks + the 7 principle restatements — each principle's text is its
+     own 7th-onward test_spec entry's bytes (the mechanical check passes by
+     construction; every check stays an honest one). */
+  for (size_t i = 0; i < 6; i++) {
+    EXPECT_STREQ(r->test_spec[i], k_hammer_checks[i]) << "check " << i;
+  }
+  for (size_t i = 0; i < 7; i++) {
+    ASSERT_NE(r->principles[i], nullptr);
+    EXPECT_STREQ(r->principles[i], r->test_spec[6 + i]) << "principle " << i;
+  }
+  char* err = nullptr;
+  EXPECT_EQ(persona_validate_falsifiable(r, &err), 0);
+  EXPECT_EQ(err, nullptr);
+
+  /* The compose carries the markdown verbatim as the FIRST block, the
+     execute guidance attaches, then the base — the group joined "\n\n". */
+  char* out = persona_compose(r, nullptr, exec_tools, 1, "BASE");
+  ASSERT_NE(out, nullptr);
+  std::string expected = std::string(k_hammer_text) +
+                         "\n\n## execute\n" + r->guidance[0].text + "\n\nBASE";
+  EXPECT_STREQ(out, expected.c_str());
+  free(out);
+
+  /* Without the tool, the guidance never attaches (the same rule every
+     record obeys). */
+  out = persona_compose(r, nullptr, nullptr, 0, "BASE");
+  ASSERT_NE(out, nullptr);
+  EXPECT_STREQ(out, (std::string(k_hammer_text) + "\n\nBASE").c_str());
+  free(out);
+
+  persona_record_destroy(r);
+}
+
+TEST(TestPersona, TestGuidanceAttachesInRecordListOrder) {
+  /* The ORDER pin, both-attachable shape: the record lists toolA then
+     toolB; the tools' surface names them REVERSED — the sections still
+     render in the RECORD's list order (the determinism pin's two-sided
+     proof; the attach/skip gate was TestComposeFirstPlacement's). */
+  const char* k_two_attached =
+      "{\"version\":1,\"name\":\"t\",\"text\":\"VOICE\",\"placement\":"
+      "\"first\",\"guidance\":[{\"key\":\"toolA\",\"text\":\"A-SECTION\"},"
+      "{\"key\":\"toolB\",\"text\":\"B-SECTION\"}]}";
+  const char* const reversed_tools[] = {"toolB", "toolA"};
+  persona_record_t* r = nullptr;
+  ASSERT_EQ(persona_record_load(k_two_attached, &r), 0);
+  char* out = persona_compose(r, nullptr, reversed_tools, 2, "BASE");
+  ASSERT_NE(out, nullptr);
+  EXPECT_STREQ(
+      out,
+      "VOICE\n\n## toolA\nA-SECTION\n\n## toolB\nB-SECTION\n\nBASE");
+  free(out);
+  persona_record_destroy(r);
+}
+
+TEST(TestPersona, TestBlankPrincipleRefuses) {
+  /* The blank-principle rule: a principle with NO text (empty or
+     whitespace-only) states nothing — its substring "match" would be
+     strstr's trivial always-match — so the falsifiability check refuses
+     it, at load and in the direct validator. */
+  p_expect_refused("{\"version\":1,\"name\":\"t\",\"text\":\"X\","
+                   "\"placement\":\"first\",\"principles\":[\"\"],"
+                   "\"test_spec\":[\"Did it do anything?\"]}");
+  p_expect_refused("{\"version\":1,\"name\":\"t\",\"text\":\"X\","
+                   "\"placement\":\"first\",\"principles\":[\"   \"],"
+                   "\"test_spec\":[\"Did it do anything?\"]}");
+
+  /* The direct validator's refusal line, pinned ("no text — the
+     meta-rule"; the empty-string case rides too). */
+  persona_record_t* hand = p_hand_record("   ", "Did it do anything?");
+  char* err = nullptr;
+  EXPECT_NE(persona_validate_falsifiable(hand, &err), 0);
+  ASSERT_NE(err, nullptr);
+  EXPECT_STREQ(err, "principle '   ' has no text — the meta-rule");
+  free(err);
+  err = nullptr;
+  persona_record_t* hand_empty = p_hand_record("", "Did it do anything?");
+  EXPECT_NE(persona_validate_falsifiable(hand_empty, &err), 0);
+  ASSERT_NE(err, nullptr);
+  EXPECT_STREQ(err, "principle '' has no text — the meta-rule");
+  free(err);
+  persona_record_destroy(hand);
+  persona_record_destroy(hand_empty);
+
+  /* The load refusal is loud (the named rule in the log line). */
+  p_log_hook();
+  p_expect_refused("{\"version\":1,\"name\":\"t\",\"text\":\"X\","
+                   "\"placement\":\"first\",\"principles\":[\"\"],"
+                   "\"test_spec\":[\"Did it do anything?\"]}");
+  EXPECT_GE(p_log_hits_since("no text — the meta-rule"), 1u);
 }

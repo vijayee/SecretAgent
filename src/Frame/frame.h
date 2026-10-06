@@ -72,6 +72,20 @@ void wave_db_close(wave_database_root_t* db);
 actor_t* wave_db_store_actor(wave_database_root_t* db);
 int wave_db_pump(wave_database_root_t* db);
 
+/* Boot/demo install of the SHIPPED personas (spec §1): ONE atomic root
+   batch puts personas/hammer/record (persona_records.c's canonical JSON)
+   and personas/hammer/meta ({"created": the ISO now}). The direct sync
+   write is the boot carve-out (the birth batch's shape: the caller's
+   thread, single writer, before any frame's engine runs) and it keeps the
+   sync API's inline-store rule — a POOLED store refuses loud. The
+   idempotency is the INSTALLER's: a put overwrites, so re-installation
+   rewrites the record's bytes and re-stamps meta/created — the documented
+   idiom is "call once at boot"; calling again is safe, it changes nothing
+   but those two keys' bytes. Returns 0 = installed; -1 refuses loud
+   (NULL root, a pooled store, a compose failure, or a failed batch —
+   nothing half-committed: the batch is one atomic put-pair). */
+int persona_records_install(wave_database_root_t* db);
+
 typedef struct frame_t frame_t;
 
 /* The POOLED cell watchdog's private state (defined in frame.c — spec §2):

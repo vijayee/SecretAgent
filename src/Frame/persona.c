@@ -167,16 +167,26 @@ static int _p_guidance_array(json_value_t* obj,
   return 0;
 }
 
-/* The falsifiability refusal line, pinned (the meta-rule's shape). */
-static void _p_err_no_checkable_test(const char* principle, char** err_out) {
+/* The falsifiability refusal lines, pinned (the meta-rule's shape): the
+   rule fragment carries the " … — the meta-rule" tail. */
+static void _p_err_compose(const char* principle, char** err_out,
+                           const char* rule) {
   if (err_out == NULL) return;
   size_t n = strlen(principle);
-  size_t cap = strlen("principle '' has no checkable test — the meta-rule") +
-               n + 1;
+  size_t cap = strlen("principle '' has ") + strlen(rule) + n + 1;
   char* err = get_memory(cap);
-  snprintf(err, cap, "principle '%s' has no checkable test — the meta-rule",
-           principle);
+  snprintf(err, cap, "principle '%s' has %s", principle, rule);
   *err_out = err;
+}
+
+/* 1 when the string carries no text at all (empty or whitespace-only) —
+   the blank principle's trivial `strstr(haystack, "")` always-match must
+   never pass the meta-rule. */
+static int _p_str_blank(const char* s) {
+  for (; *s != '\0'; s++) {
+    if (!isspace((unsigned char) *s)) return 0;
+  }
+  return 1;
 }
 
 int persona_validate_falsifiable(const persona_record_t* record,
@@ -190,7 +200,13 @@ int persona_validate_falsifiable(const persona_record_t* record,
      principles are optional; the hammer's authored record runs the check). */
   for (size_t i = 0; i < record->nprinciples; i++) {
     const char* principle = record->principles[i];
-    if (principle == NULL) continue;
+    /* A principle with NO text (empty or whitespace-only) refuses here —
+       it states nothing to restate, so it cannot be falsifiable. */
+    if (principle == NULL || _p_str_blank(principle)) {
+      _p_err_compose(principle != NULL ? principle : "", err_out,
+                     "no text — the meta-rule");
+      return -1;
+    }
     int checkable = 0;
     for (size_t j = 0; j < record->ntest_spec; j++) {
       if (record->test_spec[j] != NULL &&
@@ -200,7 +216,7 @@ int persona_validate_falsifiable(const persona_record_t* record,
       }
     }
     if (!checkable) {
-      _p_err_no_checkable_test(principle, err_out);
+      _p_err_compose(principle, err_out, "no checkable test — the meta-rule");
       return -1;
     }
   }

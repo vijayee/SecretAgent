@@ -77,6 +77,9 @@ void persona_record_destroy(persona_record_t* record);
    optional list absent = no check runs). Returns -1 when a principle is
    uncheckable: *err_out (when non-NULL) gets the heap refusal line
      principle '<text>' has no checkable test — the meta-rule
+   or, for a principle with NO text at all (empty or whitespace-only —
+   its substring "match" would be strstr's trivial always-match),
+     principle '<text>' has no text — the meta-rule
    (the caller frees). A NULL record = -1 + a loud log, err_out untouched. */
 int persona_validate_falsifiable(const persona_record_t* record,
                                  char** err_out);
