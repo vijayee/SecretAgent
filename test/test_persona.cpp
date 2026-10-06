@@ -404,6 +404,25 @@ TEST(TestPersona, TestPlaceholders) {
   free(out);
   persona_record_destroy(odd);
 
+  /* NESTED braces (the final review's recorded edge — traced against the
+     scanner's real rule at persona.c's substitution pass): an unrecognized
+     outer token wraps a recognized inner one — the outer's '{' stays
+     visible (rescanned inside), the inner substitutes. And brackets around
+     a recognized token are PLAIN text (only '{' opens a token). */
+  persona_record_t* nest = nullptr;
+  const char* k_nest = "{\"version\":1,\"name\":\"n\","
+                       "\"text\":\"[{USER_NAME}] { {USER_NAME} } { outer }.\","
+                       "\"placement\":\"first\"}";
+  ASSERT_EQ(persona_record_load(k_nest, &nest), 0);
+  out = persona_compose(nest, "{\"name\":\"Victor\"}", nullptr, 0, nullptr);
+  ASSERT_NE(out, nullptr);
+  EXPECT_STREQ(out, "[Victor] { Victor } { outer }.\n\nname: Victor")
+      << "brackets = plain text; the outer brace stays visible with its inner "
+      "token substituted; a wholly-unrecognized token replays verbatim; the "
+      "JSON context always renders its block (the two-jobs note)";
+  free(out);
+  persona_record_destroy(nest);
+
   persona_record_destroy(usr);
 }
 

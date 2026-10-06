@@ -4451,7 +4451,9 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
       f->model_name = strdup(cfg->model_name);
       if (f->model_name == NULL) goto fail;
     }
-    if (cfg->persona_name != NULL) {
+    if (cfg->persona_name != NULL && cfg->persona_name[0] != '\0') {
+      /* ""-empty counts as none (frame.h's built-in-base contract; the
+         resume site carries the same normalization) */
       f->persona_name = strdup(cfg->persona_name);
       if (f->persona_name == NULL) goto fail;
     }
