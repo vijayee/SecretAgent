@@ -3809,6 +3809,17 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
                              "aborted: cell exceeded the watchdog deadline");
       break;
     }
+    case FRM_ASK:
+      /* The blocked-ask publish (Task 2 wires the real park): in this
+         build the park machinery is NOT wired in — the loud late-drop is
+         the case (never silence): a real session must see its ask refused
+         on the log, not die unheard. The payload stays INTACT on purpose:
+         actor_run retires it through the frm_ask_payload_destroy the post
+         site attached (frame_messages.h's contract — no destroy table
+         exists here; every payload dies by its attached destroyer). */
+      log_error("frame: an ask arrived at the frame's mailbox — the park "
+                "machinery is not wired in this build; refusing loud");
+      break;
     default:
       break;
   }

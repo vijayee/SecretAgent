@@ -15,6 +15,7 @@ extern "C" {
 #include "../src/Frame/frame_messages.h"
 #include "../src/Util/allocator.h"
 #include "../src/Util/atomic_compat.h"
+#include "../src/Util/budget.h"
 #include "../src/Util/log.h"
 #include "../src/Platform/platform.h"
 }
@@ -419,14 +420,17 @@ TEST(TestPyAgent, TestAskRefusalsAreData) {
 
   ASSERT_EQ(self->results.size(), 1u);
   ASSERT_EQ(self->results[0]->status, 0);
-  EXPECT_STREQ(
-      self->results[0]->text,
+  /* The oversized-question refusal DERIVES the cap from the bridge budget's
+     constant — the refusal's wording and the cap travel together. */
+  const std::string cap_line =
+      "ask: the question exceeds the bridge budget (" +
+      std::to_string(SA_BUDGET_BRIDGE_VALUE_BYTES) + " bytes)";
+  const std::string expected =
       "ask: the question is empty"
       "ask: too many options (8 max)"
       "ask: an option is empty"
-      "ask: options must be a list"
-      "ask: the question exceeds the bridge budget (16384 bytes)"
-      "asked");
+      "ask: options must be a list" + cap_line + "asked";
+  EXPECT_STREQ(self->results[0]->text, expected.c_str());
   /* Only the LAST call (the repr-coerced options) published. */
   ASSERT_EQ(self->asks.size(), 1u);
   EXPECT_EQ(self->asks[0]->noptions, 3u);
@@ -435,10 +439,10 @@ TEST(TestPyAgent, TestAskRefusalsAreData) {
   bridge_frame_free(self);
 }
 
-/* ONE ask at a time: while the engine's park stands, the verb refuses as
-   data and posts NO second publish; the flag cleared, it publishes again.
-   The flag is SET BY HAND here — Task 2's FRM_ASK receipt sets it in the
-   real flow. */
+/* ONE ask at a time (spec §1.1): the park stands from the verb's PUBLISH
+   until the engine's consume paths clear it (Task 2's reply path) — a later
+   ask refuses as data and posts NO second publish. The clear-by-hand below
+   IS the engine's clear shape (the engine never sets the flag). */
 TEST(TestPyAgent, TestAskRefusedWhileAParkIsPending) {
   py_agent_init();
   bridge_frame_t* self = bridge_frame_create(1, NULL);
@@ -453,7 +457,6 @@ TEST(TestPyAgent, TestAskRefusedWhileAParkIsPending) {
   ASSERT_EQ(self->results[0]->status, 0);
   ASSERT_EQ(self->asks.size(), 1u) << "published with the flag clear";
 
-  pyrt_ask_parked_set(self->pyrt, 1);
   ATOMIC_STORE(&self->got_result, 0);
   bridge_frame_execute(
       self, "import actor\nprint(actor.ask('second?', ['no']), end='')");
@@ -461,7 +464,8 @@ TEST(TestPyAgent, TestAskRefusedWhileAParkIsPending) {
   ASSERT_EQ(self->results.size(), 2u);
   ASSERT_EQ(self->results[1]->status, 0);
   EXPECT_STREQ(self->results[1]->text, "ask already parked — reply pending");
-  ASSERT_EQ(self->asks.size(), 1u) << "NO second publish while a park stands";
+  ASSERT_EQ(self->asks.size(), 1u)
+      << "NO second publish — the first publish's park still stands";
 
   pyrt_ask_parked_set(self->pyrt, 0);
   ATOMIC_STORE(&self->got_result, 0);
@@ -474,6 +478,33 @@ TEST(TestPyAgent, TestAskRefusedWhileAParkIsPending) {
   EXPECT_STREQ(self->asks[1]->question, "third?");
   ASSERT_EQ(self->asks[1]->noptions, 1u);
   EXPECT_STREQ(self->asks[1]->options[0], "x");
+
+  bridge_frame_free(self);
+}
+
+/* The same-turn pin (spec §1.1): ONE cell calling ask TWICE — the first
+   publish sets the flag AT the publish, so the second ask (microseconds
+   later, before the frame dispatches the first) refuses as data. Exactly
+   one FRM_ASK crossed. */
+TEST(TestPyAgent, TestAskRefusesASecondAskInTheSameCell) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(1, NULL);
+  self->answer = 0;
+
+  self->results.clear();
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(
+      self, "import actor\n"
+            "print(actor.ask('first?', ['yes']), end='')\n"
+            "print(actor.ask('second?', ['no']), end='')\n");
+  bridge_frame_pump(self, 30000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  ASSERT_EQ(self->results[0]->status, 0);
+  EXPECT_STREQ(self->results[0]->text,
+               "askedask already parked — reply pending");
+  ASSERT_EQ(self->asks.size(), 1u) << "exactly ONE publish crossed";
+  EXPECT_STREQ(self->asks[0]->question, "first?");
 
   bridge_frame_free(self);
 }

@@ -43,9 +43,11 @@ struct pyrt_t {
   ATOMIC(uint8_t) active;
   ATOMIC(uint8_t) interrupt_req;
   /* The blocked-ask's one-park-at-a-time flag (escalation spec §1.1): set by
-     the frame when it consumes a FRM_ASK, read by the agent.ask verb before
-     publishing, cleared on the reply's consumption. Cleared at create —
-     get_clear_memory zeroes it. */
+     the ask verb at PUBLISH (a second ask inside the same cell — the frame
+     has not dispatched the first yet — cannot miss it), read by the
+     agent.ask verb before publishing, cleared by the engine's consume paths
+     (Task 2's reply + the wake branches); the engine never SETS it. Cleared
+     at create — get_clear_memory zeroes it. */
   ATOMIC(uint8_t) ask_parked;
   ATOMIC(uint64_t) corr_counter;
   platform_thread_t* thread;

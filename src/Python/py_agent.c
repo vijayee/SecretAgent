@@ -663,16 +663,23 @@ static uint8_t _py_agent_text_isblank(const char* text) {
    the bridge sink (the resolution is FRM_ASK_REPLY and the model reads it
    in the next turn's derive). The park pre-check runs FIRST: one ask per
    frame at a time — while a park stands the verb refuses as data and posts
-   NOTHING. Refusals are ALWAYS the return value (row 13's law: data, never
-   an exception): the empty question, the oversized question (the budget
-   table's cap — oversized ask INPUT is refused, never silently truncated),
-   the non-list options argument, more than 8 options, an empty option.
-   Absent/None options = no options; a non-str item is coerced through repr
-   like report does. */
+   NOTHING. The park is the verb's OWN publish-time flag: a successful
+   actor_send sets it before "asked" returns, so a SECOND ask inside the
+   same cell — microseconds after the first, before the frame dispatches it
+   — sees the flag and refuses (the spec's same-turn pin; the engine cannot
+   set it fast enough because the frame has not dispatched yet). The
+   engine's consume paths CLEAR the flag (Task 2's reply + the wake
+   branches) — the engine never sets it. Refusals are ALWAYS the return
+   value (row 13's law: data, never an exception): the empty question, the
+   oversized question (the budget table's cap — oversized ask INPUT is
+   refused, never silently truncated), the non-list options argument, more
+   than 8 options, an empty option. Absent/None options = no options; a
+   non-str item is coerced through repr like report does. */
 static PyObject* _py_agent_ask(PyObject* self, PyObject* args) {
   (void)self;
   PyObject* question_o = NULL;
   PyObject* options_o = NULL;
+  pyrt_t* self_pyrt = pyrt_thread_pyrt();
   if (!PyArg_ParseTuple(args, "O|O:ask", &question_o, &options_o)) {
     return NULL;
   }
@@ -680,8 +687,8 @@ static PyObject* _py_agent_ask(PyObject* self, PyObject* args) {
   /* The parked pre-check FIRST (one ask per frame at a time): the py pointer
      comes from pyrt.c's TLS — the SAME accessor the emit path's owner lookup
      rides, never a duplicated TLS read. NULL (a non-pyrt thread) means no
-     park can stand. */
-  if (pyrt_ask_parked(pyrt_thread_pyrt()) != 0) {
+     park can stand (and none can be set at publish either). */
+  if (pyrt_ask_parked(self_pyrt) != 0) {
     return PyUnicode_FromString("ask already parked — reply pending");
   }
 
@@ -812,12 +819,17 @@ static PyObject* _py_agent_ask(PyObject* self, PyObject* args) {
   msg.payload_destroy = frm_ask_payload_destroy;
   if (!actor_send(owner, &msg)) {
     /* actor_send already destroyed the payload (destroyed actor / full
-       queue — good-actors): the refusal is data, loud on the log side. */
+       queue — good-actors): the refusal is data, loud on the log side.
+       The publish failed — the park does NOT stand. */
     log_error("py_agent: the ask publish was refused by the owning frame "
               "actor — answered as data");
     return PyUnicode_FromString(
         "ask: the publish was refused by the frame — try again later");
   }
+  /* The park lands AT THE PUBLISH (the same-turn pin): the flag stands
+     from here until the engine's consume paths clear it — the engine
+     never sets it. */
+  pyrt_ask_parked_set(self_pyrt, 1);
   return PyUnicode_FromString("asked");
 }
 

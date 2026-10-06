@@ -3,6 +3,8 @@
 //
 
 #include <gtest/gtest.h>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -20,6 +22,7 @@ extern "C" {
 #include "../src/Scheduler/scheduler.h"
 #include "../src/Util/json.h"
 #include "../src/Util/allocator.h"
+#include "../src/Util/log.h"
 }
 
 #ifdef SA_HAS_WDB
@@ -285,6 +288,79 @@ TEST(TestFrame, TestSteerComposesMsgAppendFromOutside) {
   EXPECT_STREQ(json_as_string(json_get(payload, "content")),
                "hello from the wire");
   json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* The unwired park machinery's loud drop (the escalation slice's interim
+   window, Task 2 wires the real FRM_ASK case): an ask posted at the frame's
+   mailbox never dies UNHEARD — the dispatch logs the refusal loud and
+   leaves the payload intact for the runtime's retire (the post site's
+   frm_ask_payload_destroy runs; a custom destroyer here counts the run). */
+static int _ask_drop_lines = 0;
+static int _ask_payload_retires = 0;
+static void _ask_drop_recorder(log_Event* ev) {
+  va_list ap;
+  va_copy(ap, ev->ap);
+  char line[512];
+  vsnprintf(line, sizeof(line), ev->fmt, ap);
+  va_end(ap);
+  if (strstr(line, "ask arrived at the frame's mailbox") != NULL) {
+    _ask_drop_lines++;
+  }
+}
+
+static void _counting_ask_payload_destroy(void* p) {
+  _ask_payload_retires++;
+  frm_ask_payload_destroy(p);
+}
+
+TEST(TestFrame, TestFrmAskWithoutTheParkMachineryDropsLoud) {
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(f, nullptr);
+  log_add_callback(_ask_drop_recorder, NULL, LOG_ERROR);
+
+  frm_ask_payload_t* ap =
+      (frm_ask_payload_t*)get_clear_memory(sizeof(*ap));
+  ap->corr = 4242;
+  ap->question = strdup("which db?");
+  char** options = (char**)get_clear_memory(sizeof(char*));
+  options[0] = strdup("a");
+  ap->options = options;
+  ap->noptions = 1;
+  message_t m;
+  m.type = (uint32_t)FRM_ASK;
+  m.payload = ap;
+  m.payload_destroy = _counting_ask_payload_destroy;
+
+  int lines_before = _ask_drop_lines;
+  ASSERT_TRUE(actor_send(_frame_actor(f), &m));
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
+  EXPECT_GT(_ask_drop_lines, lines_before)
+      << "the dispatch logged the ask's loud refusal";
+  EXPECT_EQ(_ask_payload_retires, 1)
+      << "the payload retired exactly once through the runtime's destroyer";
+
+  /* The frame survived the drop: its mailbox still routes — a second ask
+     drops loud again, retired again. */
+  frm_ask_payload_t* ap2 =
+      (frm_ask_payload_t*)get_clear_memory(sizeof(*ap2));
+  ap2->corr = 4243;
+  ap2->question = strdup("which engine?");
+  message_t m2;
+  m2.type = (uint32_t)FRM_ASK;
+  m2.payload = ap2;
+  m2.payload_destroy = _counting_ask_payload_destroy;
+  int lines_after_first = _ask_drop_lines;
+  ASSERT_TRUE(actor_send(_frame_actor(f), &m2));
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
+  EXPECT_GT(_ask_drop_lines, lines_after_first)
+      << "the frame's mailbox still routes after a loud drop";
+  EXPECT_EQ(_ask_payload_retires, 2);
 
   frame_destroy(f);
   wave_db_close(db);

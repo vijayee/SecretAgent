@@ -59,11 +59,13 @@ actor_t* pyrt_thread_owner(void);
    token for the parked-ask flag below. */
 pyrt_t* pyrt_thread_pyrt(void);
 
-/* The blocked-ask's one-park-at-a-time flag (escalation spec §1.1): the
-   engine sets it when it consumes a FRM_ASK (Task 2's park), the verb reads
-   it BEFORE publishing and refuses as data while it stands, and the reply's
-   consumption clears it. Atomic instance field (the interrupt_req shape) —
-   visible across the pyrt thread and the frame's dispatch thread. */
+/* The blocked-ask's one-park-at-a-time flag (escalation spec §1.1): set by
+   the ask verb at PUBLISH (so a second ask inside the same cell — fired
+   before the frame dispatches the first — cannot miss it), read by the verb
+   BEFORE publishing and refused as data while it stands, and cleared by the
+   engine's consume paths (Task 2's reply + the wake branches) — the engine
+   never SETS it. Atomic instance field (the interrupt_req shape) — visible
+   across the pyrt thread and the frame's dispatch thread. */
 void pyrt_ask_parked_set(pyrt_t* pyrt, uint8_t parked);
 uint8_t pyrt_ask_parked(const pyrt_t* pyrt);
 
