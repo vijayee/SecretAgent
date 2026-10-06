@@ -56,6 +56,7 @@ typedef struct bridge_frame_t {
   std::vector<std::string> req_a;    /* remember/recall key, spawn goal, report text */
   std::vector<std::string> req_b;    /* remember value, spawn context */
   std::vector<std::string> emits;    /* PYRT_EMIT texts (the durable verb) */
+  std::vector<frm_ask_payload_t*> asks;   /* FRM_ASK payloads (owned; freed at teardown) */
 } bridge_frame_t;
 
 static void bridge_frame_dispatch(void* state, message_t* msg) {
@@ -141,6 +142,16 @@ static void bridge_frame_dispatch(void* state, message_t* msg) {
       }
       break;
     }
+    case FRM_ASK: {
+      /* The blocked-ask's publish is FIRE-AND-POST (the emit pattern): the
+         payload transfers OUT for the assertions and is NEVER answered
+         through the bridge sink — the resolution travels the FRM_ASK_REPLY
+         route (Task 2's park), never a corr-matched wait here. */
+      frm_ask_payload_t* ap = (frm_ask_payload_t*)msg->payload;
+      msg->payload = NULL;
+      self->asks.push_back(ap);
+      break;
+    }
     case PYRT_EMIT: {
       /* The durable verb's outbound text transfers; recorded (copied) and
          retired here — the harness asserts the payload content directly. */
@@ -198,6 +209,10 @@ static void bridge_frame_free(bridge_frame_t* self) {
     pyrt_result_payload_destroy(r);
   }
   self->results = std::vector<pyrt_result_payload_t*>();
+  for (auto* a : self->asks) {
+    frm_ask_payload_destroy(a);
+  }
+  self->asks = std::vector<frm_ask_payload_t*>();
   self->store = std::vector<std::pair<std::string, std::string>>();
   free(self->scripted_sid);
   self->req_types = std::vector<uint32_t>();
@@ -341,6 +356,124 @@ TEST(TestPyAgent, TestReportReturnsTrueAndCoercesNonString) {
   EXPECT_STREQ(self->req_a[0].c_str(), "plain");
   EXPECT_EQ(self->req_types[1], (uint32_t)FRM_REPORT);
   EXPECT_STREQ(self->req_a[1].c_str(), "7") << "non-str coerced via repr";
+
+  bridge_frame_free(self);
+}
+
+/* ask: the blocked-ask's verb (escalation spec §1.1) is FIRE-AND-POST — the
+   emit pattern, never a bounded wait: the cell COMPLETES with the marker
+   string as the answer, and the FRM_ASK publish carries the question + both
+   options verbatim. */
+TEST(TestPyAgent, TestAskPublishesWithoutTheAnswer) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(1, NULL);
+  self->answer = 0;   /* the ask is fire-and-post; nothing to pre-answer */
+
+  self->results.clear();
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(
+      self, "import actor\nprint(actor.ask('which db?', ['a', 'b']), end='')");
+  bridge_frame_pump(self, 30000);
+
+  /* The cell completed and its stdout is the marker: no answer round trip. */
+  ASSERT_EQ(self->results.size(), 1u);
+  ASSERT_EQ(self->results[0]->status, 0);
+  EXPECT_STREQ(self->results[0]->text, "asked");
+
+  /* Exactly ONE FRM_ASK published, with the question + both options. */
+  ASSERT_EQ(self->asks.size(), 1u);
+  ASSERT_NE(self->asks[0], nullptr);
+  EXPECT_NE(self->asks[0]->corr, 0u);
+  EXPECT_STREQ(self->asks[0]->question, "which db?");
+  ASSERT_EQ(self->asks[0]->noptions, 2u);
+  ASSERT_NE(self->asks[0]->options, nullptr);
+  EXPECT_STREQ(self->asks[0]->options[0], "a");
+  EXPECT_STREQ(self->asks[0]->options[1], "b");
+
+  bridge_frame_free(self);
+}
+
+/* Refusals are DATA (row 13's law): every malformed ask returns the refusal
+   string the model reads and posts NOTHING. Covered: the empty question
+   (after strip), more than 8 options, an empty option, a non-list options
+   argument, an oversized question (the spec's law — oversized ask INPUT is
+   refused, never silently truncated), and a non-str option item (coerced
+   through repr like report, NOT refused — it publishes "asked"). */
+TEST(TestPyAgent, TestAskRefusalsAreData) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(1, NULL);
+  self->answer = 0;
+
+  self->results.clear();
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(self,
+                       "import actor\n"
+                       "print(actor.ask(''), end='')\n"
+                       "print(actor.ask('q?', ['o%d' % i for i in range(9)]),"
+                       " end='')\n"
+                       "print(actor.ask('q?', ['ok', '']), end='')\n"
+                       "print(actor.ask('q?', 'not a list'), end='')\n"
+                       "print(actor.ask('q' * 100000), end='')\n"
+                       "print(actor.ask('q?', ['1', 2, '3']), end='')\n");
+  bridge_frame_pump(self, 30000);
+
+  ASSERT_EQ(self->results.size(), 1u);
+  ASSERT_EQ(self->results[0]->status, 0);
+  EXPECT_STREQ(
+      self->results[0]->text,
+      "ask: the question is empty"
+      "ask: too many options (8 max)"
+      "ask: an option is empty"
+      "ask: options must be a list"
+      "ask: the question exceeds the bridge budget (16384 bytes)"
+      "asked");
+  /* Only the LAST call (the repr-coerced options) published. */
+  ASSERT_EQ(self->asks.size(), 1u);
+  EXPECT_EQ(self->asks[0]->noptions, 3u);
+  EXPECT_STREQ(self->asks[0]->options[1], "2") << "non-str coerced via repr";
+
+  bridge_frame_free(self);
+}
+
+/* ONE ask at a time: while the engine's park stands, the verb refuses as
+   data and posts NO second publish; the flag cleared, it publishes again.
+   The flag is SET BY HAND here — Task 2's FRM_ASK receipt sets it in the
+   real flow. */
+TEST(TestPyAgent, TestAskRefusedWhileAParkIsPending) {
+  py_agent_init();
+  bridge_frame_t* self = bridge_frame_create(1, NULL);
+  self->answer = 0;
+
+  self->results.clear();
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(
+      self, "import actor\nprint(actor.ask('first?', ['yes']), end='')");
+  bridge_frame_pump(self, 30000);
+  ASSERT_EQ(self->results.size(), 1u);
+  ASSERT_EQ(self->results[0]->status, 0);
+  ASSERT_EQ(self->asks.size(), 1u) << "published with the flag clear";
+
+  pyrt_ask_parked_set(self->pyrt, 1);
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(
+      self, "import actor\nprint(actor.ask('second?', ['no']), end='')");
+  bridge_frame_pump(self, 30000);
+  ASSERT_EQ(self->results.size(), 2u);
+  ASSERT_EQ(self->results[1]->status, 0);
+  EXPECT_STREQ(self->results[1]->text, "ask already parked — reply pending");
+  ASSERT_EQ(self->asks.size(), 1u) << "NO second publish while a park stands";
+
+  pyrt_ask_parked_set(self->pyrt, 0);
+  ATOMIC_STORE(&self->got_result, 0);
+  bridge_frame_execute(
+      self, "import actor\nprint(actor.ask('third?', ['x']), end='')");
+  bridge_frame_pump(self, 30000);
+  ASSERT_EQ(self->results.size(), 3u);
+  ASSERT_EQ(self->results[2]->status, 0);
+  ASSERT_EQ(self->asks.size(), 2u);
+  EXPECT_STREQ(self->asks[1]->question, "third?");
+  ASSERT_EQ(self->asks[1]->noptions, 1u);
+  EXPECT_STREQ(self->asks[1]->options[0], "x");
 
   bridge_frame_free(self);
 }

@@ -42,6 +42,11 @@ struct pyrt_t {
   /* Externally visible view of the thread-local interp_live. */
   ATOMIC(uint8_t) active;
   ATOMIC(uint8_t) interrupt_req;
+  /* The blocked-ask's one-park-at-a-time flag (escalation spec §1.1): set by
+     the frame when it consumes a FRM_ASK, read by the agent.ask verb before
+     publishing, cleared on the reply's consumption. Cleared at create —
+     get_clear_memory zeroes it. */
+  ATOMIC(uint8_t) ask_parked;
   ATOMIC(uint64_t) corr_counter;
   platform_thread_t* thread;
   PyThreadState* tstate;
@@ -671,6 +676,20 @@ static void* _pyrt_thread(void* arg) {
 actor_t* pyrt_thread_owner(void) {
   if (_tls_pyrt == NULL) return NULL;
   return _tls_pyrt->owner;
+}
+
+pyrt_t* pyrt_thread_pyrt(void) {
+  return _tls_pyrt;
+}
+
+void pyrt_ask_parked_set(pyrt_t* pyrt, uint8_t parked) {
+  if (pyrt == NULL) return;
+  ATOMIC_STORE(&pyrt->ask_parked, parked);
+}
+
+uint8_t pyrt_ask_parked(const pyrt_t* pyrt) {
+  if (pyrt == NULL) return 0;
+  return (uint8_t)ATOMIC_LOAD(&pyrt->ask_parked);
 }
 
 void pyrt_post_text(uint32_t type, const char* text) {

@@ -161,6 +161,25 @@ void frm_steer_payload_destroy(void* p) {
   free(sp);
 }
 
+void frm_ask_payload_destroy(void* p) {
+  frm_ask_payload_t* ap = (frm_ask_payload_t*)p;
+  if (ap == NULL) return;
+  free(ap->question);
+  for (size_t i = 0; i < ap->noptions; i++) {
+    free(ap->options[i]);
+  }
+  free(ap->options);
+  free(ap);
+}
+
+void frm_ask_reply_payload_destroy(void* p) {
+  frm_ask_reply_payload_t* rp = (frm_ask_reply_payload_t*)p;
+  if (rp == NULL) return;
+  free(rp->ask_id);
+  free(rp->value);
+  free(rp);
+}
+
 #ifdef SA_HAS_WDB
 
 #include "model.h"

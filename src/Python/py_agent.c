@@ -638,6 +638,189 @@ static PyObject* _py_agent_report(PyObject* self, PyObject* args) {
   Py_RETURN_FALSE;
 }
 
+/* --------------------- the blocked-ask verb ------------------------------ */
+
+/* More ask options than this = the refusal (spec §1.1). */
+#define _PY_AGENT_ASK_OPTIONS_MAX 8
+
+/* A text that carries no non-whitespace byte (the ask boundary's
+   non-empty-after-strip rule). */
+static uint8_t _py_agent_text_isblank(const char* text) {
+  for (const char* p = text; *p != '\0'; p++) {
+    if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '\v' &&
+        *p != '\f') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/* ask(question, options=None) -> str.
+
+   The blocked-ask's verb (escalation spec §1.1): FIRE-AND-POST, the emit
+   pattern verbatim — the FRM_ASK is posted to the owning frame actor and
+   the marker string is returned immediately; NOTHING crosses back through
+   the bridge sink (the resolution is FRM_ASK_REPLY and the model reads it
+   in the next turn's derive). The park pre-check runs FIRST: one ask per
+   frame at a time — while a park stands the verb refuses as data and posts
+   NOTHING. Refusals are ALWAYS the return value (row 13's law: data, never
+   an exception): the empty question, the oversized question (the budget
+   table's cap — oversized ask INPUT is refused, never silently truncated),
+   the non-list options argument, more than 8 options, an empty option.
+   Absent/None options = no options; a non-str item is coerced through repr
+   like report does. */
+static PyObject* _py_agent_ask(PyObject* self, PyObject* args) {
+  (void)self;
+  PyObject* question_o = NULL;
+  PyObject* options_o = NULL;
+  if (!PyArg_ParseTuple(args, "O|O:ask", &question_o, &options_o)) {
+    return NULL;
+  }
+
+  /* The parked pre-check FIRST (one ask per frame at a time): the py pointer
+     comes from pyrt.c's TLS — the SAME accessor the emit path's owner lookup
+     rides, never a duplicated TLS read. NULL (a non-pyrt thread) means no
+     park can stand. */
+  if (pyrt_ask_parked(pyrt_thread_pyrt()) != 0) {
+    return PyUnicode_FromString("ask already parked — reply pending");
+  }
+
+  char* question = _py_agent_text_of(question_o);
+  if (question == NULL) return NULL;
+
+  /* The closed option list (spec §1.1): absent/None = no options; a non-list
+     REFUSES. Each item is coerced through _py_agent_text_of (repr for a
+     non-str, report's shape); blank and oversized items refuse. */
+  char** options = NULL;
+  size_t noptions = 0;
+  if (options_o != NULL && options_o != Py_None) {
+    if (!PyList_Check(options_o)) {
+      free(question);
+      return PyUnicode_FromString("ask: options must be a list");
+    }
+    Py_ssize_t n = PyList_Size(options_o);
+    if ((size_t)n > _PY_AGENT_ASK_OPTIONS_MAX) {
+      free(question);
+      return PyUnicode_FromString("ask: too many options (8 max)");
+    }
+    options = get_clear_memory(sizeof(char*) * (size_t)(n > 0 ? n : 1));
+    if (options == NULL) {
+      free(question);
+      PyErr_NoMemory();
+      return NULL;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+      PyObject* item = PyList_GetItem(options_o, i);   /* borrowed */
+      char* text = item != NULL ? _py_agent_text_of(item) : NULL;
+      if (text == NULL) {
+        /* Conversion/OOM: free the copy-in so far (the payload owns nothing
+           yet) and let the pending exception propagate verbatim. */
+        for (size_t j = 0; j < (size_t)i; j++) {
+          free(options[j]);
+        }
+        free(options);
+        free(question);
+        return NULL;
+      }
+      if (_py_agent_text_isblank(text)) {
+        free(text);
+        for (size_t j = 0; j < (size_t)i; j++) {
+          free(options[j]);
+        }
+        free(options);
+        free(question);
+        return PyUnicode_FromString("ask: an option is empty");
+      }
+      if (strlen(text) > SA_BUDGET_BRIDGE_VALUE_BYTES) {
+        char line[128];
+        snprintf(line, sizeof(line),
+                 "ask: an option exceeds the bridge budget (%u bytes)",
+                 (unsigned)SA_BUDGET_BRIDGE_VALUE_BYTES);
+        free(text);
+        for (size_t j = 0; j < (size_t)i; j++) {
+          free(options[j]);
+        }
+        free(options);
+        free(question);
+        return PyUnicode_FromString(line);
+      }
+      options[noptions++] = text;
+    }
+  }
+
+  /* The question's validations: non-empty AFTER STRIP, then the budget
+     cap — oversized input is REFUSED (never silently truncated). */
+  if (_py_agent_text_isblank(question)) {
+    free(question);
+    for (size_t j = 0; j < noptions; j++) {
+      free(options[j]);
+    }
+    free(options);
+    return PyUnicode_FromString("ask: the question is empty");
+  }
+  if (strlen(question) > SA_BUDGET_BRIDGE_VALUE_BYTES) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "ask: the question exceeds the bridge budget (%u bytes)",
+             (unsigned)SA_BUDGET_BRIDGE_VALUE_BYTES);
+    free(question);
+    for (size_t j = 0; j < noptions; j++) {
+      free(options[j]);
+    }
+    free(options);
+    return PyUnicode_FromString(line);
+  }
+
+  /* The publish target: without a frame-owned runtime there is no owner to
+     receive the ask — refused as data (loud log), never posted into the
+     void as a success. */
+  actor_t* owner = pyrt_thread_owner();
+  if (owner == NULL) {
+    log_error("py_agent: agent.ask outside a frame-owned runtime thread — "
+              "refused (no publish)");
+    free(question);
+    for (size_t j = 0; j < noptions; j++) {
+      free(options[j]);
+    }
+    free(options);
+    return PyUnicode_FromString("ask: no owner for this runtime — cannot "
+                                "publish");
+  }
+
+  /* Box the payload (ownership of every heap field transfers with the
+     message) and POST — the emit shape: no wait, no reply, no lock held
+     beyond what actor_send needs. The GIL stays held for the µs-scale
+     send, exactly as pyrt_post_text's posts do. */
+  frm_ask_payload_t* ap = get_clear_memory(sizeof(frm_ask_payload_t));
+  if (ap == NULL) {
+    free(question);
+    for (size_t j = 0; j < noptions; j++) {
+      free(options[j]);
+    }
+    free(options);
+    PyErr_NoMemory();
+    return NULL;
+  }
+  ap->corr = _py_agent_next_corr();
+  ap->question = question;
+  ap->options = options;
+  ap->noptions = noptions;
+
+  message_t msg;
+  msg.type = (uint32_t)FRM_ASK;
+  msg.payload = ap;
+  msg.payload_destroy = frm_ask_payload_destroy;
+  if (!actor_send(owner, &msg)) {
+    /* actor_send already destroyed the payload (destroyed actor / full
+       queue — good-actors): the refusal is data, loud on the log side. */
+    log_error("py_agent: the ask publish was refused by the owning frame "
+              "actor — answered as data");
+    return PyUnicode_FromString(
+        "ask: the publish was refused by the frame — try again later");
+  }
+  return PyUnicode_FromString("asked");
+}
+
 /* --------------------- the injected module's method table ---------------- */
 
 /* The base stream verbs (pyrt.c owns the routing; these are the callbacks
@@ -705,6 +888,7 @@ static PyMethodDef _py_agent_verb_methods[] = {
     {"keys", _py_agent_keys, METH_VARARGS, "List this frame's OWN state keys (local|ctx); returns a list or None."},
     {"spawn", _py_agent_spawn, METH_VARARGS, "Admission-only child spawn; returns the child sid or None."},
     {"report", _py_agent_report, METH_VARARGS, "End this frame with a report; returns True or False."},
+    {"ask", _py_agent_ask, METH_VARARGS, "Publish an owner-surface ask (fire-and-post); returns 'asked' or the refusal text."},
     {NULL, NULL, 0, NULL}};
 
 #define _PY_AGENT_TABLE_SIZE ((sizeof(_py_agent_base_methods) + sizeof(_py_agent_verb_methods)) / sizeof(PyMethodDef))

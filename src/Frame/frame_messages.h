@@ -85,7 +85,7 @@ typedef enum frame_message_type_e {
                              cut). Payload = the frame.c-private watchdog
                              struct, handed off whole; its destroyer frees
                              it on the frame's thread — see frame.c */
-  FRM_STEER                /* wire/server -> the frame's OWN mailbox: compose
+  FRM_STEER,               /* wire/server -> the frame's OWN mailbox: compose
                              the durable msg.append fire-and-post in the
                              frame's dispatch (frm_steer_payload_t). The
                              POSTED shape of the steer: frame_append_msg is
@@ -96,6 +96,18 @@ typedef enum frame_message_type_e {
                              frame.h's frame_interrupt is the posted-verb
                              precedent; like it, the post is legal from any
                              thread. */
+  FRM_ASK,                 /* cell -> frame: the model's blocked-ask verb
+                             (py_agent.c's agent.ask) — the FIRE-AND-POST
+                             publish of the owner-surface question + options
+                             (frm_ask_payload_t); nothing crosses back
+                             through the bridge sink, and the ENGINE parks
+                             the turn at the close batch (escalation spec
+                             §1.2). Resolution = FRM_ASK_REPLY. */
+  FRM_ASK_REPLY            /* owner surface -> engine input: a parked ask's
+                             resolution (frm_ask_reply_payload_t) — validated
+                             against the engine's pending_ask and consumed
+                             EXACTLY ONCE; a stale ask_id is dropped loud
+                             (escalation spec §1.4). */
 } frame_message_type_e;
 
 /* Event types (stored at sessions/<sid>/events/<seq>, JSON, %020d seq). ONLY
@@ -108,7 +120,14 @@ typedef enum frame_event_type_e {
   EV_CELL_RUN,          /* payload {code, corr} */
   EV_CELL_RESULT,       /* payload {corr, status, text} */
   EV_STATE_REMEMBER,    /* payload {key, value} */
-  EV_CONTROL            /* payload {kind, text} — interrupt/shutdown/error */
+  EV_CONTROL,           /* payload {kind, text} — interrupt/shutdown/error */
+  EV_ASK,               /* payload {askId, question, options[]} — the
+                           published blocked-ask record (escalation spec
+                           §1.2; ordinary durable event: seq-ordered,
+                           replayed, delivered through the events channel) */
+  EV_ASK_REPLY          /* payload {askId, decision, value} — a parked ask's
+                           resolution record (escalation spec §1.4); the
+                           decision renders "answer" | "reject" */
 } frame_event_type_e;
 
 /* Bridge request payloads (ownership transfers with the message): */
@@ -276,6 +295,31 @@ typedef struct frm_report_bind_payload_t {
    the dispatch (same validation as frame_append_msg). */
 typedef struct frm_steer_payload_t { char* role; char* text; } frm_steer_payload_t;
 
+/* The blocked-ask publish (FRM_ASK): the model's question + closed options,
+   posted FIRE-AND-POST by the agent.ask verb (py_agent.c's emit shape — no
+   bridge-sink reply ever crosses back; the resolution is FRM_ASK_REPLY and
+   the model reads it in the next turn's derive). corr rides the bridge corr
+   (the reply-sink space) for the audit pairing; the engine mints the durable
+   ask_id at receipt. Heap+OWNED fields transfer with the message
+   (frm_ask_payload_destroy frees question + each option + the array). */
+typedef struct frm_ask_payload_t {
+  uint64_t corr;            /* the bridge corr (the reply-sink space) */
+  char* question;
+  char** options;           /* owned array of owned strings; NULL = no options */
+  size_t noptions;
+} frm_ask_payload_t;
+
+/* The parked ask's resolution (FRM_ASK_REPLY): the engine consumes it
+   against its pending_ask EXACTLY ONCE; a stale ask_id is dropped loud.
+   ask_id carries the engine-minted "%08x" key (the sid allocator's shape);
+   decision 0 = answer, 1 = reject; value = the answer text or the refusal
+   text — may be empty. */
+typedef struct frm_ask_reply_payload_t {
+  char* ask_id;             /* the "%08x"-shaped key — the sid allocator's */
+  uint8_t decision;         /* 0 = answer, 1 = reject */
+  char* value;              /* the answer/refusal text — may be empty */
+} frm_ask_reply_payload_t;
+
 /* The client-API sessions listing (spec §3): the store enumerates the
    root's sessions/ first-level entries + each entry's meta/{created,
    status,depth,goal} and answers via the round-trip reply — records[] =
@@ -313,6 +357,8 @@ void frm_store_get_named_payload_destroy(void* p);
 void frm_store_reply_payload_destroy(void* p);
 void frm_report_bind_payload_destroy(void* p);
 void frm_steer_payload_destroy(void* p);
+void frm_ask_payload_destroy(void* p);
+void frm_ask_reply_payload_destroy(void* p);
 
 /* JSON event record shape (authoritative):
    {"seq":<int>,"type":"<event-name>","frame":"<sid-path>","corr":<int|null>,

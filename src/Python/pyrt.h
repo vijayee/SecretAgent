@@ -53,6 +53,20 @@ void pyrt_destroy(pyrt_t* pyrt);
    bridge verbs route into (py_agent.c). */
 actor_t* pyrt_thread_owner(void);
 
+/* The calling pyrt thread's runtime (pyrt.c's TLS — the same read
+   pyrt_thread_owner routes through; NO duplicated TLS logic). NULL when the
+   caller is not a pyrt worker thread. The injected module uses it as the
+   token for the parked-ask flag below. */
+pyrt_t* pyrt_thread_pyrt(void);
+
+/* The blocked-ask's one-park-at-a-time flag (escalation spec §1.1): the
+   engine sets it when it consumes a FRM_ASK (Task 2's park), the verb reads
+   it BEFORE publishing and refuses as data while it stands, and the reply's
+   consumption clears it. Atomic instance field (the interrupt_req shape) —
+   visible across the pyrt thread and the frame's dispatch thread. */
+void pyrt_ask_parked_set(pyrt_t* pyrt, uint8_t parked);
+uint8_t pyrt_ask_parked(const pyrt_t* pyrt);
+
 /* Route a text payload (PYRT_LOG / PYRT_STATUS / PYRT_EMIT) to the caller's
    runtime owner — the pyrt-thread-relative form of the injected module's
    stream verbs. Copies the text OUT of Python's heap inside; never re-enters
