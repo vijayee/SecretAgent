@@ -59,8 +59,11 @@ derive carries the answer.
   question may carry none).
 - Refusals are the verb's return value (data, never exceptions — row 13's law): empty question,
   oversized/empty option, a non-list options argument → a refusal string the model reads.
-- Publishes `PYRT_ASK` (new pyrt→frame bridge message, payload `{corr, question, options[]}`) and
-  returns a marker string immediately — the cell keeps running its remaining steps.
+- Publishes `FRM_ASK` DIRECTLY to the owning frame's mailbox (the report verb's direct-post
+  shape — no pyrt→frame hop needed; no `PYRT_ASK` type exists) and returns a marker string
+  immediately — the cell keeps running its remaining steps. The pyrt `ask_parked` flag is set
+  at the verb's POST-PUBLISH (after `actor_send` succeeds — the publish is outstanding), not
+  at engine receipt: a same-turn second ask refuses at the verb with no receipt race.
 - **One ask per frame at a time**: if a parked ask already exists when `agent.ask` is called, the
   verb returns the refusal text ("ask already parked — reply pending") and NO second publish
   happens. A second ask inside the SAME turn (pre-park, the cell still running) → same refusal;
