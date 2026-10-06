@@ -39,7 +39,7 @@ resolution is a message. Execute stays FREE by default — the owner override st
 | Decision | Value | Authority |
 |---|---|---|
 | The park shape | **Approach A — publish-then-park**: the ENGINE parks (new `FRAME_PHASE_ASK`), the turn closes `turn.end{blocked}`; the cell never blocks. Approach B (the cell thread parks on a corr-keyed wait; the verb returns the answer in-cell) REJECTED: a parked-thread class in an engine that never blocks, pool starvation by held interpreters, a watchdog exemption, and an abandoned-cell repair protocol — all new machinery where A proceeds through the proven park shape. The model sees the answer in the next turn's derive (the derive is stateless and re-rendered every turn — no seam). | owner |
-| The ladder's home | **A config enum on `frame_config_t`** (`sa_escalation_mode_t`) — the ladder is ENGINE-mechanical policy, matching how turn-caps/model-timeout configure the loop; NOT a store-loaded policy record (the persona pattern does not repeat here; the record shape may come later if per-call gates demand it — recorded). | owner |
+| The ladder's home | **A config enum on `frame_config_t`** (`frame_escalation_mode_e`) — the ladder is ENGINE-mechanical policy, matching how turn-caps/model-timeout configure the loop; NOT a store-loaded policy record (the persona pattern does not repeat here; the record shape may come later if per-call gates demand it — recorded). | owner |
 | Ask depth | **Straight to the owner surface** — any frame's ask, top or child, publishes one owner-surface ask for the session. A parked child composes with the parent's existing CHILDREN yield (zero new blocking). The parent-mediated chain (child→parent→user) is a recorded later extension, not built. | owner |
 | Pondr UX | **C surface now, the Flutter dialog after** (its own Pondr slice on the live FFI seam). | owner |
 | The bypass mode | **BYPASS added as the third enum member**: plan turns still run and log, the approval gate AUTO-APPROVES (durable control record marks it), straight to act — dangerous, documented as such; distinct from `free` (the plan-then-act discipline minus the human checkpoint, with the mode's own log trail). | owner |
@@ -126,8 +126,8 @@ one session.
 
 ## 2. The escalation ladder — config
 
-`frame.h`: `sa_escalation_mode_t { SA_ESCALATION_FREE = 0, SA_ESCALATION_PLAN_ASK_ACT,
-SA_ESCALATION_BYPASS }`; the field on `frame_config_t` (`escalation_mode`). Zero = free = the
+`frame.h`: `frame_escalation_mode_e { FRAME_ESCALATION_FREE = 0, FRAME_ESCALATION_PLAN_ASK_ACT,
+FRAME_ESCALATION_BYPASS }`; the field on `frame_config_t` (`escalation_mode`). Zero = free = the
 default. Immutable after create; **children inherit via the existing parent dup**
 (`frame.c:4480-4487`'s persona_name/caps inheritance shape); resume carries it (the resume
 site's existing config handling). The wire creates frames WITHOUT a new config field this slice
