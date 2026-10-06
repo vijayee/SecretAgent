@@ -50,8 +50,8 @@ Onyx supplies the assembly's transposed shape; the hammer supplies the first REA
 {
   "version": 1,
   "name": "hammer",
-  "text": "<the persona's markdown — msg 4148's spec verbatim, sans the meta-rule's
-           'testable as data' note (the meta-rule is ENFORCED, see below)>",
+  "text": "<the persona's markdown — msg 4148's spec block VERBATIM, the meta-rule
+           included: it IS the record's falsifiability contract (enforced at load)>",
   "placement": "first",              /* or "below" — Onyx's above/below */
   "guidance": [
     {"key": "execute", "text": "<tool-conditional guidance for the execute surface>"}
