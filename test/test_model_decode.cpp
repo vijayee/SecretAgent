@@ -208,7 +208,7 @@ TEST(TestModelDecode, TestToolCallStringArguments) {
     &seen_body, &seen);
 
   std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -263,7 +263,7 @@ TEST(TestModelDecode, TestToolCallObjectArguments) {
 
   /* Trailing slash must be trimmed by the URL join. */
   std::string base_url = "http://127.0.0.1:" + std::to_string(port) + "/";
-  frame_config_t cfg = {base_url.c_str(), "sk-test", "test-model", NULL, 4};
+  frame_config_t cfg = {base_url.c_str(), "sk-test", "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -310,7 +310,7 @@ TEST(TestModelDecode, TestNoToolCallContentOnly) {
     &seen_body, &seen);
 
   std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -345,7 +345,7 @@ TEST(TestModelDecode, TestNon2xxCarriesCodeAndExcerpt) {
     "{\"error\":\"boom\"}", &seen_body, &seen);
 
   std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -379,7 +379,7 @@ TEST(TestModelDecode, TestMalformedBodyIsDecodeError) {
     "not json at all", &seen_body, &seen);
 
   std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -402,7 +402,7 @@ TEST(TestModelDecode, TestMalformedBodyIsDecodeError) {
 
 TEST(TestModelDecode, TestTransportErrorReportsReason) {
   /* Port 1: refusals return instantly (no server listening). */
-  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -445,7 +445,7 @@ TEST(TestModelDecode, TestReasoningOnlyReplySurfacesContent) {
     &seen_body, &seen);
 
   std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -509,7 +509,7 @@ TEST(TestModelDecode, TestConfigTimeoutReachesTransport) {
   std::thread server(fake_server_run_hang, listen_fd, &seen);
 
   std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 4, 300};
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 0, 4, 300};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -562,7 +562,7 @@ TEST(TestModelDecode, TestSubmitRoundTripMatchesComplete) {
                      CONTENT_AND_TOOL_BODY, &seen_body, &seen);
 
   std::string base_url = "http://127.0.0.1:" + std::to_string(port);
-  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {base_url.c_str(), NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
   ASSERT_NE(mb->submit, nullptr);   /* the http backend is NOT sync-only */
@@ -628,7 +628,7 @@ TEST(TestModelDecode, TestSubmitTransportFailureReachesTheSink) {
      client fires a transport-error completion (status -1, reason, NULL
      body), the model submit has ALREADY returned 0, and the sink carries
      the failure to the caller. */
-  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 
@@ -659,7 +659,7 @@ TEST(TestModelDecode, TestSubmitRejectedNeverCallsSink) {
   /* NULL messages (http body unbuildable) → rejected BEFORE any I/O:
      rc != 0 and the sink NEVER fires — the http client's rejected-submit
      contract, inherited verbatim by the model backend. */
-  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", NULL, 4};
+  frame_config_t cfg = {"http://127.0.0.1:1", NULL, "test-model", NULL, 0, 4};
   model_backend_t* mb = model_http_backend_create(&cfg);
   ASSERT_NE(mb, nullptr);
 

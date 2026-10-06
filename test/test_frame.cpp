@@ -467,6 +467,88 @@ TEST(TestFrame, TestResumeCarriesPersonaName) {
   wave_db_close(db);
 }
 
+TEST(TestFrame, TestEscalationModeInherits) {
+  /* The ladder's config-copy contract (escalation spec §2): the mode is
+     a plain VALUE copy (an enum — the max_depth line's pattern) at all
+     three config-copy sites — the pooled child-create inheritance, the
+     frame_spawn branch, and the resume copy — and a cfg-less create
+     carries FREE (0). A value outside the ladder refuses loud at
+     create, never clamped to free. The mode's engine behavior (plan
+     turns, the gate, bypass) is Task 5's tests; THIS pins the config. */
+
+  /* A POOLED parent's child carries the mode (frame_spawn refuses on a
+     pooled store, so the child rides frame_create's parent link — the
+     TestPoolAttachAndInheritance shape; the NULL cfg forces the
+     parent-heritage branch). */
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  ASSERT_NE(pool, nullptr);
+  wave_database_config_t sc;
+  memset(&sc, 0, sizeof(sc));
+  sc.location = NULL;
+  sc.store_pool = pool;
+  frame_config_t pooled_cfg = cfg;
+  pooled_cfg.pool = pool;
+  wave_database_root_t* db = wave_db_open_config(&sc);
+  ASSERT_NE(db, nullptr);
+  frame_t* parent = frame_create(db, NULL, "pooled ladder root", &pooled_cfg);
+  ASSERT_NE(parent, nullptr);
+  EXPECT_EQ(_frame_escalation_mode(parent), FRAME_ESCALATION_PLAN_ASK_ACT);
+  frame_t* child = frame_create(db, parent, "pooled ladder leaf", NULL);
+  ASSERT_NE(child, nullptr);
+  EXPECT_EQ(_frame_escalation_mode(child), FRAME_ESCALATION_PLAN_ASK_ACT)
+      << "the pooled child-create inheritance carries the ladder";
+  frame_destroy(child);
+  frame_destroy(parent);
+  scheduler_pool_stop(pool);
+  wave_db_close(db);
+  scheduler_pool_destroy(pool);
+
+  /* The frame_spawn branch: a spawned child inherits the parent's mode. */
+  wave_database_root_t* inline_db = wave_db_open(NULL);
+  ASSERT_NE(inline_db, nullptr);
+  frame_t* spawn_parent = frame_create(inline_db, NULL, "spawn root", &cfg);
+  ASSERT_NE(spawn_parent, nullptr);
+  frame_t* spawned = frame_spawn(spawn_parent, "spawned leaf", NULL);
+  ASSERT_NE(spawned, nullptr);
+  EXPECT_EQ(_frame_escalation_mode(spawned), FRAME_ESCALATION_PLAN_ASK_ACT)
+      << "frame_spawn's heritage branch carries the ladder";
+  frame_destroy(spawned);
+  frame_destroy(spawn_parent);
+
+  /* The resume copy site: the restart cfg's mode rides the resume. */
+  frame_t* resumed_src = frame_create(inline_db, NULL, "resume me", &cfg);
+  ASSERT_NE(resumed_src, nullptr);
+  std::string sid = frame_sid(resumed_src);
+  ASSERT_EQ(_frame_set_status_done(resumed_src), 0);
+  frame_destroy(resumed_src);
+  frame_t* resumed = frame_resume(inline_db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr);
+  EXPECT_EQ(_frame_escalation_mode(resumed), FRAME_ESCALATION_PLAN_ASK_ACT)
+      << "the restart cfg's mode rides the resume";
+  frame_destroy(resumed);
+
+  /* The cfg-less shape: zeroed = FREE — every standing frame unchanged. */
+  frame_config_t plain_cfg = test_config();
+  frame_t* plain = frame_create(inline_db, NULL, "free root", &plain_cfg);
+  ASSERT_NE(plain, nullptr);
+  EXPECT_EQ(_frame_escalation_mode(plain), FRAME_ESCALATION_FREE)
+      << "a zeroed cfg carries FREE (the default)";
+  frame_destroy(plain);
+
+  /* The refusal: a value > 2 fails loud (NULL + log), never a clamp. */
+  frame_config_t bad_cfg = test_config();
+  bad_cfg.escalation_mode = 7;
+  EXPECT_EQ(frame_create(inline_db, NULL, "out of ladder", &bad_cfg), nullptr)
+      << "a mode outside the ladder refuses loud";
+  frame_config_t bad_resume_cfg = test_config();
+  bad_resume_cfg.escalation_mode = 7;
+  EXPECT_EQ(frame_resume(inline_db, sid.c_str(), &bad_resume_cfg), nullptr)
+      << "a mode outside the ladder refuses loud at resume too";
+  wave_db_close(inline_db);
+}
+
 TEST(TestFrame, TestReportBindsOneEventIntoParent) {
   frame_config_t cfg = test_config();
   wave_database_root_t* db = wave_db_open(NULL);

@@ -13,6 +13,16 @@
 
 typedef struct wave_database_root_t wave_database_root_t;   /* opaque; owns ONE root db */
 
+/* The escalation ladder (escalation spec §2): config, not a store-loaded
+   policy record. FREE is the default — every standing frame stays
+   byte-identical. Children inherit; immutable after create. */
+typedef enum frame_escalation_mode_e {
+  FRAME_ESCALATION_FREE = 0,         /* execute free, never asks (default) */
+  FRAME_ESCALATION_PLAN_ASK_ACT = 1, /* plan turns gate on one owner approval */
+  FRAME_ESCALATION_BYPASS = 2,       /* DANGEROUS: plan turns auto-approve,
+                                        ask verb refuses */
+} frame_escalation_mode_e;
+
 /* Config (immutable after create): */
 typedef struct frame_config_t {
   const char* model_base_url;    /* e.g. http://127.0.0.1:11434 (Ollama) */
@@ -24,6 +34,15 @@ typedef struct frame_config_t {
                                     persona block, the derive pins hold).
                                     The frame owns a dup of it; a spawned
                                     child inherits the parent's. */
+  unsigned escalation_mode;      /* frame_escalation_mode_e — L5 escalation
+                                    ladder: 0 = free (execute free, never
+                                    asks; the default), 1 = plan-ask-act
+                                    (plan turns gate on one owner approval),
+                                    2 = bypass (DANGEROUS: plan turns
+                                    auto-approve, ask verb refuses).
+                                    Children inherit. Immutable after
+                                    create. A value > 2 refuses loud at
+                                    create/resume — never a silent clamp. */
   unsigned max_depth;            /* SA_FRAME_MAX_DEPTH equivalent (default 4) */
   unsigned model_timeout_ms;     /* one completion POST bound, ms; 0 = the
                                     built-in default (model.h's

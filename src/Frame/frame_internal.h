@@ -430,6 +430,11 @@ const char* _frame_goal(const frame_t* f);
    derive's persona trip keys off it — persona spec §3). */
 const char* _frame_persona_name(const frame_t* f);
 
+/* The frame's carried escalation ladder mode (frame_escalation_mode_e;
+   0 = free — escalation spec §2). Also the tests' config-copy seam (the
+   _frame_persona_name precedent). */
+unsigned _frame_escalation_mode(const frame_t* f);
+
 /* 1 while the frame is live (open subtree); 0 for dead/unknown frames. */
 uint8_t _frame_is_live(const frame_t* f);
 

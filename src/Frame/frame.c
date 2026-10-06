@@ -363,6 +363,7 @@ struct frame_t {
   char* model_api_key;
   char* model_name;
   char* persona_name;         /* the persona record key; NULL = none */
+  unsigned escalation_mode;   /* frame_escalation_mode_e; 0 = free (default) */
   unsigned max_depth;
   unsigned model_timeout_ms;  /* 0 = built-in default (model_timeout_ms_resolve) */
   unsigned cell_watchdog_ms;  /* one pooled RUNNING CELL's bound, ms;
@@ -4604,6 +4605,10 @@ const char* _frame_persona_name(const frame_t* f) {
   return (f != NULL) ? f->persona_name : NULL;
 }
 
+unsigned _frame_escalation_mode(const frame_t* f) {
+  return (f != NULL) ? f->escalation_mode : FRAME_ESCALATION_FREE;
+}
+
 uint8_t _frame_is_live(const frame_t* f) {
   return (f != NULL && f->st != NULL) ? 1 : 0;
 }
@@ -4972,7 +4977,18 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
   }
 
   if (cfg != NULL) {
+    if (cfg->escalation_mode > FRAME_ESCALATION_BYPASS) {
+      /* frame.h's refusal contract: a value outside the ladder is never
+         clamped or coerced to the default — a mode the engine cannot
+         interpret would silently disable it. Refuse loud (the depth-cap's
+         shape) before any config lands. */
+      log_error("frame: escalation_mode %u is outside the ladder "
+                "(0=free 1=plan-ask-act 2=bypass); refusing loud",
+                cfg->escalation_mode);
+      goto fail;
+    }
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
+    f->escalation_mode = cfg->escalation_mode;
     f->model_timeout_ms = cfg->model_timeout_ms;
     f->cell_watchdog_ms = cfg->cell_watchdog_ms;
     f->pool = cfg->pool;        /* BORROWED, exactly like `backend` */
@@ -4996,8 +5012,11 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
     }
   } else if (parent != NULL) {
     /* Spawned children inherit the parent's depth budget, model config, and
-       pool (a tree always sits on ONE pool). */
+       pool (a tree always sits on ONE pool) — and the escalation ladder
+       (the parent was validated at its own create; the value rides the
+       lineage, escalation spec §2). */
     f->max_depth = parent->max_depth;
+    f->escalation_mode = parent->escalation_mode;
     f->model_timeout_ms = parent->model_timeout_ms;
     f->cell_watchdog_ms = parent->cell_watchdog_ms;   /* a pooled tree's
         children run their cells under the same one-cell bound */
@@ -5358,7 +5377,18 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
   /* Goal is not separately persisted; the post-restart config is copied in
      (NULL cfg carries none). */
   if (cfg != NULL) {
+    if (cfg->escalation_mode > FRAME_ESCALATION_BYPASS) {
+      /* The create site's refusal shape at RESUME time: a value outside the
+         ladder rides the same refuse-loud rule the create path holds —
+         never a silent clamp into an engine the restarted frame cannot
+         interpret. */
+      log_error("frame_resume: escalation_mode %u is outside the ladder "
+                "(0=free 1=plan-ask-act 2=bypass); refusing loud",
+                cfg->escalation_mode);
+      goto fail;
+    }
     f->max_depth = (cfg->max_depth > 0) ? cfg->max_depth : 4;
+    f->escalation_mode = cfg->escalation_mode;
     f->model_timeout_ms = cfg->model_timeout_ms;
     f->cell_watchdog_ms = cfg->cell_watchdog_ms;
     f->pool = cfg->pool;        /* BORROWED, exactly like the model strings */
