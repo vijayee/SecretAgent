@@ -219,8 +219,9 @@ typedef struct frame_engine_state_t {
     uint64_t corr;             /* the publishing verb's bridge corr (the
                                   reply-sink key space; informational here) */
     char* question;            /* the ask's text, OWNED (stolen from the
-                                  FRM_ASK payload at receipt; consumed by the
-                                  close batch's compose) */
+                                  FRM_ASK payload at receipt; freed by
+                                  _frame_engine_ask_clear — the close batch
+                                  borrows it into the record) */
     char** options;            /* the OWNED array of OWNED strings (NULL =
                                   no options — an open ask; the close's
                                   compose renders an empty array) */

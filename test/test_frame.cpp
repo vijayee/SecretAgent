@@ -3146,6 +3146,85 @@ TEST(TestFrame, TestAskSecondAskInSameTurnRefused) {
   wave_db_close(db);
 }
 
+/* The reply's compose/post refusal leaves the PARK STANDING for a retry
+   (escalation spec §1.4's exactly-once contract): the park clears only after
+   the batch POSTS. Force the real refusal at the reply path — a value
+   beyond the WAL batch cap (SA_FRAME_MAX_BATCH_BYTES is 120 KiB in frame.c;
+   the post's cap check refuses pre-post, the seq range rolls back, no
+   record lands) — then the honest retry resumes the engine. */
+TEST(TestFrame, TestAskReplyRefusedBatchKeepsTheParkedAskStanding) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "the refused reply's retry", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ask_capture_model_t cm = {};
+  cm.base.complete = ask_capture_complete;
+  cm.replies = {
+      canned_cell_body("import actor\nactor.ask('q?', ['yes', 'no'])"
+                       "\nprint('asked')"),
+      canned_content_body("done after the answer")};
+  frame_set_model_backend(f, &cm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 2) << "parked";
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  size_t parked_count = json_size(events);
+  std::string ask_id;
+  for (size_t i = json_size(events); i > 0; i--) {
+    json_value_t* rec = json_at(events, i - 1);
+    if (event_is(rec, "ask")) {
+      ask_id = json_as_string(json_get(json_get(rec, "payload"), "askId"));
+      break;
+    }
+  }
+  ASSERT_EQ(ask_id.size(), 8u);
+  json_value_destroy(events);
+
+  /* The oversized reply POSTS (the internals post is unbounded by the
+     bridge budget) and the dispatch's reply batch runs into the WAL
+     record cap: the compose succeeds, the post refuses PRE-post, the seq
+     range rolls back, and the park STANDS (no ask.reply record, the engine
+     still parked — the same oversized reply could land again). */
+  std::string oversized(150 * 1024, 'x');
+  EXPECT_EQ(_frame_ask_reply_post(f, ask_id.c_str(), 0, oversized.c_str()), 0)
+      << "posted (the ack cannot see the engine)";
+  EXPECT_EQ(frame_run_loop(f), 2) << "the refusal kept the park standing";
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(json_size(events), parked_count)
+      << "the refused reply batch committed NOTHING";
+  EXPECT_EQ(fr_count_type(events, "ask.reply"), 0u);
+  json_value_destroy(events);
+
+  /* The retry lands: the matched reply composes its batch, the park clears,
+     and the fresh turn runs to done. */
+  EXPECT_EQ(frame_ask_reply(f, ask_id.c_str(), 0, "yes"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0) << "the retry resumed the engine";
+  EXPECT_EQ(frame_is_done(f), 1);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(fr_count_type(events, "ask.reply"), 1u);
+  json_value_t* reply = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "ask.reply")) {
+      reply = json_at(events, i);
+      break;
+    }
+  }
+  ASSERT_NE(reply, nullptr);
+  ASSERT_TRUE(event_is(reply, "ask.reply"));
+  json_value_t* reply_payload = json_get(reply, "payload");
+  ASSERT_NE(reply_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "askId")), ask_id.c_str());
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 #endif /* python gate */
 
 #endif /* SA_HAS_WDB */

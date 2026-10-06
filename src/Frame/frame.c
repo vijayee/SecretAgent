@@ -3933,11 +3933,18 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          stolen strings live in the park until the engine's clear.
          One ask per frame at a time: the verb's publish flag refuses
          same-turn refires (the second ask never posts); THIS belt is the
-         dispatch-time twin for a hand-crafted or otherwise-raced publish. */
+         dispatch-time twin for a hand-crafted or otherwise-raced publish.
+         The publish flag is the VERB's set: a NON-parking refusal here
+         clears it (the model-visible contract — a refused ask never left a
+         standing park, so the verb must not stay latched); the second-ask
+         belt keeps it set (a park genuinely stands). */
       frm_ask_payload_t* ap = (frm_ask_payload_t*)msg->payload;
       msg->payload = NULL;
       if (ap == NULL) {
         log_error("frame: FRM_ASK with no payload at '%s'", f->sid_path);
+#ifdef SA_HAS_PYTHON
+        if (f->pyrt != NULL) pyrt_ask_parked_set(f->pyrt, 0);
+#endif
         break;
       }
       uint8_t options_torn = (ap->options == NULL && ap->noptions > 0) ? 1 : 0;
@@ -3950,6 +3957,9 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         log_error("frame: FRM_ASK at '%s' refuses a malformed ask (no "
                   "question, or an empty/torn option) — dropped loud",
                   f->sid_path);
+#ifdef SA_HAS_PYTHON
+        if (f->pyrt != NULL) pyrt_ask_parked_set(f->pyrt, 0);
+#endif
         frm_ask_payload_destroy(ap);
         break;
       }
@@ -3963,6 +3973,9 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         log_error("frame: an ask arrived at '%s' with no live OPEN turn to "
                   "close in — the ask cannot park; refusing loud",
                   f->sid_path);
+#ifdef SA_HAS_PYTHON
+        if (f->pyrt != NULL) pyrt_ask_parked_set(f->pyrt, 0);
+#endif
         frm_ask_payload_destroy(ap);
         break;
       }
@@ -3974,6 +3987,9 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       if (f->engine.pending_ask.ask_id == NULL) {
         log_error("frame: out of memory boxing the ask at '%s' — refuse loud",
                   f->sid_path);
+#ifdef SA_HAS_PYTHON
+        if (f->pyrt != NULL) pyrt_ask_parked_set(f->pyrt, 0);
+#endif
         frm_ask_payload_destroy(ap);
         break;
       }
@@ -4049,9 +4065,10 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         json_value_destroy(reply_payload);
         json_value_destroy(append_payload);
         /* The park stands (nothing was posted) — the same reply lands again
-           once the compose succeeds; the loud trail above names it. */
+           once the compose succeeds. */
         log_error("frame: out of memory composing the ask reply's records at "
-                  "'%s' — the park stands for the retry", f->sid_path);
+                  "'%s' (ask %s) — the park stands for the retry",
+                  f->sid_path, rp->ask_id);
         frm_ask_reply_payload_destroy(rp);
         break;
       }
@@ -4070,9 +4087,16 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
          — no engine park, no parked ask) and the engine re-enters via the
          ordinary FRM_TURN continuation (a fresh turn over a derive that now
          carries the answer): the same repost idiom frame_interrupt's
-         continuation uses on its own mailbox. */
+         continuation uses on its own mailbox. The repost's refusal (the
+         DESTROY flag only — _loop_post_turn's shape) leaves a live engine
+         at phase NONE with nothing pending: loud here, never silent. */
       _frame_engine_ask_clear(f);
       f->engine.phase = FRAME_PHASE_NONE;
+      if (atomic_load(&f->actor.flags) & ACTOR_FLAG_DESTROY) {
+        log_error("frame: the ask reply's turn continuation was refused at "
+                  "'%s' — the mailbox is gone; the frame idles",
+                  f->sid_path);
+      }
       _frame_post(&f->actor, (uint32_t)FRM_TURN, NULL, NULL,
                   "the ask's resolution turn continuation");
       break;
