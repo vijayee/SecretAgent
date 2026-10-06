@@ -3326,4 +3326,647 @@ TEST(TestFrame, TestAskReplyRefusedBatchKeepsTheParkedAskStanding) {
 
 #endif /* python gate */
 
+/* --- escalation Task 5: the plan-ask-act ladder (+ BYPASS) — PYTHON-FREE
+   (the plan turn is a CONTENT turn: no cell ever runs; the act pins below
+   ride content completions and the queue-empty failure; the REAL-cell pins
+   — a real tool round in act, the ask verb's bypass refusal — live in
+   test_loop.cpp's python-gated family). The family's harness: a content-
+   and-tool-call scripted model that captures the messages AND the request's
+   tools shape ("none-pointer" = the NULL pointer / the canned execute tool;
+   "json-null" = the JSON null VALUE = explicitly no tools). --------------- */
+
+static json_value_t* lf_payload_of(json_value_t* rec) {
+  return json_get(rec, "payload");
+}
+
+static long long lf_seq_of(json_value_t* rec) {
+  json_value_t* s = json_get(rec, "seq");
+  return (s != NULL) ? (long long)json_as_int(s) : -1;
+}
+
+/* The LAST "ask" record whose question matches the ladder's gate needle
+   (the log is append-only: the LATEST gate asks last). */
+static json_value_t* lf_find_gate_ask(json_value_t* events) {
+  json_value_t* found = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "ask")) continue;
+    json_value_t* p = lf_payload_of(rec);
+    json_value_t* q = (p != NULL) ? json_get(p, "question") : NULL;
+    if (q != NULL &&
+        strcmp(json_as_string(q), "Approve this plan?") == 0) {
+      found = rec;
+    }
+  }
+  return found;
+}
+
+/* The FIRST control record whose payload kind matches. */
+static json_value_t* lf_find_control(json_value_t* events, const char* kind) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = lf_payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    if (k != NULL && strcmp(json_as_string(k), kind) == 0) return rec;
+  }
+  return NULL;
+}
+
+typedef struct ladder_model_t {
+  model_backend_t base;
+  std::vector<std::string> replies;
+  std::vector<std::string> captured;
+  std::vector<std::string> tools_seen;
+} ladder_model_t;
+
+/* The tools-shape capture (the ladder's pin; the loop's tools argument is
+   exactly ONE of the three shapes model.c's builder accepts). */
+static void lf_capture_tools(ladder_model_t* lm, json_value_t* tools) {
+  if (tools == NULL) {
+    lm->tools_seen.emplace_back("none-pointer");
+  } else if (json_type(tools) == JSON_NULL) {
+    lm->tools_seen.emplace_back("json-null");
+  } else {
+    char* ts = json_serialize(tools);
+    lm->tools_seen.emplace_back((ts != NULL) ? std::string(ts) : std::string());
+    free(ts);
+  }
+}
+
+/* The decode: content-or-tool_calls (test_loop.cpp's scripted_decode
+   shape, local copy — the python-gated original is out of this family's
+   region). */
+static int lf_decode(const std::string& body, model_reply_t** reply_out,
+                     char** error_out) {
+  char* err = NULL;
+  json_value_t* root = json_parse(body.c_str(), body.size(), &err);
+  if (err != NULL) free(err);
+  if (root == NULL) {
+    *error_out = strdup("ladder model: body is not valid JSON");
+    return -1;
+  }
+  json_value_t* choices = json_get(root, "choices");
+  json_value_t* choice = (choices != NULL && json_type(choices) == JSON_ARRAY)
+                             ? json_at(choices, 0) : NULL;
+  json_value_t* message =
+      (choice != NULL && json_type(choice) == JSON_OBJECT)
+          ? json_get(choice, "message") : NULL;
+  if (message == NULL) {
+    json_value_destroy(root);
+    *error_out = strdup("ladder model: no message in choices[0]");
+    return -1;
+  }
+  model_reply_t* r = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
+  json_value_t* content = json_get(message, "content");
+  r->content = strdup((content != NULL && json_type(content) != JSON_NULL)
+                          ? json_as_string(content) : "");
+  json_value_t* calls = json_get(message, "tool_calls");
+  if (calls != NULL && json_type(calls) == JSON_ARRAY && json_size(calls) > 0) {
+    json_value_t* fn = json_get(json_at(calls, 0), "function");
+    json_value_t* args = (fn != NULL) ? json_get(fn, "arguments") : NULL;
+    json_value_t* parsed = NULL;
+    if (args != NULL && json_type(args) == JSON_STRING) {
+      char* aerr = NULL;
+      const char* t = json_as_string(args);
+      parsed = json_parse(t, strlen(t), &aerr);
+      if (aerr != NULL) free(aerr);
+      if (parsed == NULL) {
+        json_value_destroy(root);
+        model_reply_destroy(r);
+        *error_out = strdup("ladder model: arguments string is not JSON");
+        return -1;
+      }
+      args = parsed;
+    }
+    if (args != NULL && json_type(args) == JSON_OBJECT) {
+      json_value_t* code = json_get(args, "code");
+      if (code != NULL && json_type(code) == JSON_STRING) {
+        r->tool_code = strdup(json_as_string(code));
+      }
+    }
+    if (parsed != NULL) json_value_destroy(parsed);
+  }
+  json_value_destroy(root);
+  *reply_out = r;
+  return 0;
+}
+
+static int ladder_complete(void* self, json_value_t* messages,
+                           json_value_t* tools, char** raw_out,
+                           model_reply_t** reply_out, char** error_out) {
+  (void)raw_out;
+  *reply_out = NULL;
+  *error_out = NULL;
+  ladder_model_t* lm = (ladder_model_t*)self;
+  char* seen = json_serialize(messages);
+  if (seen != NULL) {
+    lm->captured.emplace_back(seen);
+    free(seen);
+  }
+  lf_capture_tools(lm, tools);
+  if (lm->replies.empty()) {
+    *error_out = strdup("ladder model: queue empty");
+    return -1;
+  }
+  std::string body = lm->replies.front();
+  lm->replies.erase(lm->replies.begin());
+  return lf_decode(body, reply_out, error_out) == 0 ? 0 : -1;
+}
+
+/* One canned content-only completion body (canned_content_body's shape; no
+   python needed — this family's replies decode content only). */
+static std::string lf_content_body(const std::string& text) {
+  return std::string(
+             R"json({"choices":[{"message":{"role":"assistant","content":")json") +
+             text + std::string(R"json("}}]})json");
+}
+
+/* One canned `execute` tool-call completion body (the canned shape — no
+   python needed: this family never RUNS the cell, and the plan gate
+   refuses the shape before any tool path). */
+static std::string lf_tool_body(const std::string& code) {
+  std::string inner = std::string("{\"code\":\"") + code + "\"}";
+  std::string esc;
+  for (char c : inner) {
+    if (c == '"') esc += "\\\"";
+    else esc += c;
+  }
+  return std::string(
+      R"json({"choices":[{"message":{"role":"assistant","tool_calls":[)json"
+      R"json({"type":"function","function":{"name":"execute",)json"
+      R"json("arguments":")json") + esc +
+      std::string(R"json("}}]}}]})json");
+}
+
+TEST(TestFrame, TestPlanAskActPlansToolsNullThenGatesThenActs) {
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "ladder: plan then act", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {
+      lf_content_body("Plan: 1. measure 2. cut 3. report"),
+      lf_content_body("act phase's first step")};
+  frame_set_model_backend(f, &lm.base);
+
+  /* TURN 1 = the plan turn: tools-null request, the plan block, the
+     runtime-authored gate parking the frame. */
+  EXPECT_EQ(frame_run_loop(f), 2) << "the plan turn parks at the gate";
+  EXPECT_EQ(frame_is_done(f), 0);
+  ASSERT_EQ(lm.captured.size(), 1u);
+  ASSERT_EQ(lm.tools_seen.size(), 1u);
+  EXPECT_EQ(lm.tools_seen[0], "json-null")
+      << "the plan request is built tools-NULL (model.c's no-tools shape)";
+  EXPECT_NE(lm.captured[0].find("PLAN mode"), std::string::npos)
+      << "the plan block rode the system prompt";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* ask_rec = lf_find_gate_ask(events);
+  ASSERT_NE(ask_rec, nullptr);
+  size_t ask_index = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (json_at(events, i) == ask_rec) { ask_index = i; break; }
+  }
+  json_value_t* p = lf_payload_of(ask_rec);
+  ASSERT_NE(p, nullptr);
+  json_value_t* id = json_get(p, "askId");
+  ASSERT_NE(id, nullptr);
+  std::string ask_id = json_as_string(id);
+  EXPECT_EQ(ask_id.size(), 8u) << "the root allocator's mint";
+  EXPECT_STREQ(json_as_string(json_get(p, "question")), "Approve this plan?");
+  json_value_t* options = json_get(p, "options");
+  ASSERT_NE(options, nullptr);
+  ASSERT_EQ(json_size(options), 2u);
+  EXPECT_STREQ(json_as_string(json_at(options, 0)), "Approve");
+  EXPECT_STREQ(json_as_string(json_at(options, 1)), "Reject");
+  json_value_t* plan_v = json_get(p, "plan");
+  ASSERT_NE(plan_v, nullptr);
+  EXPECT_EQ(json_type(plan_v), JSON_STRING);
+  EXPECT_STREQ(json_as_string(plan_v), "Plan: 1. measure 2. cut 3. report")
+      << "the plan text rides the ask record below the cap";
+
+  /* The close batch: [step.start, control plan-requested, msg.append (the
+     plan text), ask, step.end, turn.end{blocked}] — SIX consecutive seqs
+     (the turn.start rode its own turn-entry batch, so the ask sits at the
+     batch's fourth position). */
+  json_value_t* rec = json_at(events, ask_index - 3);
+  ASSERT_NE(rec, nullptr);
+  ASSERT_TRUE(event_is(rec, "step.start")) << "the batch's first record";
+  for (long long k = 0; k <= 5; k++) {
+    json_value_t* at = json_at(events, ask_index - 3 + (size_t)k);
+    ASSERT_NE(at, nullptr);
+    EXPECT_EQ(lf_seq_of(at), lf_seq_of(rec) + k)
+        << "the close batch is ONE atomic group; record " << k;
+  }
+  json_value_t* ctrl_rec = json_at(events, ask_index - 2);
+  ASSERT_TRUE(event_is(ctrl_rec, "control"));
+  EXPECT_STREQ(json_as_string(json_get(lf_payload_of(ctrl_rec), "kind")),
+               "plan-requested");
+  json_value_t* plan_append = json_at(events, ask_index - 1);
+  ASSERT_TRUE(event_is(plan_append, "msg.append"));
+  EXPECT_STREQ(json_as_string(json_get(lf_payload_of(plan_append), "role")),
+               "assistant");
+  json_value_t* turn_end_rec = json_at(events, ask_index + 2);
+  ASSERT_TRUE(event_is(turn_end_rec, "turn.end"));
+  {
+    json_value_t* tp = lf_payload_of(turn_end_rec);
+    json_value_t* reason = json_get(tp, "reason");
+    ASSERT_NE(reason, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "blocked");
+    EXPECT_EQ(json_as_int(json_get(tp, "turn")), 1);
+  }
+  EXPECT_EQ(fr_count_type(events, "msg.append"), 1u)
+      << "only the assistant plan text — no user-side append while parked";
+  json_value_destroy(events);
+
+  /* THE APPROVE (decision 0, value "Approve"): the reply batch ALSO carries
+     the durable control record — [ask.reply, control auto:false,
+     msg.append user] — and the ACT turn runs (tools again, no plan block),
+     its content completing the frame normally. */
+  EXPECT_EQ(frame_ask_reply(f, ask_id.c_str(), 0, "Approve"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0) << "the act phase ran to completion";
+  EXPECT_EQ(frame_is_done(f), 1);
+  ASSERT_EQ(lm.captured.size(), 2u);
+  ASSERT_EQ(lm.tools_seen.size(), 2u);
+  EXPECT_EQ(lm.tools_seen[1], "none-pointer")
+      << "the act turn's request carries `execute` again";
+  EXPECT_EQ(lm.captured[1].find("PLAN mode"), std::string::npos)
+      << "the plan block left the derive at the approval";
+  EXPECT_NE(lm.captured[1].find("Plan: 1. measure"), std::string::npos)
+      << "the plan text reached the derive through the durable msg.append";
+
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  {
+    /* The reply batch's THREE records: ask.reply, control{plan-approved,
+       auto false}, msg.append user — consecutive seqs IN THAT ORDER. */
+    json_value_t* approved = lf_find_control(events, "plan-approved");
+    ASSERT_NE(approved, nullptr);
+    size_t a = 0;
+    for (size_t i = 0; i < json_size(events); i++) {
+      if (json_at(events, i) == approved) { a = i; break; }
+    }
+    json_value_t* reply_r = json_at(events, a - 1);
+    json_value_t* append_r = json_at(events, a + 1);
+    ASSERT_TRUE(event_is(reply_r, "ask.reply"));
+    ASSERT_TRUE(event_is(append_r, "msg.append"));
+    EXPECT_EQ(lf_seq_of(reply_r) + 1, lf_seq_of(approved));
+    EXPECT_EQ(lf_seq_of(approved) + 1, lf_seq_of(append_r));
+    json_value_t* ap = lf_payload_of(approved);
+    EXPECT_EQ(json_type(json_get(ap, "auto")), JSON_BOOL);
+    EXPECT_EQ(json_as_bool(json_get(ap, "auto")), 0)
+        << "owner-approved, not AUTO";
+    json_value_t* rp = lf_payload_of(reply_r);
+    EXPECT_STREQ(json_as_string(json_get(rp, "decision")), "answer");
+    json_value_t* up = lf_payload_of(append_r);
+    EXPECT_STREQ(json_as_string(json_get(up, "role")), "user");
+    EXPECT_STREQ(json_as_string(json_get(up, "content")), "Approve");
+    EXPECT_EQ(fr_count_type(events, "ask"), 1u) << "no re-ask in act";
+  }
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestPlanGateRejectReplansAndReplanCarriesTheText) {
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "ladder: replan", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {lf_content_body("Plan one: measure"), lf_content_body("Plan two: cut"), lf_content_body("Plan three: report")};
+  frame_set_model_backend(f, &lm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 2);
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* ask1 = lf_find_gate_ask(events);
+  ASSERT_NE(ask1, nullptr);
+  std::string id1 = json_as_string(json_get(lf_payload_of(ask1), "askId"));
+  json_value_destroy(events);
+
+  /* REJECT with no text: the standing default wording; NO control record
+     (the ladder revisits plan — no transition happened). */
+  EXPECT_EQ(frame_ask_reply(f, id1.c_str(), 1, ""), 0);
+  EXPECT_EQ(frame_run_loop(f), 2) << "the next turn is plan AGAIN";
+
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  {
+    json_value_t* reply = NULL;
+    size_t reply_index = 0;
+    for (size_t i = 0; i < json_size(events); i++) {
+      if (event_is(json_at(events, i), "ask.reply")) {
+        reply = json_at(events, i);
+        reply_index = i;
+        break;
+      }
+    }
+    ASSERT_NE(reply, nullptr);
+    json_value_t* rp = lf_payload_of(reply);
+    EXPECT_STREQ(json_as_string(json_get(rp, "decision")), "reject");
+    json_value_t* text_v = json_get(rp, "value");
+    ASSERT_NE(text_v, nullptr) << "the empty reject renders value null";
+    EXPECT_EQ(json_type(text_v), JSON_NULL);
+    EXPECT_EQ(json_as_string(text_v), nullptr)
+        << "json_as_string on a null value answers NULL (the standing shape)";
+    /* The SAME batch's user-side append rides NEXT (ask.reply, then
+       msg.append — the two-record reject shape). */
+    json_value_t* append = json_at(events, reply_index + 1);
+    ASSERT_NE(append, nullptr);
+    ASSERT_TRUE(event_is(append, "msg.append"));
+    json_value_t* ap = lf_payload_of(append);
+    EXPECT_STREQ(json_as_string(json_get(ap, "role")), "user");
+    EXPECT_STREQ(json_as_string(json_get(ap, "content")),
+                 "Plan rejected: revise and re-propose")
+        << "the standing default wording (no objection text)";
+    EXPECT_EQ(lf_find_control(events, "plan-approved"), nullptr)
+        << "no approval control record on a reject";
+  }
+  EXPECT_EQ(_frame_engine_state(f)->ladder_act, 0u)
+      << "a reject never flips the ladder's ACT marker (the next turn is "
+         "plan again)";
+  json_value_destroy(events);
+
+  /* The replan turn ran tools-NULL and carried the plan block again
+     (turn 2 is plan). */
+  ASSERT_EQ(lm.tools_seen.size(), 2u);
+  EXPECT_EQ(lm.tools_seen[1], "json-null");
+  ASSERT_EQ(lm.captured.size(), 2u);
+  EXPECT_NE(lm.captured[1].find("PLAN mode"), std::string::npos);
+  EXPECT_NE(lm.captured[1].find("Plan one: measure"), std::string::npos)
+      << "the prior plan text rode the durable msg.append into the replan";
+
+  /* REJECT WITH text: the objection IS the record's content, verbatim. */
+  json_value_t* events2 = load_events(f);
+  ASSERT_NE(events2, nullptr);
+  json_value_t* ask2 = lf_find_gate_ask(events2);
+  ASSERT_NE(ask2, nullptr);
+  std::string id2 = json_as_string(json_get(lf_payload_of(ask2), "askId"));
+  EXPECT_NE(id2, id1) << "a fresh mint per gate";
+  json_value_destroy(events2);
+  EXPECT_EQ(frame_ask_reply(f, id2.c_str(), 1, "skip step 3"), 0);
+  EXPECT_EQ(frame_run_loop(f), 2) << "still plan after the second reject";
+
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  {
+    size_t asks = 0;
+    for (size_t i = 0; i < json_size(events); i++) {
+      if (event_is(json_at(events, i), "ask")) asks++;
+    }
+    EXPECT_EQ(asks, 3u) << "three gated plan turns";
+    json_value_t* last_user = NULL;
+    for (size_t i = 0; i < json_size(events); i++) {
+      json_value_t* r = json_at(events, i);
+      if (!event_is(r, "msg.append")) continue;
+      json_value_t* ap = lf_payload_of(r);
+      if (strcmp(json_as_string(json_get(ap, "role")), "user") == 0) {
+        last_user = r;
+      }
+    }
+    ASSERT_NE(last_user, nullptr);
+    json_value_t* ap = lf_payload_of(last_user);
+    EXPECT_STREQ(json_as_string(json_get(ap, "content")), "skip step 3")
+        << "the objection rides VERBATIM";
+    EXPECT_EQ(lf_find_control(events, "plan-approved"), nullptr)
+        << "still no approval: three gates, zero transitions";
+  }
+  json_value_destroy(events);
+  /* The third plan turn's derive carried the whole replan history. */
+  ASSERT_EQ(lm.captured.size(), 3u);
+  ASSERT_EQ(lm.tools_seen.size(), 3u);
+  EXPECT_EQ(lm.tools_seen[2], "json-null");
+  EXPECT_NE(lm.captured[2].find("Plan one: measure"), std::string::npos);
+  EXPECT_NE(lm.captured[2].find("Plan two: cut"), std::string::npos);
+  EXPECT_EQ(lm.captured[2].find("Plan three: report"), std::string::npos)
+      << "the model's own fresh reply is not in its own derive";
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestPlanModeToolCallReplyRefusesLoud) {
+  /* The plan turn ran tools-NULL — a tool-call reply is an unexpected
+     shape there: LOUD ("plan-mode"), turn ends error, gate-free state
+     (a later run re-enters plan). No cell ever ran. */
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "ladder: bad shape", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {lf_tool_body("print('ignored')")};
+  frame_set_model_backend(f, &lm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 1) << "the plan-mode refusal failed loud";
+  ASSERT_EQ(lm.tools_seen.size(), 1u);
+  EXPECT_EQ(lm.tools_seen[0], "json-null")
+      << "the refusal's turn RAN the tools-shaped request too";
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(lf_find_gate_ask(events), nullptr)
+      << "the unexpected reply never gated";
+  json_value_t* turn_end = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "turn.end")) {
+      turn_end = json_at(events, i);
+    }
+  }
+  ASSERT_NE(turn_end, nullptr);
+  {
+    json_value_t* tp = lf_payload_of(turn_end);
+    json_value_t* reason = json_get(tp, "reason");
+    ASSERT_NE(reason, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "error");
+  }
+  ASSERT_NE(lf_find_control(events, "plan-mode"), nullptr)
+      << "the refusal's control record rides the close";
+  json_value_destroy(events);
+  /* The gate-free state: a re-run re-enters plan (queue empty now → the
+     fallback's once-only retry exhausts → still failed loud). */
+  EXPECT_EQ(frame_run_loop(f), 1);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestApprovalPersistsAcrossRestart) {
+  /* The approval consult (escalation spec §2.4): the durable control record
+     is the approval's mechanism — the approve lands, the act turn FAILS
+     loud (this python-free shape: the act turn's model queue is empty —
+     the fallback class's once-only retry exhausts; the frame stays NOT
+     done), the frame is destroyed, and the resumed run's FIRST derive
+     re-learns ACT from the log's plan-approved record: no re-gate, no
+     re-ask, and the act request is built TOOLS-shaped.
+     NOTE (the recorded safe default): the derive window is bounded to the
+     newest 512 records — a very long log may scroll the approval past it,
+     and a re-gate (re-asking) is the SAFE default there. */
+  char tmpl[] = "/tmp/sa-ladder-XXXXXX";
+  char* got = mkdtemp(tmpl);
+  ASSERT_NE(got, nullptr);
+  std::string dir = std::string(got);
+  std::string loc = dir + "/db";
+
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "durable approval", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {lf_content_body("Plan: durable edition")};
+  frame_set_model_backend(f, &lm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 2);
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* ask_rec = lf_find_gate_ask(events);
+  ASSERT_NE(ask_rec, nullptr);
+  std::string ask_id =
+      json_as_string(json_get(lf_payload_of(ask_rec), "askId"));
+  json_value_destroy(events);
+  EXPECT_EQ(frame_ask_reply(f, ask_id.c_str(), 0, "Approve"), 0);
+  /* The act turn fails loud twice (the queue is empty; the fallback class
+     retries once) — the approval's control record is already durable. */
+  EXPECT_EQ(frame_run_loop(f), 1);
+  EXPECT_EQ(frame_is_done(f), 0);
+
+  frame_destroy(f);
+  wave_db_close(db);
+
+  /* RE-OPEN + RESUME: the derive's consult sees the control record. */
+  db = wave_db_open(loc.c_str());
+  ASSERT_NE(db, nullptr);
+  frame_t* resumed = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr);
+  ladder_model_t lm2 = {};
+  lm2.base.complete = ladder_complete;
+  lm2.replies = {lf_content_body("the act phase's resumed step")};
+  frame_set_model_backend(resumed, &lm2.base);
+
+  EXPECT_EQ(frame_run_loop(resumed), 0);
+  ASSERT_EQ(lm2.captured.size(), 1u);
+  ASSERT_EQ(lm2.tools_seen.size(), 1u);
+  EXPECT_EQ(lm2.tools_seen[0], "none-pointer")
+      << "the resumed run consulted the log: this turn is ACT (tools)";
+  EXPECT_EQ(lm2.captured[0].find("PLAN mode"), std::string::npos)
+      << "no plan block rides an act turn's prompt";
+  events = load_events(resumed);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(fr_count_type(events, "ask"), 1u)
+      << "NO re-ask: the approval carried the restart";
+  json_value_destroy(events);
+  EXPECT_EQ(frame_is_done(resumed), 1) << "the act content ended the frame";
+
+  frame_destroy(resumed);
+  wave_db_close(db);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(TestFrame, TestBypassPlansThenAutoApprovesWithoutAsking) {
+  /* DANGEROUS mode (escalation spec §2.3): the plan turn still runs and is
+     still logged, but its close AUTO-APPROVES — the durable control record
+     {plan-approved, auto true} INSTEAD of any ask record; NO park; the
+     engine CONTINUES (the next turn runs, tools = execute). The owner
+     surface is never involved (the flow's own ask-verb refusal lives in
+     test_loop.cpp's python-gated family). */
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_BYPASS;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "bypass: no gate", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {
+      lf_content_body("Plan: automatically approved edition"),
+      lf_content_body("the act phase ran without asking")};
+  frame_set_model_backend(f, &lm.base);
+
+  /* ONE run loop drives the whole continuation: plan → auto-approve →
+     act → done. NEVER rc 2 (no park exists in bypass). But first, the
+     in-memory flip is observed at the plan turn's end (the engine is live
+     at phase NONE with the continuation queued, its ACT marker set — the
+     bypass's own continuation idiom) via the by-hand pump. */
+  EXPECT_EQ(frame_start(f), 0);
+  for (int i = 0; i < 64 && lm.captured.size() < 1; i++) {
+    _frame_pump(f);
+  }
+  ASSERT_EQ(lm.captured.size(), 1u);
+  {
+    frame_engine_state_t* e = _frame_engine_state(f);
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->engine_live, 1u) << "the plan close did NOT end the engine";
+    EXPECT_EQ(e->ladder_act, 1u)
+        << "the auto-approval flipped the ladder's ACT marker in memory";
+  }
+  /* The continuation completes the flow normally. */
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(frame_is_done(f), 1);
+  ASSERT_EQ(lm.captured.size(), 2u);
+  ASSERT_EQ(lm.tools_seen.size(), 2u);
+  EXPECT_EQ(lm.tools_seen[0], "json-null")
+      << "the plan turn ran (tools-null, the plan block: the same shape)";
+  EXPECT_NE(lm.captured[0].find("PLAN mode"), std::string::npos);
+  EXPECT_EQ(lm.tools_seen[1], "none-pointer")
+      << "the flow CONTINUED — the next turn ran with tools";
+  EXPECT_EQ(lm.captured[1].find("PLAN mode"), std::string::npos);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(lf_find_gate_ask(events), nullptr)
+      << "NO ask record — the bypass never asks";
+  json_value_t* approved = lf_find_control(events, "plan-approved");
+  ASSERT_NE(approved, nullptr);
+  {
+    json_value_t* ap = lf_payload_of(approved);
+    ASSERT_NE(ap, nullptr);
+    json_value_t* a = json_get(ap, "auto");
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(json_type(a), JSON_BOOL);
+    EXPECT_EQ(json_as_bool(a), 1) << "the bypass approval is AUTO";
+  }
+  EXPECT_EQ(fr_count_type(events, "msg.append"), 2u)
+      << "the plan text (durable artifact) + the act content";
+  EXPECT_EQ(fr_count_type(events, "turn.end"), 2u);
+  json_value_t* first_end = NULL;
+  size_t turn_count = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "turn.end")) {
+      if (turn_count++ == 0) first_end = json_at(events, i);
+    }
+  }
+  ASSERT_NE(first_end, nullptr);
+  EXPECT_EQ(turn_count, 2u);
+  {
+    json_value_t* tp = lf_payload_of(first_end);
+    json_value_t* reason = json_get(tp, "reason");
+    ASSERT_NE(reason, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "completed")
+        << "the plan turn still closes its own envelope (completed)";
+  }
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 #endif /* SA_HAS_WDB */

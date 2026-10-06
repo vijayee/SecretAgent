@@ -121,6 +121,16 @@ typedef struct frame_engine_state_t {
   uint8_t model_retry_step;    /* 1 = the queued FRM_TURN is a model RETRY
                                   (skips the checks + the turn count, exactly
                                   like the old loop's same-array retry) */
+  /* The ladder's ACT marker (escalation spec §2.2, Task 5): 0 = the engine's
+     turns run PLAN-shaped (tools-null requests, the plan block, the close-
+     side gate); 1 = approved — turns run the ordinary free loop. Set at the
+     approval's consume (frame.c's FRM_ASK_REPLY) and at the BYPASS plan
+     turn's auto-approval; re-learned from the log every derive (the
+     consult: a plan-approved control record in the window flips it — spec
+     §2.4's durable-approval mechanism). Reset at the engine's start and end
+     (the model_retry_step lifecycle: a DEAD/restarted engine never carries
+     it — the next run's first derive re-consults the records). */
+  uint8_t ladder_act;
   uint8_t engine_failed;       /* the last terminal step failed (frame_run_loop's rc) */
   size_t live_children;        /* children admitted-and-STARTED, not yet resumed
                                   (Task 5; single-writer: the frame's dispatch
@@ -209,10 +219,17 @@ typedef struct frame_engine_state_t {
      _frame_engine_ask_clear (the same discipline as doom_last_code). The
      pyrt "ask_parked" publish flag is NOT this struct's: it is set at the
      verb's post-publish and cleared at the engine's consume paths
-     (_frame_engine_ask_clear included); the engine never sets it.
+     (_frame_engine_ask_clear included); the VERB's rule stands — the engine
+     never sets it for a CELL'S ask. EXCEPT the plan gate (escalation Task
+     5): the runtime-authored gate's post-commit park sets the same flag
+     (`_frame_engine_pyrt_park_set` — a LIVING cell's ask is refused while
+     it stands: one park at a time; a parked plan turn has no living cell).
 
-     plan_gate: 1 = the ladder's runtime-authored plan-gate ask (the
-     approval flow's owner); Task 5's consumer — always 0 in this slice. */
+     plan_gate: 1 = the ladder's runtime-authored plan-gate ask (escalation
+     spec §2.2; Task 5: the gate's own close composes the "ask" record, the
+     approve consume writes the {plan-approved} control record and flips
+     ladder_act); 0 = a generic agent.ask (the close's record carries plan
+     NULL). */
   struct {
     char* ask_id;              /* the engine-minted "%08x" key, OWNED (NULL =
                                   no park) */
@@ -662,6 +679,21 @@ int _frame_engine_ask_close_post(frame_t* f, json_value_t* result_payload);
    clears the pyrt publish flag (the parked pre-check's truth follows the
    engine: no engine park, no parked ask). NULL-safe, idempotent. */
 void _frame_engine_ask_clear(frame_t* f);
+
+/* The ask_id's mint (the FRM_ASK receipt's mechanism exposed — the root's
+   sid allocator, the same 8-hex shape the session sids use, one allocator:
+   no collisions; escalation Task 5's runtime-authored plan gate reaches it
+   from loop.c). out[9] carries the minted id or "" on a dead frame — the
+   caller refuses loudly instead of boxing a foreign/empty key. */
+void _frame_engine_ask_id_mint(frame_t* f, char out[9]);
+
+/* The pyrt publish flag's engine-side set (escalation Task 5): the plan
+   gate's post-commit park rides the SAME flag the ask verb's pre-check
+   reads (one park at a time — a living cell's ask is refused while a
+   runtime-authored gate stands; a parked plan turn has no living cell).
+   frame-internal because the runtime instance lives in frame_t's private
+   members. No-op on NULL / no-python builds. */
+void _frame_engine_pyrt_park_set(frame_t* f, uint8_t parked);
 
 /* The posted ask reply (the handlers' shape — the _frame_steer_post
    precedent): ONE FRM_ASK_REPLY {ask_id, decision, value} into the frame's

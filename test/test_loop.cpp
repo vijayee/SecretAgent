@@ -185,6 +185,14 @@ typedef struct scripted_model_t {
   model_backend_t base;
   std::vector<std::string>* replies;
   std::vector<std::string> captured;
+  /* The REQUEST's tools shape, one entry per call (the escalation ladder's
+     pin: a plan turn's request is tools-NULL — the JSON null VALUE; a
+     free/act turn's is the canned execute tool — the NULL POINTER, and a
+     carried array serializes):
+       "none-pointer" = NULL pointer (the canned execute tool);
+       "json-null"    = a JSON null VALUE (explicitly no tools);
+       else           = the serialized JSON array text. */
+  std::vector<std::string> tools_seen;
   frame_t* steer_frame;
   const char* steer_text;
   unsigned steer_on;
@@ -302,7 +310,6 @@ static std::string canned_content_body(const std::string& text) {
 static int scripted_complete(void* self, json_value_t* messages, json_value_t* tools,
                              char** raw_out, model_reply_t** reply_out,
                              char** error_out) {
-  (void)tools;
   (void)raw_out;
   *reply_out = NULL;
   *error_out = NULL;
@@ -313,6 +320,16 @@ static int scripted_complete(void* self, json_value_t* messages, json_value_t* t
   if (seen != NULL) {
     sm->captured.emplace_back(seen);
     free(seen);
+  }
+  /* The request's tools shape (the escalation ladder's pin). */
+  if (tools == NULL) {
+    sm->tools_seen.emplace_back("none-pointer");
+  } else if (json_type(tools) == JSON_NULL) {
+    sm->tools_seen.emplace_back("json-null");
+  } else {
+    char* ts = json_serialize(tools);
+    sm->tools_seen.emplace_back((ts != NULL) ? std::string(ts) : std::string());
+    free(ts);
   }
 
   /* Steering hook: run the loop on THIS thread — appending a user message
@@ -2802,6 +2819,224 @@ TEST(TestLoop, TestSteeringAfterRetryResetsTheStreak) {
         << "no breaker control fired — the steer's fresh input reset the "
            "streak across the failed turn";
   }
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+/* --- escalation Task 5: the plan-ask-act ladder + BYPASS (the python-gated
+       half — the gates' engine mechanics' pins whose act/free phases run
+       REAL cells; the python-free consume/close-shape pins live in
+       test_frame.cpp's ladder family) --------------------------------
+   These tests drive the loop's run loop (the parked gates) and pin the
+   request shape via scripted_model_t's tools_seen. */
+
+/* The ask record's needle (the plan gate's record shape): find the "ask"
+   record whose payload question == question (NULL when absent). */
+static json_value_t* find_plan_gate_ask(json_value_t* events) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "ask")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* q = (p != NULL) ? json_get(p, "question") : NULL;
+    if (q != NULL &&
+        strcmp(json_as_string(q), "Approve this plan?") == 0) {
+      return rec;
+    }
+  }
+  return NULL;
+}
+
+/* The FIRST control record whose payload kind == kind (NULL when absent). */
+static json_value_t* find_control_kind(json_value_t* events,
+                                       const char* kind) {
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "control")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    if (k != NULL && strcmp(json_as_string(k), kind) == 0) return rec;
+  }
+  return NULL;
+}
+
+TEST(TestLoop, TestFreeModeAsksOnlyWhenTheModelAsks) {
+  /* THE FREE-MODE PIN (escalation spec §2.1 — the byte-identity proof,
+     focused): a FREE frame with a model that never asks runs the ordinary
+     shape — the captured request carries the canned execute tool (the
+     NULL-pointer tools contract; NEVER a JSON-null no-tools request), no
+     plan block rides the system prompt, and no ask machinery lands. The
+     standing suite largely IS this test; this is the focused re-assertion
+     with the tools capture. */
+  py_agent_init();
+  frame_config_t cfg = test_config();   /* escalation_mode defaults free */
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "free frame", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  std::vector<std::string> replies = {
+      canned_cell_body("print('free run')"),
+      canned_content_body("free done")};
+  sm.replies = &replies;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(frame_is_done(f), 1);
+  ASSERT_EQ(sm.captured.size(), 2u);
+  ASSERT_EQ(sm.tools_seen.size(), 2u);
+  EXPECT_EQ(sm.tools_seen[0], "none-pointer")
+      << "a FREE turn's request carries the canned execute tool";
+  EXPECT_EQ(sm.tools_seen[1], "none-pointer");
+  EXPECT_EQ(sm.captured[0].find("PLAN mode"), std::string::npos)
+      << "no plan block rides a free turn's system prompt";
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(find_plan_gate_ask(events), nullptr)
+      << "no runtime-authored gate ask exists in free mode";
+  EXPECT_EQ(find_control_kind(events, "plan-requested"), nullptr);
+  EXPECT_EQ(find_control_kind(events, "plan-approved"), nullptr);
+  EXPECT_EQ(count_type(events, "ask"), 0u)
+      << "never asked: a free frame with a non-asking model carries no ask "
+         "record";
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestPlanAskActApprovedActRunsRealCells) {
+  /* The full ladder over REAL cells (the tools-null pins live in
+     test_frame.cpp's python-free family): plan turn → parked gate; the
+     approve's ACT turn runs a REAL tool round — the act request carries
+     `execute` again — and the final content turn completes the frame. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "ladder drive", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  std::vector<std::string> replies = {
+      canned_content_body(
+          "Plan: 1. measure the beam 2. cut once 3. report the result"),
+      canned_cell_body("print('act cell ran')"),
+      canned_content_body("ladder complete")};
+  sm.replies = &replies;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 2) << "the plan turn parks at the gate";
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  std::string ask_id;
+  json_value_t* ask_rec = find_plan_gate_ask(events);
+  ASSERT_NE(ask_rec, nullptr);
+  {
+    json_value_t* p = payload_of(ask_rec);
+    json_value_t* id = json_get(p, "askId");
+    ASSERT_NE(id, nullptr);
+    ask_id = json_as_string(id);
+    EXPECT_EQ(ask_id.size(), 8u);
+    json_value_t* plan_v = json_get(p, "plan");
+    ASSERT_NE(plan_v, nullptr);
+    EXPECT_EQ(json_type(plan_v), JSON_STRING)
+        << "the gate ask carries the plan text (a generic ask's is null)";
+    EXPECT_EQ(std::string(json_as_string(plan_v)),
+              "Plan: 1. measure the beam 2. cut once 3. report the result")
+        << "the plan text below the bridge cap rides verbatim";
+    EXPECT_EQ(sm.tools_seen[0], "json-null")
+        << "the plan turn's request was built tools-NULL";
+    EXPECT_NE(sm.captured[0].find("PLAN mode"), std::string::npos)
+        << "the plan block rode the system prompt";
+  }
+  json_value_destroy(events);
+
+  EXPECT_EQ(frame_ask_reply(f, ask_id.c_str(), 0, "Approve"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0) << "the act phase ran to normal completion";
+
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  /* The act turn's REAL tool round: the cell audited + ran + its result
+     rode the next derive. */
+  EXPECT_GE(count_type(events, "cell.run"), 1u);
+  EXPECT_GE(count_type(events, "cell.result"), 1u);
+  ASSERT_EQ(sm.captured.size(), 3u);
+  ASSERT_EQ(sm.tools_seen.size(), 3u);
+  EXPECT_EQ(sm.tools_seen[1], "none-pointer")
+      << "the act request carries `execute` again";
+  /* The plan block left the derive the moment the approval flipped
+     ladder_act (in memory) — the durable consult's record rides too. */
+  EXPECT_EQ(sm.captured[1].find("PLAN mode"), std::string::npos);
+  EXPECT_EQ(sm.tools_seen[2], "none-pointer")
+      << "the act turn's final content call stays free-acting";
+  EXPECT_EQ(frame_is_done(f), 1);
+  json_value_destroy(events);
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestBypassAskVerbRefusesWithoutAnAnswerer) {
+  /* DANGEROUS mode's ask verb (escalation spec §2.3): an `agent.ask` under
+     bypass refuses AS DATA — the cell's result carries the refusal text —
+     and no park can ever exist in bypass. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_BYPASS;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "bypass drive", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  scripted_model_t sm = {};
+  sm.base.complete = scripted_complete;
+  std::vector<std::string> replies = {
+      canned_content_body("Plan: do the thing, then the other thing"),
+      canned_cell_body(
+          "import actor\n"
+          "print(actor.ask('which way?', ['left', 'right']))"),
+      canned_content_body("bypass complete")};
+  sm.replies = &replies;
+  sm.fallback = NULL;
+  frame_set_model_backend(f, &sm.base);
+
+  /* NO park anywhere: the plan turn auto-approves and the flow continues to
+     the ask verb's cell, whose refusal is data, then completes. */
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(find_plan_gate_ask(events), nullptr);
+  json_value_t* approved = find_control_kind(events, "plan-approved");
+  ASSERT_NE(approved, nullptr);
+  {
+    json_value_t* p = payload_of(approved);
+    json_value_t* a = json_get(p, "auto");
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(json_type(a), JSON_BOOL) << "the bypass approval carries auto";
+    EXPECT_EQ(json_as_bool(a), 1) << "the bypass approval is AUTO";
+  }
+  /* The refusal is the cell's captured data (the ask verb's return the cell
+     printed). */
+  bool saw_refusal = false;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "cell.result")) continue;
+    json_value_t* p = payload_of(rec);
+    json_value_t* t = json_get(p, "text");
+    if (t != NULL && strstr(json_as_string(t),
+                            "escalation bypassed: asked questions have no "
+                            "answerer") != NULL) {
+      saw_refusal = true;
+    }
+  }
+  EXPECT_TRUE(saw_refusal) << "the ask verb's bypass refusal is data";
   json_value_destroy(events);
   frame_destroy(f);
   wave_db_close(db);

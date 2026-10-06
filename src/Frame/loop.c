@@ -207,6 +207,17 @@ static const char SA_LOOP_INSTRUCTION[] =
     "Finish the frame by calling actor.report inside your last cell (a "
     "completion declaration), or simply by answering WITHOUT a tool call.\n";
 
+/* The PLAN turn's instruction (escalation spec §2.2; Task 5): ONE bounded
+   constant — byte-stable per mode (the cache-stable prefix's rule) — riding
+   the system prompt of every plan turn (after the persona group, or ahead
+   of the base instruction when no persona rides). The plan turn is
+   tools-null: the model's reply text IS the plan; the close composes the
+   approval gate (the plan_gate ask, or the bypass's auto-approval). */
+static const char SA_LOOP_PLAN_INSTRUCTION[] =
+    "You are in PLAN mode: do not execute anything yet. Propose a concrete "
+    "plan of steps for the goal instead; your reply IS the plan, and the "
+    "owner approves or rejects it before any cell can run.\n";
+
 /* The frame's tool-id surface, as persona_compose (persona spec §2 item 4)
    reads it: the tool-conditional guidance entries attach on these ids.
    Today's surface is the model layer's ONE canned `execute` tool (loop.c's
@@ -358,9 +369,23 @@ static void _loop_flush_results(json_value_t* out, char** ring, size_t* n) {
   *n = 0;
 }
 
+/* The ladder's gating read (escalation spec §2.2/§2.3; Task 5): 1 = THIS
+   turn runs PLAN-shaped — a tools-null model request, the plan-instruction
+   block riding the system prompt, and the close-side gate composing in the
+   content path. FREE never gates (the byte-identity proof: every standing
+   pin's mode); PLAN_ASK_ACT/BYPASS gate every turn until the engine's
+   ladder_act flips (the approval's consume or the bypass's auto-approval,
+   re-learned from the log every derive — spec §2.4's consult). */
+static uint8_t _loop_ladder_gating(frame_t* f, const frame_engine_state_t* e) {
+  return (_frame_escalation_mode(f) != (unsigned)FRAME_ESCALATION_FREE &&
+          e != NULL && e->ladder_act == 0)
+             ? 1 : 0;
+}
+
 static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t nsnaps,
                                   const loop_report_t* reports, size_t nreports,
-                                  const char* persona_prefix) {
+                                  const char* persona_prefix,
+                                  const char* plan_block) {
   loop_sb_t sb;
   _loop_sb_init(&sb);
   if (persona_prefix != NULL) {
@@ -375,9 +400,17 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
        matrix row 36: the persona re-composes every derive, and a record
        that carries no {CURRENT_DATETIME} stamps nothing). */
     _loop_sb_puts(&sb, persona_prefix);
+    if (plan_block != NULL) {
+      _loop_sb_puts(&sb, plan_block);   /* the plan block rides AFTER the
+                                           persona group */
+    }
   } else {
-    _loop_sb_puts(&sb, SA_LOOP_INSTRUCTION);   /* the NO-PERSONA path: today's
-                                                  bytes, untouched */
+    if (plan_block != NULL) {
+      /* The ladder's plan turn without a persona: the plan block rides
+         BEFORE the base instruction (escalation Task 5). */
+      _loop_sb_puts(&sb, plan_block);
+    }
+    _loop_sb_puts(&sb, SA_LOOP_INSTRUCTION);   /* today's bytes, untouched */
   }
 
   const char* goal = _frame_goal(f);
@@ -415,9 +448,12 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
    engine destroys after the model call; NULL on failure (the caller logs a
    control event). `events` = the derive's parsed DOM (consumed).
    `persona_prefix` = the composed persona GROUP (borrowed; NULL = none —
-   every persona-less frame's prompts stay byte-identical). */
+   every persona-less frame's prompts stay byte-identical).
+   `plan_block` = the ladder's plan instruction (borrowed; NULL in every
+   free-acting turn — the standing prompts stay byte-identical). */
 static json_value_t* _loop_project(frame_t* f, json_value_t* events,
-                                   const char* persona_prefix) {
+                                   const char* persona_prefix,
+                                   const char* plan_block) {
   if (events == NULL || json_type(events) != JSON_ARRAY) {
     json_value_destroy(events);
     return NULL;
@@ -463,7 +499,7 @@ static json_value_t* _loop_project(frame_t* f, json_value_t* events,
     return NULL;
   }
   char* sys_text = _loop_system_content(f, snaps, nsnaps, reports, nreports,
-                                        persona_prefix);
+                                        persona_prefix, plan_block);
   json_value_t* sys = json_new_object();
   json_object_set(sys, "role", json_new_string("system"));
   json_object_set(sys, "content", json_new_string(sys_text));
@@ -796,6 +832,10 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
   e->store_corr = 0;
   e->turn_cell_corr = 0;
   e->model_retry_step = 0;
+  /* The ladder's ACT marker dies with the engine (the model_retry_step
+     lifecycle: a DEAD engine never carries it — a restart's first derive
+     re-consults the log's plan-approved control record, spec §2.4). */
+  e->ladder_act = 0;
   /* The wake latch resets with the engine (a dying engine's queued
      continuation is either consumed or dead-queued — a resumed run must
      wake on its own inputs, never inherit a stale one). */
@@ -1168,12 +1208,223 @@ static void _loop_tool_path(frame_t* f, frame_engine_state_t* e,
   _loop_post_cell_run(f, e, reply);
 }
 
+/* The engine's turn-finish main payload for a plan turn's close: the
+   assistant msg.append (the plan text — the content path's ordinary main
+   record), or the empty-turn control when the reply carried no content.
+   Both mirrors of `_frame_engine_finish_post`'s main-record compose (the
+   shape the derive projects exactly the same way). */
+static json_value_t* _loop_plan_main_payload(const char* content) {
+  if (content == NULL) {
+    /* The empty-turn control event (the exact payload _loop_control
+       composes; the standing finish shape). */
+    json_value_t* c = json_new_object();
+    if (c == NULL) return NULL;
+    json_object_set(c, "kind", json_new_string("empty-turn"));
+    json_object_set(c, "text", json_new_null());
+    return c;
+  }
+  json_value_t* m = json_new_object();
+  if (m == NULL) return NULL;
+  json_object_set(m, "role", json_new_string("assistant"));
+  json_object_set(m, "content", json_new_string(content));
+  return m;
+}
+
+/* The ladder's control payload ({kind, auto} + the standing control shape's
+   null-text key). kind "plan-requested" rides the PLAN gate's close
+   (auto null — no decision happened); "plan-approved" rides the approval
+   consume (auto false) and the BYPASS close (auto true) — the spec §2.2/
+   §2.3 durable phase transitions. NULL on OOM — loud. */
+static json_value_t* _loop_plan_control_payload(const char* kind, int auto_ok,
+                                                uint8_t with_auto) {
+  json_value_t* c = json_new_object();
+  if (c == NULL) return NULL;
+  json_object_set(c, "kind", json_new_string(kind));
+  if (with_auto != 0) {
+    json_object_set(c, "auto", json_new_bool(auto_ok));
+  }
+  return c;
+}
+
+/* The ladder's runtime-authored plan gate (escalation spec §2.2; Task 5):
+   ONE fire-and-post batch — [step.start, control{plan-requested},
+   msg.append(plan text), the "ask" record {question, options, plan:<the
+   cap-capped text>}, step.end, turn.end{blocked}] — the FINISH batch's
+   rider-group shape (this batch is the plan content turn's whole cycle) with
+   the gate's records in it; the ask and its turn's close can never split
+   across a crash boundary. The ask parks BEFORE the compose (the gate is
+   runtime-authored: corr 0, plan_gate 1, the question/options the engine
+   owns); on rc == 0 the engine rests in FRAME_PHASE_ASK and the pyrt park
+   flag rides (a LIVING cell would be refused — one park at a time; a parked
+   plan turn has none). A refusal leaves NOTHING behind (the batch's
+   pre-allocation rolled back — the standing fire-and-post discipline) and
+   the caller clears the half-boxed ask and fails the turn loud: the parked
+   state's truth rides committed records ONLY.
+   content = the plan turn's model text (borrowed; NULL = the empty-turn
+   control, the finishing shape). Returns the pre-post rc (0 = posted). */
+static int _loop_plan_gate_post(frame_t* f, frame_engine_state_t* e,
+                                const char* content) {
+  /* The park: the mint (root allocator — no collisions), then the OWNED
+     strings (the FRM_ASK receipt's boxing shape; corr is 0 — no bridge
+     reply sink authored this ask). */
+  char minted[9];
+  _frame_engine_ask_id_mint(f, minted);
+  if (minted[0] != '\0') e->pending_ask.ask_id = strdup(minted);
+  e->pending_ask.question = strdup("Approve this plan?");
+  e->pending_ask.options =
+      (char**)get_clear_memory(2 * sizeof(char*));
+  e->pending_ask.noptions = 2;
+  if (e->pending_ask.options != NULL) {
+    e->pending_ask.options[0] = strdup("Approve");
+    e->pending_ask.options[1] = strdup("Reject");
+  }
+  if (e->pending_ask.ask_id == NULL || e->pending_ask.question == NULL ||
+      e->pending_ask.options == NULL || e->pending_ask.options[0] == NULL ||
+      e->pending_ask.options[1] == NULL) {
+    log_error("loop: out of memory boxing the plan gate's ask at '%s'",
+              frame_sid(f));
+    _frame_engine_ask_clear(f);
+    return -1;
+  }
+  e->pending_ask.plan_gate = 1;
+
+  /* The ask record's plan renders the content CAP-CAPPED (an OUTPUT render —
+     the budget table's bridge value cap + the truncate-marker helper; an
+     oversized plan asks in the marked shape, never silently). */
+  char* plan_capped = NULL;
+  uint8_t plan_trunc = 0;
+  budget_truncate_with_marker((content != NULL) ? content : "",
+                              SA_BUDGET_BRIDGE_VALUE_BYTES, &plan_capped,
+                              &plan_trunc);
+  if (plan_capped == NULL) {
+    log_error("loop: out of memory rendering the plan gate's plan text at "
+              "'%s'", frame_sid(f));
+    _frame_engine_ask_clear(f);
+    return -1;
+  }
+
+  json_value_t* control = _loop_plan_control_payload("plan-requested", 0, 0);
+  json_value_t* main = _loop_plan_main_payload(content);
+  json_value_t* ask = json_new_object();
+  json_value_t* options = (ask != NULL) ? json_new_array() : NULL;
+  json_value_t* step_start =
+      lifecycle_step_json(e->turn_counter, 1);
+  json_value_t* step_end =
+      lifecycle_step_json(e->turn_counter, 1);
+  json_value_t* turn_end =
+      lifecycle_turn_end_json(e->turn_counter, LIFE_REASON_BLOCKED, NULL);
+  if (ask != NULL) {
+    if (options != NULL) {
+      json_object_set(ask, "kind", json_new_string("ask"));
+      json_object_set(ask, "askId",
+                      json_new_string(e->pending_ask.ask_id));
+      json_object_set(ask, "question",
+                      json_new_string(e->pending_ask.question));
+      for (size_t i = 0; i < e->pending_ask.noptions; i++) {
+        json_array_append(options,
+                          json_new_string(e->pending_ask.options[i]));
+      }
+      json_object_set(ask, "options", options);   /* takes the value */
+      json_object_set(ask, "plan",
+                      (plan_capped[0] != '\0')
+                          ? json_new_string(plan_capped)
+                          : json_new_null());
+    } else {
+      /* options OOM'd: the half-composed ask record is dropped; the failure
+         below clears the park. */
+      json_value_destroy(ask);
+      ask = NULL;
+    }
+  }
+  if (control == NULL || main == NULL || step_start == NULL ||
+      step_end == NULL || turn_end == NULL || ask == NULL) {
+    /* The destroyers are NULL-tolerant; the parked ask's OWNED strings (and
+       any options array living inside `ask`) die with the records here. */
+    json_value_destroy(control);
+    json_value_destroy(main);
+    json_value_destroy(ask);
+    json_value_destroy(step_start);
+    json_value_destroy(step_end);
+    json_value_destroy(turn_end);
+    free(plan_capped);
+    log_error("loop: out of memory composing the plan gate's close at '%s'",
+              frame_sid(f));
+    _frame_engine_ask_clear(f);
+    return -1;
+  }
+  const char* names[6] = {LIFE_EVENT_STEP_START, "control",
+                          (content != NULL) ? "msg.append" : "control",
+                          "ask", LIFE_EVENT_STEP_END, LIFE_EVENT_TURN_END};
+  json_value_t* payloads[6] = {step_start, control, main, ask, step_end,
+                               turn_end};
+  int rc = _frame_event_batch_post_fire(f, names, payloads, 6, "plan gate");
+  free(plan_capped);   /* the record owned its own copy */
+  if (rc == 0) {
+    /* The close POSTED — the compose-time facts follow and the engine PARKS
+       (the same shape as FRAME_PHASE_MODEL): the driver breaks on the park;
+       a reply's FRM_TURN reposts. The pyrt park flag rides post-commit (a
+       living cell would be refused — no second park can exist). */
+    e->turn_open = 0;
+    e->step_open = 0;
+    e->phase = FRAME_PHASE_ASK;
+    _frame_engine_pyrt_park_set(f, 1);
+  }
+  return rc;
+}
+
+/* The BYPASS plan turn's auto-approval close (escalation spec §2.3; Task 5):
+   the plan turn still runs and its plan text stays a durable audit artifact,
+   but the gate AUTO-APPROVES — ONE fire-and-post batch [step.start,
+   msg.append(plan text), control{kind "plan-approved", auto true}, step.end,
+   turn.end{completed}], NEVER the finish trip (the status put and the END
+   rule stay a later content turn's business — this close must NOT end the
+   engine). A refusal leaves the open tail standing (the caller fails the
+   turn loud). Returns the pre-post rc (0 = posted; the compose-time flags
+   cleared). */
+static int _loop_bypass_plan_close_post(frame_t* f, frame_engine_state_t* e,
+                                        const char* content) {
+  json_value_t* control = _loop_plan_control_payload("plan-approved", 1, 1);
+  json_value_t* main = _loop_plan_main_payload(content);
+  json_value_t* step_start = lifecycle_step_json(e->turn_counter, 1);
+  json_value_t* step_end = lifecycle_step_json(e->turn_counter, 1);
+  json_value_t* turn_end =
+      lifecycle_turn_end_json(e->turn_counter, LIFE_REASON_COMPLETED, NULL);
+  if (control == NULL || main == NULL || step_start == NULL ||
+      step_end == NULL || turn_end == NULL) {
+    json_value_destroy(control);
+    json_value_destroy(main);
+    json_value_destroy(step_start);
+    json_value_destroy(step_end);
+    json_value_destroy(turn_end);
+    log_error("loop: out of memory composing the bypass plan's close at '%s'",
+              frame_sid(f));
+    return -1;
+  }
+  const char* names[5] = {LIFE_EVENT_STEP_START,
+                          (content != NULL) ? "msg.append" : "control",
+                          "control", LIFE_EVENT_STEP_END,
+                          LIFE_EVENT_TURN_END};
+  json_value_t* payloads[5] = {step_start, main, control, step_end, turn_end};
+  int rc = _frame_event_batch_post_fire(f, names, payloads, 5,
+                                        "bypass plan close");
+  if (rc == 0) {
+    e->turn_open = 0;
+    e->step_open = 0;
+  }
+  return rc;
+}
+
 /* The content path (no tool call: the turn ends): msg.append — or, on an
    empty assistant turn, the empty-turn control event — and, when the turn
    ENDS the frame, the meta/status=done put in ONE atomic FRAME_STORE_FINISH
    batch. The reply takes the END rule: live children pending → the CHILDREN
    yield (status stays "running"); a child with none → the quiet-completion
-   terminate; a top frame → the engine ends (done rode the batch). */
+   terminate; a top frame → the engine ends (done rode the batch).
+   THE LADDER's fork (escalation spec §2.2/§2.3; Task 5): a plan turn
+   (gating — PLAN_ASK_ACT/BYPASS pre-approval) never reaches the finish
+   (which would END the frame): its close composes the PHASE TRANSITION
+   instead — the runtime-authored gate ask (park) or the bypass's
+   auto-approval (continue). */
 static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
                                model_reply_t* reply) {
   /* The content is read BEFORE the reply dies (the finish batch composes its
@@ -1181,6 +1432,41 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
      pointer), and the reply is destroyed after the batch composing used it. */
   const char* content =
       (reply->content != NULL && reply->content[0] != '\0') ? reply->content : NULL;
+  /* THE LADDER'S GATE (escalation spec §2.2/§2.3): a plan turn's close
+     composes the PHASE TRANSITION, never the finish (which would END the
+     frame — a plan approval must keep the engine for its act phase). */
+  uint8_t gating = _loop_ladder_gating(f, e);
+  if (gating != 0) {
+    unsigned mode = _frame_escalation_mode(f);
+    if (mode == (unsigned)FRAME_ESCALATION_BYPASS) {
+      int brc = _loop_bypass_plan_close_post(f, e, content);
+      model_reply_destroy(reply);
+      if (brc != 0) {
+        _loop_fail(f, e, "commit-error", "the bypass plan close was refused");
+        return;
+      }
+      /* The auto-approval committed: the ladder moves to ACT and the engine
+         CONTINUES — the FRM_TURN repost carries the continuation_queued
+         latch (the parked-ask reply's idiom). */
+      e->ladder_act = 1;
+      (void)_loop_post_turn(f);
+      return;
+    }
+    int grc = _loop_plan_gate_post(f, e, content);
+    model_reply_destroy(reply);
+    if (grc == 0) {
+      return;   /* parked (FRAME_PHASE_ASK set post-commit by the composer) */
+    }
+    /* The close was refused pre-post (logged; the seq range rolled back —
+       the records committed NOTHING): the half-boxed ask dies with it and
+       the turn fails loud — no half-parked state (the park's truth rides
+       committed records only, spec §5). */
+    _frame_engine_ask_clear(f);
+    _loop_fail(f, e, "commit-error", "the plan gate close was refused");
+    return;
+  }
+  /* The standing finish path (free/act turns — the ordinary shape,
+     byte-identical). */
   /* The status put rides the batch ONLY when this turn ends the frame: a
      content turn while live children are pending yields at the finish reply
      (status stays "running"; the completing end writes the put — this batch
@@ -1300,6 +1586,17 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
   }
 
   if (reply->tool_code != NULL) {
+    /* THE LADDER's plan turn refuses tool-call replies (escalation spec
+       §2.2; Task 5): the request ran tools-NULL (no tool surface was
+       offered), so a tool-call reply is an unexpected shape at a plan turn.
+       Loud — `_loop_fail` ends the turn error (the control's wording rides
+       the failure close); a LATER run over this gate-free state re-enters
+       plan (ladder_act never flipped — nothing happened). */
+    if (_loop_ladder_gating(f, e) != 0) {
+      _loop_fail(f, e, "plan-mode", "the model sent tool calls in a plan turn");
+      model_reply_destroy(reply);
+      return;
+    }
     _loop_tool_path(f, e, reply);
     return;
   }
@@ -1310,10 +1607,20 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
    the persona-less derive and the persona trip's reply): project with the
    engine's persona prefix (NULL = the built-in base alone, today's exact
    bytes) and take the submit/complete path. CONSUMES `events` on every
-   path. */
+   path.
+   THE LADDER's tools shape (escalation spec §2.2; Task 5): a PLAN turn's
+   request is built tools-NULL — the tools argument is a JSON NULL VALUE
+   (model.c's `_model_request_body` no-tools shape: both `tools` and
+   `tool_choice` are OMITTED from the request document — the refine slice's
+   no-tools contract, reused verbatim) and the plan instruction rides the
+   system prompt. The NULL POINTER keeps the canned `execute` tool (every
+   free/act turn's unchanged bytes). */
 static void _loop_engine_model_path(frame_t* f, frame_engine_state_t* e,
                                     json_value_t* events) {
-  json_value_t* messages = _loop_project(f, events, e->persona_prefix);   /* consumes the DOM */
+  uint8_t gating = _loop_ladder_gating(f, e);
+  json_value_t* messages =
+      _loop_project(f, events, e->persona_prefix,
+                    (gating != 0) ? SA_LOOP_PLAN_INSTRUCTION : NULL);   /* consumes the DOM */
   if (messages == NULL) {
     log_error("loop: the projection failed at '%s'", frame_sid(f));
     _loop_fail(f, e, "derive-error", NULL);
@@ -1327,6 +1634,12 @@ static void _loop_engine_model_path(frame_t* f, frame_engine_state_t* e,
     json_value_destroy(messages);
     return;
   }
+
+  /* The request's tools: NULL POINTER = the canned execute tool (today);
+     a JSON NULL VALUE = explicitly no tools at all (gating plan turns).
+     The value dies right after the submit/complete — model.h's contract
+     says the backend copies everything it needs before returning. */
+  json_value_t* tools_arg = (gating != 0) ? json_new_null() : NULL;
 
   if (mb->submit != NULL) {
     /* The ASYNC shape (Task 4's http submit): rc 0 → the sink fires EXACTLY
@@ -1343,8 +1656,9 @@ static void _loop_engine_model_path(frame_t* f, frame_engine_state_t* e,
        a settle returning 1 means the record is GONE and nothing of `f`/`e`
        may follow that return. */
     _frame_engine_submit_begin(f);
-    int src = mb->submit(mb, messages, NULL, _loop_model_sink, f);
+    int src = mb->submit(mb, messages, tools_arg, _loop_model_sink, f);
     json_value_destroy(messages);
+    json_value_destroy(tools_arg);
     if (_frame_engine_submit_settle(f) != 0) return;
     if (src != 0) {
       /* Rejected before any I/O: the sink will never fire, so THIS caller
@@ -1370,8 +1684,9 @@ static void _loop_engine_model_path(frame_t* f, frame_engine_state_t* e,
      model-error retry re-derives; nothing retains it). */
   model_reply_t* reply = NULL;
   char* err = NULL;
-  int crc = mb->complete(mb, messages, NULL, NULL, &reply, &err);
+  int crc = mb->complete(mb, messages, tools_arg, NULL, &reply, &err);
   json_value_destroy(messages);
+  json_value_destroy(tools_arg);
   /* The sync drain has NO status facts: a scripted sync backend speaks no
      HTTP — complete()'s rc is its own contract, not a status code — so the
      arrival passes 0/0 = absent both ways. The guards table then reads the
@@ -1610,8 +1925,26 @@ static void _loop_engine_on_derive(frame_t* f, frame_engine_state_t* e,
     json_value_t* rec = json_at(events, i);
     if (rec == NULL) continue;
     json_value_t* type_v = json_get(rec, "type");
-    if (type_v == NULL ||
-        strcmp(json_as_string(type_v), "msg.append") != 0) {
+    if (type_v == NULL) continue;
+    if (strcmp(json_as_string(type_v), "msg.append") != 0) {
+      /* --- the ladder's approval consult (escalation spec §2.4; Task 5) --
+         The derive is the ONE stateless re-deriver: a plan-approved control
+         record in the scanned window flips the engine to ACT — the
+         approval's lifetime is the record (durable), so a resumed run
+         re-enters act without re-asking. A plan-requested control (a
+         standing, UNapproved gate) does NOT set it. WINDOW NOTE (the
+         recorded safe default): the derive is bounded to the newest
+         SA_FRAME_DEBUG_MAX_EVENTS records — a frame whose approval scrolled
+         past the window re-gates, and re-asking is the SAFE default. */
+      if (strcmp(json_as_string(type_v), "control") == 0) {
+        json_value_t* payload = json_get(rec, "payload");
+        json_value_t* kind = (payload != NULL) ? json_get(payload, "kind")
+                                               : NULL;
+        if (kind != NULL &&
+            strcmp(json_as_string(kind), "plan-approved") == 0) {
+          e->ladder_act = 1;
+        }
+      }
       continue;
     }
     json_value_t* payload = json_get(rec, "payload");
@@ -1893,6 +2226,9 @@ int _frame_engine_start(frame_t* f) {
   e->turns_issued = 0;
   e->model_retries = 0;
   e->model_retry_step = 0;
+  e->ladder_act = 0;   /* the ladder re-consults the log's control records on
+                          this run's FIRST derive (spec §2.4) — a restarted
+                          engine never inherits the act phase in memory */
   atomic_store(&e->continuation_queued, 0);   /* the wake latch is a per-run
                                    knob: a restart wakes on its own inputs */
   e->engine_failed = 0;

@@ -684,7 +684,17 @@ static PyObject* _py_agent_ask(PyObject* self, PyObject* args) {
     return NULL;
   }
 
-  /* The parked pre-check FIRST (one ask per frame at a time): the py pointer
+  /* The bypass pre-check FIRST (escalation spec §2.3): a bypassed runtime's
+     asks have no answerer — publishing one would park the frame forever, so
+     the refusal is data. Order is chosen first-for-clarity, not out of
+     necessity (a bypassed runtime can never park, so the two flags never
+     stand together). NULL (a non-pyrt thread) means neither can stand. */
+  if (pyrt_bypass(self_pyrt) != 0) {
+    return PyUnicode_FromString(
+        "escalation bypassed: asked questions have no answerer");
+  }
+
+  /* The parked pre-check (one ask per frame at a time): the py pointer
      comes from pyrt.c's TLS — the SAME accessor the emit path's owner lookup
      rides, never a duplicated TLS read. NULL (a non-pyrt thread) means no
      park can stand (and none can be set at publish either). */

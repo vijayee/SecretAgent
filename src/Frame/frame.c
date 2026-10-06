@@ -2534,9 +2534,10 @@ int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
 }
 
 /* The parked ask's RECORD compose (escalation spec §1.3): the "ask" event's
-   payload {kind, askId, question, options[], plan} — plan is JSON null in
-   this slice (a generic agent.ask carries no plan text; the ladder's
-   runtime-authored gate fills it). The parked ask's question/options are
+   payload {kind, askId, question, options[], plan} — plan is JSON null here:
+   this composer serves the CELL closes (a generic agent.ask carries no plan
+   text); the ladder's runtime-authored plan gate composes its OWN record in
+   loop.c (with the turn's plan text). The parked ask's question/options are
    BORROWED here (the park owns the strings). NULL on OOM — loud. */
 static json_value_t* _frame_ask_record_payload(frame_t* f,
                                                const frame_engine_state_t* e) {
@@ -2658,6 +2659,32 @@ void _frame_engine_ask_clear(frame_t* f) {
   f->engine.pending_ask.plan_gate = 0;
 #ifdef SA_HAS_PYTHON
   if (f->pyrt != NULL) pyrt_ask_parked_set(f->pyrt, 0);
+#endif
+}
+
+/* The ask_id's mint (frame_internal.h's contract; escalation Task 5): the
+   same root allocator + 8-hex shape the FRM_ASK receipt uses — the ladder's
+   runtime-authored gate asks share ONE key space, no collisions. */
+void _frame_engine_ask_id_mint(frame_t* f, char out[9]) {
+  if (f == NULL || f->root == NULL || out == NULL) {
+    log_error("frame: the ask_id mint on a dead frame or no output buffer");
+    if (out != NULL) out[0] = '\0';
+    return;
+  }
+  _frame_sid_generate(f->root, out);
+}
+
+/* The pyrt publish flag's engine-side set (frame_internal.h's contract; the
+   plan gate's post-commit park). The flag lives on the frame's OWN runtime
+   (frame_t's private members — loop.c never touches them); a no-python
+   build has none. */
+void _frame_engine_pyrt_park_set(frame_t* f, uint8_t parked) {
+#ifdef SA_HAS_PYTHON
+  if (f == NULL || f->pyrt == NULL) return;
+  pyrt_ask_parked_set(f->pyrt, parked);
+#else
+  (void)f;
+  (void)parked;
 #endif
 }
 
@@ -3689,6 +3716,16 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
           frm_cell_payload_destroy(cp);
           break;
         }
+        /* The ladder's mode flag rides the runtime at ITS creation point
+           (escalation spec §2.3): the pyrt instance is per-frame and lazily
+           created HERE — a frame_start/resume-time set would land on a NULL
+           runtime, and both create and resume funnel through this lazy
+           boot, so this is the ONE writer of the verb's bypass view.
+           BYPASS's agent.ask refuses as data ("asked questions have no
+           answerer"); FREE/PLAN_ASK_ACT leave the flag clear. */
+        if (_frame_escalation_mode(f) == FRAME_ESCALATION_BYPASS) {
+          pyrt_bypass_set(f->pyrt, 1);
+        }
       }
       f->cell_corr = cp->corr;
       f->cell_status = 0;
@@ -4271,22 +4308,53 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
       /* The durable resolution's words (the standing decision law: a reject
          is data the model reads — the generic verb's wording on an empty
          refusal; the ladder's default wording is the plan-gate slice's). */
+      uint8_t plan_gate = f->engine.pending_ask.plan_gate;
       const char* decision_name =
           (rp->decision == 0) ? "answer" : "reject";
       const char* content;
       if (rp->decision == 0) {
-        content = rp->value;
+        if (rp->value != NULL && rp->value[0] != '\0') {
+          content = rp->value;    /* the answer text verbatim */
+        } else {
+          /* The plan gate's belt — an empty answer renders "Approved."
+             (the boundary refuses one; the consume never relies on it).
+             A generic ask's empty answer never reaches here (validation
+             refused it above). */
+          content = "Approved.";
+        }
       } else if (rp->value != NULL && rp->value[0] != '\0') {
         content = rp->value;   /* reject WITH text: the objection rides verbatim */
       } else {
-        content = "Owner declined.";
+        content = (plan_gate != 0)
+                      ? "Plan rejected: revise and re-propose"   /* the ladder's
+                                                                    default wording
+                                                                    (spec §2.2) */
+                      : "Owner declined.";
       }
       json_value_t* reply_payload = _frame_ask_reply_payload_compose(
           rp->ask_id, decision_name, rp->value);
       json_value_t* append_payload = _frame_msg_append_payload("user", content);
-      if (reply_payload == NULL || append_payload == NULL) {
+      /* THE LADDER'S APPROVE (escalation spec §2.2, Task 5): a plan-gate
+         ANSWER lands the phase transition as a durable control record
+         {kind "plan-approved", auto false} — THIRD record in the SAME batch
+         (ask.reply, control, msg.append; the derive's consult reads the
+         control from the log on every derive — spec §2.4). A REJECT writes
+         NO control record (the ladder revisits plan: no transition
+         happened). */
+      json_value_t* control_payload = NULL;
+      if (plan_gate != 0 && rp->decision == 0) {
+        control_payload = json_new_object();
+        if (control_payload != NULL) {
+          json_object_set(control_payload, "kind",
+                          json_new_string("plan-approved"));
+          json_object_set(control_payload, "auto", json_new_bool(0));
+        }
+      }
+      if (reply_payload == NULL || append_payload == NULL ||
+          (control_payload == NULL && plan_gate != 0 && rp->decision == 0)) {
         json_value_destroy(reply_payload);
         json_value_destroy(append_payload);
+        json_value_destroy(control_payload);
         /* The park stands (nothing was posted) — the same reply lands again
            once the compose succeeds. */
         log_error("frame: out of memory composing the ask reply's records at "
@@ -4295,16 +4363,35 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
         frm_ask_reply_payload_destroy(rp);
         break;
       }
-      const char* names[2] = {"ask.reply", "msg.append"};
-      json_value_t* payloads[2] = {reply_payload, append_payload};
-      int rc = _frame_event_batch_post_fire(f, names, payloads, 2, "ask reply");
+      const char* names[3];
+      json_value_t* payloads[3];
+      size_t nops = 0;
+      names[nops] = "ask.reply";
+      payloads[nops++] = reply_payload;
+      if (control_payload != NULL) {
+        names[nops] = "control";
+        payloads[nops++] = control_payload;
+      }
+      names[nops] = "msg.append";
+      payloads[nops++] = append_payload;
+      int rc = _frame_event_batch_post_fire(f, names, payloads, nops,
+                                            (control_payload != NULL)
+                                                ? "plan approval"
+                                                : "ask reply");
       frm_ask_reply_payload_destroy(rp);   /* the reply was consumed — the
                                               shell retires on EVERY path */
       if (rc != 0) {
         /* Nothing was posted (the pre-post refusal already logged): the park
            stands for a retry; the engine's state keeps its compose-time
-           truth. */
+           truth — INCLUDING the ladder's plan_gate (no durable approval, no
+           ACT flip). */
         break;
+      }
+      if (control_payload != NULL) {
+        /* The approval COMMITTED: the durable control record rides the
+           batch; the in-memory ACT flag follows the commit (every derive's
+           consult re-learns it from the record, a restart included). */
+        f->engine.ladder_act = 1;
       }
       /* The park is CLEAR (the funnel: it also drops the pyrt publish flag
          — no engine park, no parked ask) and the engine re-enters via the

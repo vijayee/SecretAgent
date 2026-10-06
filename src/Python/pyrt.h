@@ -69,6 +69,18 @@ pyrt_t* pyrt_thread_pyrt(void);
 void pyrt_ask_parked_set(pyrt_t* pyrt, uint8_t parked);
 uint8_t pyrt_ask_parked(const pyrt_t* pyrt);
 
+/* The escalation ladder's BYPASS view (escalation spec §2.3): 1 = this
+   frame's runtime runs the bypass mode — the agent.ask verb refuses as
+   data ("asked questions have no answerer": an open question here would
+   park the frame forever, so refusing loudly is the honest shape). Set by
+   the frame layer at the runtime's creation point (frame.c's lazy pyrt
+   boot, the one site where the frame's own config first backs a live
+   runtime — both fresh creates and resumes funnel through it); cleared at
+   create (get_clear_memory zeroes it — FREE/PLAN_ASK_ACT runtimes are
+   clear). Atomic instance field (the ask_parked shape). */
+void pyrt_bypass_set(pyrt_t* pyrt, uint8_t bypass);
+uint8_t pyrt_bypass(const pyrt_t* pyrt);
+
 /* Route a text payload (PYRT_LOG / PYRT_STATUS / PYRT_EMIT) to the caller's
    runtime owner — the pyrt-thread-relative form of the injected module's
    stream verbs. Copies the text OUT of Python's heap inside; never re-enters

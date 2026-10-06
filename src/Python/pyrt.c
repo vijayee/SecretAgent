@@ -49,6 +49,11 @@ struct pyrt_t {
      (Task 2's reply + the wake branches); the engine never SETS it. Cleared
      at create — get_clear_memory zeroes it. */
   ATOMIC(uint8_t) ask_parked;
+  /* The ladder's BYPASS view (escalation spec §2.3): set by the frame layer
+     at this runtime's creation point when the owning frame's config runs
+     bypass; the ask verb refuses as data while it stands. Cleared at
+     create — get_clear_memory zeroes it. */
+  ATOMIC(uint8_t) bypass;
   ATOMIC(uint64_t) corr_counter;
   platform_thread_t* thread;
   PyThreadState* tstate;
@@ -692,6 +697,16 @@ void pyrt_ask_parked_set(pyrt_t* pyrt, uint8_t parked) {
 uint8_t pyrt_ask_parked(const pyrt_t* pyrt) {
   if (pyrt == NULL) return 0;
   return (uint8_t)ATOMIC_LOAD(&pyrt->ask_parked);
+}
+
+void pyrt_bypass_set(pyrt_t* pyrt, uint8_t bypass) {
+  if (pyrt == NULL) return;
+  ATOMIC_STORE(&pyrt->bypass, bypass);
+}
+
+uint8_t pyrt_bypass(const pyrt_t* pyrt) {
+  if (pyrt == NULL) return 0;
+  return (uint8_t)ATOMIC_LOAD(&pyrt->bypass);
 }
 
 void pyrt_post_text(uint32_t type, const char* text) {
