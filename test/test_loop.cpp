@@ -3352,6 +3352,67 @@ TEST(TestLoop, TestPersonaInheritsIntoTheSpawnedChild) {
   wave_db_close(db);
 }
 
+TEST(TestLoop, TestPersonaBelowPlacementRidesAfterTheBase) {
+  /* The below placement's LIVE pin (matrix row 55): the loop composes with
+     the turn instruction as the base, so a placement-"below" record puts the
+     instructions FIRST and the persona GROUP after — the mirror of the
+     first-block pin above. The record installs through the store batches
+     (the same machinery the hammer's install test rides), not the hammer's
+     "first"-only asset. */
+  static const char BELOW_RECORD[] =
+      "{\"version\":1,\"name\":\"understudy\","
+      "\"text\":\"## the understudy\\n\\nThe instructions above own the "
+      "task; this block owns only the manner.\","
+      "\"placement\":\"below\","
+      "\"guidance\":[{\"key\":\"execute\","
+      "\"text\":\"Manner is not the cell's authority.\"}]}";
+  static const char BELOW_CONTEXT[] = "{\"name\":\"Victor\"}";
+  frame_config_t cfg = test_config();
+  cfg.persona_name = "understudy";
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  test_store_put(db, "personas/understudy/record", BELOW_RECORD);
+  test_store_put(db, "personas/understudy/user-context", BELOW_CONTEXT);
+  frame_t* f = frame_create(db, NULL, "below rides", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"below done"}}]})json");
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  ASSERT_EQ(rm.captured.size(), 1u);
+  std::string content = test_system_content(rm.captured[0]);
+
+  /* The expected bytes composed through the PURE persona api with the SAME
+     base the loop composes with (the placement lives in the record — the
+     compose alone answers [base][persona][context][guidance]) plus the goal
+     line the loop appends after the prefix. */
+  persona_record_t* rec = NULL;
+  ASSERT_EQ(persona_record_load(BELOW_RECORD, &rec), 0);
+  ASSERT_NE(rec, nullptr);
+  const char* tools[] = {"execute"};
+  char* composed = persona_compose(rec, BELOW_CONTEXT, tools, 1,
+                                   TEST_LOOP_INSTRUCTION);
+  ASSERT_NE(composed, nullptr);
+  std::string expected = std::string(composed) + "Goal: below rides\n";
+  free(composed);
+  persona_record_destroy(rec);
+  EXPECT_EQ(content, expected) << "the below assembly moved";
+
+  size_t instr_pos = content.find("You drive one frame");
+  size_t persona_pos = content.find("## the understudy");
+  ASSERT_NE(instr_pos, std::string::npos);
+  ASSERT_NE(persona_pos, std::string::npos);
+  EXPECT_GT(persona_pos, instr_pos)
+      << "below: the persona GROUP rides AFTER the base instructions";
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 #endif /* SA_HAS_WDB */
 
 /* The reopened-walk probe runs REAL tool cycles through the frame's own
