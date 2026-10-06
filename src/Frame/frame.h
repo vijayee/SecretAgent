@@ -18,6 +18,12 @@ typedef struct frame_config_t {
   const char* model_base_url;    /* e.g. http://127.0.0.1:11434 (Ollama) */
   const char* model_api_key;     /* may be NULL/empty for Ollama */
   const char* model_name;        /* e.g. a local model tag */
+  const char* persona_name;      /* BORROWED: the persona record key
+                                    (e.g. "hammer"); NULL/empty = the
+                                    built-in base (persona spec §3 — no
+                                    persona block, the derive pins hold).
+                                    The frame owns a dup of it; a spawned
+                                    child inherits the parent's. */
   unsigned max_depth;            /* SA_FRAME_MAX_DEPTH equivalent (default 4) */
   unsigned model_timeout_ms;     /* one completion POST bound, ms; 0 = the
                                     built-in default (model.h's

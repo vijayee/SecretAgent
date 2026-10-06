@@ -306,6 +306,93 @@ TEST(TestFrame, TestSpawnAdmissionOnlyAndDepthCap) {
   wave_db_close(db);
 }
 
+TEST(TestFrame, TestPersonaNameCarriedAndDefaulted) {
+  /* The config field's copy contract (persona spec §3): a persona-carrying
+     cfg dups the name INTO the frame; a persona-less cfg carries none —
+     every persona-less frame stays byte-identical to today (Task 4's derive
+     pins hold off this). The accessor is the test-visible seam (the
+     _frame_goal precedent): the persona block's REAL observable — the
+     composed first block in the captured prompt — is Task 4's test. */
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* plain = frame_create(db, NULL, NULL, &cfg);
+  ASSERT_NE(plain, nullptr);
+  EXPECT_EQ(_frame_persona_name(plain), nullptr)
+      << "a persona-less config carries none";
+  frame_destroy(plain);
+
+  cfg.persona_name = "hammer";
+  frame_t* named = frame_create(db, NULL, "hammer session", &cfg);
+  ASSERT_NE(named, nullptr);
+  EXPECT_STREQ(_frame_persona_name(named), "hammer")
+      << "frame_create dups the config's persona name";
+  frame_destroy(named);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestSpawnInheritsPersonaName) {
+  /* The spawn inheritance (persona spec §3): a spawned child composes its
+     config from the parent — the persona name rides it (an owned dup, the
+     same rule the model strings follow); a persona-less parent's child
+     carries none. */
+  frame_config_t cfg = test_config();
+  cfg.persona_name = "hammer";
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* parent = frame_create(db, NULL, "parent goal", &cfg);
+  ASSERT_NE(parent, nullptr);
+  frame_t* child = frame_spawn(parent, "leaf goal", NULL);
+  ASSERT_NE(child, nullptr);
+  EXPECT_STREQ(_frame_persona_name(child), "hammer")
+      << "the spawned child inherits the parent's persona name";
+  frame_destroy(child);
+  frame_destroy(parent);
+
+  /* The persona-less lineage: the child carries none. */
+  frame_config_t plain_cfg = test_config();
+  frame_t* bare = frame_create(db, NULL, "bare parent", &plain_cfg);
+  ASSERT_NE(bare, nullptr);
+  frame_t* bare_child = frame_spawn(bare, "leaf goal", NULL);
+  ASSERT_NE(bare_child, nullptr);
+  EXPECT_EQ(_frame_persona_name(bare_child), nullptr)
+      << "no persona in, no persona inherited";
+  frame_destroy(bare_child);
+  frame_destroy(bare);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestResumeCarriesPersonaName) {
+  /* The resume copy site (persona spec §3): the post-restart config's
+     persona name dups into the resumed frame; a persona-less restart cfg
+     carries none — the persona rides the CONFIG, not the store. The
+     done-handle resume (the read-only shape: no repair pass, no sync
+     writes) keeps it in-memory. */
+  frame_config_t cfg = test_config();
+  cfg.persona_name = "hammer";
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "restart me", &cfg);
+  ASSERT_NE(f, nullptr);
+  std::string sid = frame_sid(f);
+  ASSERT_EQ(_frame_set_status_done(f), 0);
+  frame_destroy(f);
+
+  frame_t* resumed = frame_resume(db, sid.c_str(), &cfg);
+  ASSERT_NE(resumed, nullptr);
+  EXPECT_STREQ(_frame_persona_name(resumed), "hammer")
+      << "the restart cfg's persona name rides the resume";
+  frame_destroy(resumed);
+
+  frame_config_t plain_cfg = test_config();
+  frame_t* bare = frame_resume(db, sid.c_str(), &plain_cfg);
+  ASSERT_NE(bare, nullptr);
+  EXPECT_EQ(_frame_persona_name(bare), nullptr)
+      << "a persona-less restart cfg carries none";
+  frame_destroy(bare);
+  wave_db_close(db);
+}
+
 TEST(TestFrame, TestReportBindsOneEventIntoParent) {
   frame_config_t cfg = test_config();
   wave_database_root_t* db = wave_db_open(NULL);

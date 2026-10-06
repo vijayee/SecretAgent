@@ -343,6 +343,10 @@ model_backend_t* _frame_backend_get(frame_t* f);
 /* The frame's goal text (borrowed; NULL when the frame carries none). */
 const char* _frame_goal(const frame_t* f);
 
+/* The frame's carried persona record key (NULL = the built-in base; the
+   derive's persona trip keys off it — persona spec §3). */
+const char* _frame_persona_name(const frame_t* f);
+
 /* 1 while the frame is live (open subtree); 0 for dead/unknown frames. */
 uint8_t _frame_is_live(const frame_t* f);
 

@@ -333,6 +333,7 @@ struct frame_t {
   char* model_base_url;       /* owned copies of the config strings */
   char* model_api_key;
   char* model_name;
+  char* persona_name;         /* the persona record key; NULL = none */
   unsigned max_depth;
   unsigned model_timeout_ms;  /* 0 = built-in default (model_timeout_ms_resolve) */
   unsigned cell_watchdog_ms;  /* one pooled RUNNING CELL's bound, ms;
@@ -3942,6 +3943,11 @@ const char* _frame_goal(const frame_t* f) {
   return (f != NULL) ? f->goal : NULL;
 }
 
+/* The frame's carried persona record key (NULL = the built-in base). */
+const char* _frame_persona_name(const frame_t* f) {
+  return (f != NULL) ? f->persona_name : NULL;
+}
+
 uint8_t _frame_is_live(const frame_t* f) {
   return (f != NULL && f->st != NULL) ? 1 : 0;
 }
@@ -4326,6 +4332,10 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
       f->model_name = strdup(cfg->model_name);
       if (f->model_name == NULL) goto fail;
     }
+    if (cfg->persona_name != NULL) {
+      f->persona_name = strdup(cfg->persona_name);
+      if (f->persona_name == NULL) goto fail;
+    }
   } else if (parent != NULL) {
     /* Spawned children inherit the parent's depth budget, model config, and
        pool (a tree always sits on ONE pool). */
@@ -4345,6 +4355,10 @@ static frame_t* _frame_alloc(wave_database_root_t* root, frame_t* parent,
     if (parent->model_name != NULL) {
       f->model_name = strdup(parent->model_name);
       if (f->model_name == NULL) goto fail;
+    }
+    if (parent->persona_name != NULL) {
+      f->persona_name = strdup(parent->persona_name);
+      if (f->persona_name == NULL) goto fail;
     }
   } else {
     /* The cfg-less, parent-less create (frame_spawn's inherit path passes
@@ -4400,6 +4414,7 @@ fail:
   free(f->model_base_url);
   free(f->model_api_key);
   free(f->model_name);
+  free(f->persona_name);
   free(f);
   return NULL;
 }
@@ -4701,6 +4716,10 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
       f->model_name = strdup(cfg->model_name);
       if (f->model_name == NULL) goto fail;
     }
+    if (cfg->persona_name != NULL) {
+      f->persona_name = strdup(cfg->persona_name);
+      if (f->persona_name == NULL) goto fail;
+    }
   } else {
     f->max_depth = 4;
   }
@@ -4777,6 +4796,7 @@ fail:
   free(f->model_base_url);
   free(f->model_api_key);
   free(f->model_name);
+  free(f->persona_name);
   free(f);
   return NULL;
 }
@@ -4966,6 +4986,7 @@ static void _frame_destroy_run(frame_t* f) {
   free(f->model_base_url);
   free(f->model_api_key);
   free(f->model_name);
+  free(f->persona_name);
   if (f->owned_backend != NULL) {
     model_backend_destroy(f->owned_backend);
     f->owned_backend = NULL;
