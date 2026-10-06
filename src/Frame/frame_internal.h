@@ -72,8 +72,13 @@ typedef enum frame_phase_e {
   FRAME_PHASE_MODEL,        /* an async model submit is in flight */
   FRAME_PHASE_CELL,         /* the turn's one cell is in flight */
   FRAME_PHASE_STORE,        /* a store round trip is in flight (Task 2's vocabulary) */
-  FRAME_PHASE_CHILDREN      /* yielded: live children pending; each child
+  FRAME_PHASE_CHILDREN,     /* yielded: live children pending; each child
                                report's FRM_CHILD_REPORT reposts the turn */
+  FRAME_PHASE_ASK           /* parked: the closed turn's ask awaits the
+                               owner's reply (escalation spec §1.3) —
+                               frame_ask_reply's FRM_ASK_REPLY clears the
+                               park and reposts the turn; nothing blocks,
+                               nothing spins */
 } frame_phase_e;
 
 /* What the pending FRAME_PHASE_STORE round trip is for (the engine state's
@@ -190,6 +195,39 @@ typedef struct frame_engine_state_t {
   uint8_t turn_known;          /* 0 until the run's first restore */
   uint8_t turn_open;           /* 1 = turn.start posted, no turn.end yet */
   uint8_t step_open;           /* 1 = step.start posted, no step.end yet */
+
+  /* --- the blocked-ask's park (escalation spec §1.3/§1.4; escalation Task
+     2) --------------------------------------------------------------------
+
+     The ask verb publishes FRM_ASK mid-cell (fire-and-post); the engine
+     mints the ask_id and OWNS the question/options here until the cell's
+     completion composes the close batch (cell.result + step.end + the "ask"
+     record + turn.end{blocked}) — then the engine rests in
+     FRAME_PHASE_ASK while the owner composes. The state is IN-MEMORY only
+     (like the parked model submit): durability lives in the records, so a
+     DEAD engine never carries it — every engine-end site clears through
+     _frame_engine_ask_clear (the same discipline as doom_last_code). The
+     pyrt "ask_parked" publish flag is NOT this struct's: it is set at the
+     verb's post-publish and cleared at the engine's consume paths
+     (_frame_engine_ask_clear included); the engine never sets it.
+
+     plan_gate: 1 = the ladder's runtime-authored plan-gate ask (the
+     approval flow's owner); Task 5's consumer — always 0 in this slice. */
+  struct {
+    char* ask_id;              /* the engine-minted "%08x" key, OWNED (NULL =
+                                  no park) */
+    uint64_t corr;             /* the publishing verb's bridge corr (the
+                                  reply-sink key space; informational here) */
+    char* question;            /* the ask's text, OWNED (stolen from the
+                                  FRM_ASK payload at receipt; consumed by the
+                                  close batch's compose) */
+    char** options;            /* the OWNED array of OWNED strings (NULL =
+                                  no options — an open ask; the close's
+                                  compose renders an empty array) */
+    size_t noptions;
+    uint8_t plan_gate;         /* 0 = a generic agent.ask; 1 = the ladder's
+                                  plan gate (Task 5) */
+  } pending_ask;
 
   /* --- the async submit's LIFETIME HANDOFF (lock-free; atomics are
      house-legal — the frame layer stays lock-free post store-actor) ------
@@ -584,6 +622,37 @@ int _frame_event_batch_post_fire(frame_t* f, const char** type_names,
    pre-post rc (0 = posted). */
 int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
                                     uint8_t with_riders);
+
+/* The parked ask's PAIRED close (escalation spec §1.3; escalation Task 2):
+   the sibling of the ordinary close, composed when PYRT_RESULT's close has
+   riders AND the engine holds a pending ask. ONE fire-and-post batch:
+   [cell.result (the real status), step.end, the "ask" record
+   {kind, askId, question, options[], plan}, turn.end{reason blocked}] —
+   the ask and its turn's close can never split across a crash boundary (and
+   a crash between the turn close and the ask publish cannot exist, spec
+   §4.1). On rc == 0 the engine flips turn_open/step_open to 0 and rests in
+   FRAME_PHASE_ASK. A pre-post refusal leaves the OPEN tail and the park
+   standing (the store's records stay the truth; no half-parked state) — the
+   standing store-refusal discipline, already logged loud. CONSUMES the
+   payload on every path. Returns the pre-post rc (0 = posted). */
+int _frame_engine_ask_close_post(frame_t* f, json_value_t* result_payload);
+
+/* The parked-ask state's clear (the pending ask dies whenever the engine's
+   bookkeeping dies — every engine-end funnel plus the frame teardown): frees
+   the OWNED ask_id, zeroes the corr/plan_gate, and — SA_HAS_PYTHON builds —
+   clears the pyrt publish flag (the parked pre-check's truth follows the
+   engine: no engine park, no parked ask). NULL-safe, idempotent. */
+void _frame_engine_ask_clear(frame_t* f);
+
+/* The posted ask reply (the handlers' shape — the _frame_steer_post
+   precedent): ONE FRM_ASK_REPLY {ask_id, decision, value} into the frame's
+   own mailbox; the frame's dispatch validates it against the park and
+   composes the durable reply batch there. Returns 0 once POSTED — never a
+   commit confirmation (§3.1's ack contract: the engine's stale-ask outcome
+   lives in the events stream). Nonzero loud on the pre-post refusals
+   (a dead frame, an empty ask_id, a decision outside 0|1, OOM). */
+int _frame_ask_reply_post(frame_t* f, const char* ask_id, uint8_t decision,
+                          const char* value);
 
 /* Best-effort seq roll-back of an abandoned pre-allocation (§5). */
 void _frame_seq_rollback(frame_t* f, uint64_t abandoned);

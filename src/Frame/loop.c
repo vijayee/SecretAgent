@@ -830,6 +830,11 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
   e->doom_streak = 0;
   e->users_seen_seq = 0;
   e->cell_users_seq = 0;
+  /* The parked ask dies with the engine (the same discipline: a DEAD engine
+     never carries it — every engine end funnels here; the frame teardown's
+     own _frame_engine_ask_clear covers a mid-park destroy). The parked
+     publish flag follows (frame.c's helper clears the pyrt flag too). */
+  _frame_engine_ask_clear(f);
   if (failed) e->engine_failed = 1;
 }
 
@@ -2193,6 +2198,13 @@ int frame_run_loop(frame_t* f) {
     _frame_pump(f);
     if (e->engine_live == 0) break;
     if (e->phase == FRAME_PHASE_CHILDREN) break;   /* Task 5's yield */
+    if (e->phase == FRAME_PHASE_ASK) break;   /* the ask park (escalation
+                                                 spec §1.3): the engine rests
+                                                 until the owner's reply —
+                                                 frame_ask_reply's posted
+                                                 FRM_ASK_REPLY clears the park
+                                                 and reposts the turn; the
+                                                 NEXT run loop pumps that */
     if (!seen_valid || e->phase != seen ||
         (e->phase == FRAME_PHASE_STORE && e->store_corr != seen_trip)) {
       seen = e->phase;
@@ -2254,9 +2266,12 @@ int frame_run_loop(frame_t* f) {
   }
 
   _loop_driver_drain_store(f);
-  /* 2 on the CHILDREN yield (live; Task 5 fills the branch), else 0 clean
+  /* 2 on the LIVE yields (the CHILDREN yield — Task 5's branch — or the ask
+     park, whose reply resumes the engine live), else 0 clean
      / 1 failed loud by the terminal step's engine_failed. */
-  if (e->phase == FRAME_PHASE_CHILDREN) return 2;
+  if (e->phase == FRAME_PHASE_CHILDREN || e->phase == FRAME_PHASE_ASK) {
+    return 2;
+  }
   return (e->engine_failed != 0) ? 1 : 0;
 }
 

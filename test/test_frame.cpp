@@ -293,30 +293,24 @@ TEST(TestFrame, TestSteerComposesMsgAppendFromOutside) {
   wave_db_close(db);
 }
 
-/* The unwired park machinery's loud drop (the escalation slice's interim
-   window, Task 2 wires the real FRM_ASK case): an ask posted at the frame's
-   mailbox never dies UNHEARD — the dispatch logs the refusal loud and
-   leaves the payload intact for the runtime's retire (the post site's
-   frm_ask_payload_destroy runs; a custom destroyer here counts the run). */
+/* The parked ask's DISPLACED shapes (the framing gate): an ask at an
+   engine-less frame (engine_live 0 / no open turn) has no turn close to ride
+   — the dispatch refuses LOUD (never silence, never a stranded park) and
+   consumes the payload (the case retires the shell through its own
+   destroyer; nothing parks). */
 static int _ask_drop_lines = 0;
-static int _ask_payload_retires = 0;
 static void _ask_drop_recorder(log_Event* ev) {
   va_list ap;
   va_copy(ap, ev->ap);
   char line[512];
   vsnprintf(line, sizeof(line), ev->fmt, ap);
   va_end(ap);
-  if (strstr(line, "ask arrived at the frame's mailbox") != NULL) {
+  if (strstr(line, "no live OPEN turn to close in") != NULL) {
     _ask_drop_lines++;
   }
 }
 
-static void _counting_ask_payload_destroy(void* p) {
-  _ask_payload_retires++;
-  frm_ask_payload_destroy(p);
-}
-
-TEST(TestFrame, TestFrmAskWithoutTheParkMachineryDropsLoud) {
+TEST(TestFrame, TestFrmAskAtAnEnginelessFrameRefusesLoud) {
   frame_config_t cfg = test_config();
   wave_database_root_t* db = wave_db_open(NULL);
   ASSERT_NE(db, nullptr);
@@ -335,18 +329,23 @@ TEST(TestFrame, TestFrmAskWithoutTheParkMachineryDropsLoud) {
   message_t m;
   m.type = (uint32_t)FRM_ASK;
   m.payload = ap;
-  m.payload_destroy = _counting_ask_payload_destroy;
+  m.payload_destroy = frm_ask_payload_destroy;
 
   int lines_before = _ask_drop_lines;
   ASSERT_TRUE(actor_send(_frame_actor(f), &m));
   actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
   EXPECT_GT(_ask_drop_lines, lines_before)
-      << "the dispatch logged the ask's loud refusal";
-  EXPECT_EQ(_ask_payload_retires, 1)
-      << "the payload retired exactly once through the runtime's destroyer";
+      << "the dispatch logged the engine-less ask's loud refusal";
 
-  /* The frame survived the drop: its mailbox still routes — a second ask
-     drops loud again, retired again. */
+  /* Nothing parked: the log holds ZERO ask records (the refusal consumed
+     the payload; no ask state ever boxed). */
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(json_size(events), 0u) << "an engine-less ask commits nothing";
+  json_value_destroy(events);
+
+  /* The frame survived the refusal: its mailbox still routes — a second ask
+     refuses loud again (the frame stays startable, no park ever stood). */
   frm_ask_payload_t* ap2 =
       (frm_ask_payload_t*)get_clear_memory(sizeof(*ap2));
   ap2->corr = 4243;
@@ -354,13 +353,12 @@ TEST(TestFrame, TestFrmAskWithoutTheParkMachineryDropsLoud) {
   message_t m2;
   m2.type = (uint32_t)FRM_ASK;
   m2.payload = ap2;
-  m2.payload_destroy = _counting_ask_payload_destroy;
+  m2.payload_destroy = frm_ask_payload_destroy;
   int lines_after_first = _ask_drop_lines;
   ASSERT_TRUE(actor_send(_frame_actor(f), &m2));
   actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
   EXPECT_GT(_ask_drop_lines, lines_after_first)
-      << "the frame's mailbox still routes after a loud drop";
-  EXPECT_EQ(_ask_payload_retires, 2);
+      << "the frame's mailbox still routes after a loud refusal";
 
   frame_destroy(f);
   wave_db_close(db);
@@ -2783,6 +2781,369 @@ TEST(TestFrame, TestSecondResumeComposesNothing) {
 
   frame_destroy(parent);   /* the live spawn's teardown (loud, expected) */
   wave_db_close(idb);
+}
+
+/* --- escalation Task 2: the park — close batch, the reply, the stale drop
+
+   The ask flow (spec §1): turn 1's cell calls actor.ask; the cell completes;
+   ONE atomic close batch lands [cell.result, step.end, "ask", turn.end
+   {blocked}]; the engine rests in FRAME_PHASE_ASK (frame_run_loop returns 2,
+   live); frame_ask_reply posts FRM_ASK_REPLY; the dispatch composes ONE
+   reply batch ["ask.reply", msg.append user] and reposts the FRM_TURN
+   continuation — a fresh turn derives the answer. */
+
+/* The ask tests' log needles (each test installs its own recorder). */
+static int _ask_belt_lines = 0;
+static int _ask_stale_lines = 0;
+
+static void _ask_belt_recorder(log_Event* ev) {
+  va_list ap;
+  va_copy(ap, ev->ap);
+  char line[512];
+  vsnprintf(line, sizeof(line), ev->fmt, ap);
+  va_end(ap);
+  if (strstr(line, "second ask arrived") != NULL) _ask_belt_lines++;
+}
+
+static void _ask_stale_recorder(log_Event* ev) {
+  va_list ap;
+  va_copy(ap, ev->ap);
+  char line[512];
+  vsnprintf(line, sizeof(line), ev->fmt, ap);
+  va_end(ap);
+  if (strstr(line, "no park holds it") != NULL) _ask_stale_lines++;
+}
+
+/* The ask tests' scripted model: canned bodies popped in order; every
+   model call's derived-messages array serializes into `captured` (the
+   answer's arrive-by-derive pin). */
+typedef struct ask_capture_model_t {
+  model_backend_t base;
+  std::vector<std::string> replies;
+  std::vector<std::string> captured;
+} ask_capture_model_t;
+
+static int ask_capture_complete(void* self, json_value_t* messages,
+                                json_value_t* tools, char** raw_out,
+                                model_reply_t** reply_out, char** error_out) {
+  (void)tools;
+  (void)raw_out;
+  *reply_out = NULL;
+  *error_out = NULL;
+  ask_capture_model_t* cm = (ask_capture_model_t*)self;
+  char* seen = json_serialize(messages);
+  if (seen != NULL) {
+    cm->captured.push_back(std::string(seen));
+    free(seen);
+  }
+  if (cm->replies.empty()) {
+    *error_out = strdup("ask capture model: queue empty (an unexpected "
+                        "model turn)");
+    return -1;
+  }
+  std::string body = cm->replies.front();
+  cm->replies.erase(cm->replies.begin());
+  return scripted_decode(body, reply_out, error_out) == 0 ? 0 : -1;
+}
+
+/* Park one turn whose cell runs `ask_code` (the shared setup): installs the
+   scripted model with `replies`, runs the loop, returns the frame (parked:
+   frame_run_loop returned 2, the frame NOT done). The turn's close-batch
+   records are asserted here (the SAME-batch shape is the park's heart) and
+   the minted ask_id is returned via *ask_id_out. */
+static frame_t* ask_park_and_pin(wave_database_root_t* db,
+                                 ask_capture_model_t* cm,
+                                 std::vector<std::string> replies,
+                                 const std::string& ask_code,
+                                 std::string* ask_id_out);
+
+TEST(TestFrame, TestAskParksAndBlocksTheTurn) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "decide: which way?", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ask_capture_model_t cm = {};
+  cm.base.complete = ask_capture_complete;
+  cm.replies = {
+      canned_cell_body("import actor\nactor.ask('q?', ['yes', 'no'])"
+                       "\nprint('asked')"),
+      canned_content_body("done after the answer")};
+  frame_set_model_backend(f, &cm.base);
+
+  /* The park: the loop returns LIVE (rc 2) with the frame NOT done — the
+     turn closed blocked and the engine rests on the parked ask. */
+  EXPECT_EQ(frame_run_loop(f), 2) << "parked awaiting the owner's reply";
+  EXPECT_EQ(frame_is_done(f), 0);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  /* The close batch is ONE atomic group of FOUR consecutive records:
+     cell.result + step.end + the "ask" record + turn.end{blocked}. */
+  size_t ask_index = SIZE_MAX;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "ask")) {
+      ASSERT_EQ(ask_index, SIZE_MAX) << "exactly ONE ask record";
+      ask_index = i;
+    }
+  }
+  ASSERT_NE(ask_index, SIZE_MAX) << "the cell's ask was parked";
+  ASSERT_GE(ask_index, 2u) << "cell.result and step.end precede it IN the batch";
+  json_value_t* result_rec = json_at(events, ask_index - 2);
+  json_value_t* step_end_rec = json_at(events, ask_index - 1);
+  json_value_t* ask_rec = json_at(events, ask_index);
+  json_value_t* turn_end_rec = json_at(events, ask_index + 1);
+  ASSERT_NE(turn_end_rec, nullptr);
+  ASSERT_TRUE(event_is(result_rec, "cell.result"));
+  ASSERT_TRUE(event_is(step_end_rec, "step.end"));
+  ASSERT_TRUE(event_is(turn_end_rec, "turn.end"));
+  /* The SAME-batch proof: four consecutive seqs (turn-lifecycle's batching
+     rule — the group can never half-apply across a crash). */
+  long long base_seq = (long long)json_as_int(json_get(result_rec, "seq"));
+  EXPECT_EQ((long long)json_as_int(json_get(step_end_rec, "seq")), base_seq + 1);
+  EXPECT_EQ((long long)json_as_int(json_get(ask_rec, "seq")), base_seq + 2);
+  EXPECT_EQ((long long)json_as_int(json_get(turn_end_rec, "seq")), base_seq + 3);
+
+  json_value_t* ask_payload = json_get(ask_rec, "payload");
+  ASSERT_NE(ask_payload, nullptr);
+  json_value_t* ask_id_v = json_get(ask_payload, "askId");
+  ASSERT_NE(ask_id_v, nullptr);
+  std::string ask_id = json_as_string(ask_id_v);
+  EXPECT_EQ(ask_id.size(), 8u) << "the mint: the sid allocator's 8-hex shape";
+  EXPECT_STREQ(json_as_string(json_get(ask_payload, "question")), "q?");
+  json_value_t* options = json_get(ask_payload, "options");
+  ASSERT_NE(options, nullptr);
+  ASSERT_EQ(json_size(options), 2u);
+  EXPECT_STREQ(json_as_string(json_at(options, 0)), "yes");
+  EXPECT_STREQ(json_as_string(json_at(options, 1)), "no");
+  json_value_t* plan_v = json_get(ask_payload, "plan");
+  ASSERT_NE(plan_v, nullptr) << "the plan field is PRESENT (generic ask)";
+  EXPECT_EQ(json_type(plan_v), JSON_NULL) << "plan null in this slice";
+
+  json_value_t* turn_end_payload = json_get(turn_end_rec, "payload");
+  ASSERT_NE(turn_end_payload, nullptr);
+  json_value_t* reason = json_get(turn_end_payload, "reason");
+  ASSERT_NE(reason, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "blocked")
+      << "LIFE_REASON_BLOCKED's first writer";
+  EXPECT_EQ(json_as_int(json_get(turn_end_payload, "turn")), 1);
+
+  /* NO reply record and NO user-side append while parked. */
+  EXPECT_EQ(fr_count_type(events, "ask.reply"), 0u);
+  EXPECT_EQ(fr_count_type(events, "msg.append"), 0u);
+  size_t parked_count = json_size(events);
+  json_value_destroy(events);
+
+  /* The engine PARKS: a second run loop pumps NOTHING (no replies, no new
+     turn — the parked engine issues no turns of its own). */
+  EXPECT_EQ(frame_run_loop(f), 2);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(json_size(events), parked_count) << "the parked engine is quiet";
+  json_value_destroy(events);
+
+  /* THE REPLY: the post returns 0 (posted — never a commit confirm); the
+     resolution composes as the reply batch [ask.reply, msg.append] and the
+     fresh turn runs to done (the model capture pins the answer's ride). */
+  EXPECT_EQ(frame_ask_reply(f, ask_id.c_str(), 0, "yes"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0) << "the reply resumed; the fresh turn ends";
+
+  EXPECT_EQ(frame_is_done(f), 1);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  /* The reply batch: the ask.reply record + the user-side msg.append, the
+     SAME batch (two consecutive seqs). */
+  json_value_t* reply_rec = json_at(events, ask_index + 2);
+  json_value_t* append_rec = json_at(events, ask_index + 3);
+  ASSERT_NE(append_rec, nullptr);
+  ASSERT_TRUE(event_is(reply_rec, "ask.reply"));
+  ASSERT_TRUE(event_is(append_rec, "msg.append"));
+  EXPECT_EQ((long long)json_as_int(json_get(reply_rec, "seq")),
+            base_seq + 4) << "the reply batch starts after the close";
+  json_value_t* reply_payload = json_get(reply_rec, "payload");
+  ASSERT_NE(reply_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "askId")), ask_id.c_str());
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "decision")), "answer");
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "value")), "yes");
+  json_value_t* append_payload = json_get(append_rec, "payload");
+  ASSERT_NE(append_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(append_payload, "role")), "user");
+  EXPECT_STREQ(json_as_string(json_get(append_payload, "content")), "yes")
+      << "the answer's durable user-side input";
+  /* TWO msg.appends total: the answer + the fresh turn's assistant content
+     (the finish batch writes it). */
+  EXPECT_EQ(fr_count_type(events, "msg.append"), 2u);
+  /* The fresh turn started, derived the answer, and closed completed. */
+  std::string second = (cm.captured.size() > 1) ? cm.captured[1] : "";
+  EXPECT_NE(second.find("\"yes\""), std::string::npos)
+      << "turn 2's derive carried the answer";
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestAskStaleReplyIsDroppedLoud) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "stale reply probe", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ask_capture_model_t cm = {};
+  cm.base.complete = ask_capture_complete;
+  cm.replies = {
+      canned_cell_body("import actor\nactor.ask('hold?', ['yes', 'no'])"
+                       "\nprint('held')"),
+      canned_content_body("answered late")};
+  frame_set_model_backend(f, &cm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 2) << "parked";
+  EXPECT_EQ(frame_is_done(f), 0);
+
+  /* The minted id (read it from the parked ask's record). */
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  size_t parked_count = json_size(events);
+  std::string ask_id;
+  for (size_t i = json_size(events); i > 0; i--) {
+    json_value_t* rec = json_at(events, i - 1);
+    if (event_is(rec, "ask")) {
+      ask_id = json_as_string(json_get(json_get(rec, "payload"), "askId"));
+      break;
+    }
+  }
+  ASSERT_EQ(ask_id.size(), 8u);
+  json_value_destroy(events);
+
+  /* The API's own bounds refuse BEFORE any post (no mailbox traffic). */
+  EXPECT_LT(frame_ask_reply(f, "", 0, "yes"), 0) << "empty ask_id";
+  EXPECT_LT(frame_ask_reply(NULL, ask_id.c_str(), 0, "yes"), 0);
+  EXPECT_LT(frame_ask_reply(f, ask_id.c_str(), 5, "yes"), 0) << "decision 0|1";
+
+  /* A WRONG id POSTS (that is the contract: the post's ack cannot see the
+     engine) — the dispatch drops it LOUD, the park stands, nothing lands. */
+  log_add_callback(_ask_stale_recorder, NULL, LOG_ERROR);
+  int stale_before = _ask_stale_lines;
+  EXPECT_EQ(frame_ask_reply(f, "00000000", 0, "yes"), 0) << "posted";
+  EXPECT_EQ(frame_run_loop(f), 2) << "the park STANDS — nothing resumed";
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(json_size(events), parked_count) << "a stale reply commits NOTHING";
+  EXPECT_EQ(fr_count_type(events, "ask.reply"), 0u);
+  json_value_destroy(events);
+  EXPECT_GT(_ask_stale_lines, stale_before)
+      << "the stale reply was dropped LOUD (the async wire's contract)";
+
+  /* The RIGHT id still works after the stale refusals. */
+  EXPECT_EQ(frame_ask_reply(f, ask_id.c_str(), 0, "yes"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0) << "the matched reply resumed the engine";
+  EXPECT_EQ(frame_is_done(f), 1);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* reply = json_at(events, parked_count);
+  ASSERT_NE(reply, nullptr);
+  ASSERT_TRUE(event_is(reply, "ask.reply"));
+  json_value_t* reply_payload = json_get(reply, "payload");
+  ASSERT_NE(reply_payload, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(reply_payload, "askId")), ask_id.c_str());
+  EXPECT_EQ(fr_count_type(events, "ask.reply"), 1u) << "consumed EXACTLY ONCE";
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestAskSecondAskInSameTurnRefused) {
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "one ask at a time", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ask_capture_model_t cm = {};
+  cm.base.complete = ask_capture_complete;
+  cm.replies = {
+      canned_cell_body("import actor\na = actor.ask('q1?', ['yes', 'no'])\n"
+                       "b = actor.ask('q2?', ['yes', 'no'])\n"
+                       "print(a + ' | ' + b)"),
+      canned_content_body("done after one ask")};
+  frame_set_model_backend(f, &cm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 2) << "parked on the FIRST ask only";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  /* ONE ask record — the second verb call already returned the refusal
+     (the publish-time flag), and the cell's own print carries it. */
+  EXPECT_EQ(fr_count_type(events, "ask"), 1u);
+  json_value_t* ask_rec = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "ask")) {
+      ask_rec = json_at(events, i);
+      break;
+    }
+  }
+  ASSERT_NE(ask_rec, nullptr);
+  EXPECT_STREQ(json_as_string(json_get(json_get(ask_rec, "payload"),
+                                       "question")), "q1?");
+  for (size_t i = json_size(events); i > 0; i--) {
+    json_value_t* rec = json_at(events, i - 1);
+    if (!event_is(rec, "cell.result")) continue;
+    std::string text = json_as_string(json_get(json_get(rec, "payload"), "text"));
+    EXPECT_NE(text.find("asked | ask already parked"), std::string::npos)
+        << "the SECOND ask was refused at the verb: '" << text << "'";
+    break;
+  }
+  size_t parked_count = json_size(events);
+  json_value_destroy(events);
+
+  /* The dispatch-time belt: a hand-crafted ask while PARKED refuses loud
+     (the verb's flag never fired here — this is the engine's own belt). */
+  log_add_callback(_ask_belt_recorder, NULL, LOG_ERROR);
+  int belt_before = _ask_belt_lines;
+  frm_ask_payload_t* ap = (frm_ask_payload_t*)get_clear_memory(sizeof(*ap));
+  ap->corr = 777;
+  ap->question = strdup("late?");
+  message_t m;
+  m.type = (uint32_t)FRM_ASK;
+  m.payload = ap;
+  m.payload_destroy = frm_ask_payload_destroy;
+  ASSERT_TRUE(actor_send(_frame_actor(f), &m));
+  actor_run(_frame_actor(f), ACTOR_BATCH_SIZE);
+  EXPECT_GT(_ask_belt_lines, belt_before) << "the belt refused LOUD";
+  EXPECT_LT(frame_ask_reply(f, "beefbeef", 0, ""), 0)
+      << "an ANSWER carries its text (reject alone may be empty)";
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(json_size(events), parked_count) << "the belt committed nothing";
+  EXPECT_EQ(fr_count_type(events, "ask"), 1u);
+  json_value_destroy(events);
+
+  /* Then the reply still resumes the engine (the belt refused, not broke). */
+  json_value_t* events2 = load_events(f);
+  ASSERT_NE(events2, nullptr);
+  std::string parked_ask_id;
+  for (size_t i = json_size(events2); i > 0; i--) {
+    json_value_t* rec = json_at(events2, i - 1);
+    if (event_is(rec, "ask")) {
+      parked_ask_id = json_as_string(json_get(json_get(rec, "payload"), "askId"));
+      break;
+    }
+  }
+  ASSERT_EQ(parked_ask_id.size(), 8u);
+  json_value_destroy(events2);
+  EXPECT_EQ(frame_ask_reply(f, parked_ask_id.c_str(), 0, "yes"), 0);
+  EXPECT_EQ(frame_run_loop(f), 0);
+  EXPECT_EQ(frame_is_done(f), 1);
+
+  frame_destroy(f);
+  wave_db_close(db);
 }
 
 #endif /* python gate */

@@ -262,7 +262,14 @@ if (BUILD_TESTING)
            _test_name MATCHES "^TestFrame.TestSecondResumeComposesNothing$" OR
            _test_name MATCHES "^TestClientApiHandlers.TestInterruptReachesTheFrame$" OR
            _test_name MATCHES "^TestClientApiUnix.TestInterruptPostsOverTheSocket$" OR
-           _test_name MATCHES "^TestRefine.TestRefineLiveRefineAgainstRealModel$")
+           _test_name MATCHES "^TestRefine.TestRefineLiveRefineAgainstRealModel$" OR
+           # Escalation Task 2: the ask park's three pins run real pyrt cells
+           # (turn 1's cell calls actor.ask through the frame's own runtime) —
+           # the same CPython-owned classes. The engine-less ask pin (the
+           # fourth) runs NO cell and keeps full leak checking.
+           _test_name MATCHES "^TestFrame.TestAskParksAndBlocksTheTurn$" OR
+           _test_name MATCHES "^TestFrame.TestAskStaleReplyIsDroppedLoud$" OR
+           _test_name MATCHES "^TestFrame.TestAskSecondAskInSameTurnRefused$")
           set_property(TEST ${_test_name} APPEND PROPERTY ENVIRONMENT "LSAN_OPTIONS=suppressions=${_sa_lsan_supp}")
         endif()
       endforeach()

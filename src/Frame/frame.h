@@ -162,6 +162,17 @@ int frame_start(frame_t* f);
    cost). FRM_STOP remains the drain-at-boundary control. */
 void frame_interrupt(frame_t* f);
 
+/* Deliver an owner-surface reply for a parked ask. 0 = the FRM_ASK_REPLY was
+   POSTED (the park's truth lands asynchronously — never a commit confirm);
+   rc<0 = the frame ref/args were invalid. Bounded: ask_id <= 40 chars,
+   decision 0|1, value capped at the bridge value budget. The reply's durable
+   resolution (the ask.reply record + the user-side msg.append, and the
+   engine's resume) lands asynchronously through the frame's own dispatch —
+   a stale ask_id is dropped LOUD there (log + no batch), never reported
+   back through this rc. */
+int frame_ask_reply(frame_t* f, const char* ask_id, uint8_t decision,
+                    const char* value);
+
 /* Test/debug + embedding accessor: the pool the frame's actor is attached
    to (NULL = inline). */
 scheduler_pool_t* frame_pool(const frame_t* f);

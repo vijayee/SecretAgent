@@ -2525,6 +2525,111 @@ int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
   return rc;
 }
 
+/* The parked ask's RECORD compose (escalation spec §1.3): the "ask" event's
+   payload {kind, askId, question, options[], plan} — plan is JSON null in
+   this slice (a generic agent.ask carries no plan text; the ladder's
+   runtime-authored gate fills it). The parked ask's question/options are
+   BORROWED here (the park owns the strings). NULL on OOM — loud. */
+static json_value_t* _frame_ask_record_payload(frame_t* f,
+                                               const frame_engine_state_t* e) {
+  json_value_t* payload = json_new_object();
+  if (payload == NULL) {
+    log_error("frame: out of memory composing the ask record payload at '%s'",
+              f->sid_path);
+    return NULL;
+  }
+  json_value_t* options = json_new_array();
+  if (options == NULL) {
+    json_value_destroy(payload);
+    log_error("frame: out of memory composing the ask's options at '%s'",
+              f->sid_path);
+    return NULL;
+  }
+  json_object_set(payload, "kind", json_new_string("ask"));
+  json_object_set(payload, "askId", json_new_string(e->pending_ask.ask_id));
+  json_object_set(payload, "question", json_new_string(e->pending_ask.question));
+  for (size_t i = 0; i < e->pending_ask.noptions; i++) {
+    json_array_append(options, json_new_string(e->pending_ask.options[i]));
+  }
+  json_object_set(payload, "options", options);
+  json_object_set(payload, "plan", json_new_null());
+  return payload;
+}
+
+/* The parked ask's PAIRED close (escalation spec §1.3): the ordinary close's
+   sibling — ONE fire-and-post batch of [cell.result (the real status),
+   step.end, the "ask" record, turn.end{reason blocked}] so the ask and its
+   turn's close can never split across a crash boundary (a crash between the
+   turn close and the ask publish cannot exist, spec §4.1). On rc == 0 the
+   engine's compose-time facts flip (turn_open/step_open → 0) and the engine
+   rests in FRAME_PHASE_ASK. A pre-post refusal leaves the OPEN tail and the
+   park standing (the store's records stay the truth; no half-parked state —
+   the park is set by the SAME batch's completion, spec §5); the standing
+   pre-post-refusal return propagates loud. CONSUMES the payload on every
+   path. Returns the pre-post rc (0 = posted). */
+int _frame_engine_ask_close_post(frame_t* f, json_value_t* result_payload) {
+  if (f == NULL || f->st == NULL || f->engine.pending_ask.ask_id == NULL) {
+    log_error("frame: the parked ask's close on a dead frame or no park");
+    json_value_destroy(result_payload);
+    return -1;
+  }
+  json_value_t* ask_payload = _frame_ask_record_payload(f, &f->engine);
+  if (ask_payload == NULL) {
+    log_error("frame: the ask record at '%s' never composed — the close is "
+              "refused pre-post (the park stands for the next cell's close)",
+              f->sid_path);
+    json_value_destroy(result_payload);
+    return -1;
+  }
+  const char* names[4] = {"cell.result", LIFE_EVENT_STEP_END, "ask",
+                          LIFE_EVENT_TURN_END};
+  json_value_t* payloads[4] = {
+      result_payload,
+      lifecycle_step_json(f->engine.turn_counter, 1),
+      ask_payload,
+      lifecycle_turn_end_json(f->engine.turn_counter, LIFE_REASON_BLOCKED,
+                              NULL)};
+  int rc = _frame_event_batch_post_fire(f, names, payloads, 4, "ask close");
+  if (rc != 0) {
+    log_error("frame: the parked ask's close batch at '%s' was refused "
+              "pre-post — the turn stays OPEN and the park stands (no "
+              "half-parked state, spec §5)", f->sid_path);
+    return rc;
+  }
+  /* The close POSTED: the compose-time facts follow, and the engine PARKS
+     (the same shape as FRAME_PHASE_MODEL awaiting its completion). The task
+     loop's driver breaks on FRAME_PHASE_ASK; a reply's FRM_TURN reposts. */
+  f->engine.turn_open = 0;
+  f->engine.step_open = 0;
+  f->engine.phase = FRAME_PHASE_ASK;
+  return 0;
+}
+
+/* The parked-ask state's clear (the pending ask dies whenever the engine's
+   bookkeeping dies — the engine-end funnel(s), the interrupt's OOM corner,
+   and the frame teardown). Free what the park owns, zero the rest; the pyrt
+   publish flag follows the park (no park → the verb cannot refuse). */
+void _frame_engine_ask_clear(frame_t* f) {
+  if (f == NULL) return;
+  free(f->engine.pending_ask.ask_id);
+  free(f->engine.pending_ask.question);
+  if (f->engine.pending_ask.options != NULL) {
+    for (size_t i = 0; i < f->engine.pending_ask.noptions; i++) {
+      free(f->engine.pending_ask.options[i]);
+    }
+    free(f->engine.pending_ask.options);
+  }
+  f->engine.pending_ask.ask_id = NULL;
+  f->engine.pending_ask.question = NULL;
+  f->engine.pending_ask.options = NULL;
+  f->engine.pending_ask.noptions = 0;
+  f->engine.pending_ask.corr = 0;
+  f->engine.pending_ask.plan_gate = 0;
+#ifdef SA_HAS_PYTHON
+  if (f->pyrt != NULL) pyrt_ask_parked_set(f->pyrt, 0);
+#endif
+}
+
 /* The interrupt synthesis (surface-completion spec §2): ONE mechanism, three
    callers, their own texts. arm_cut = 1 for the frame_interrupt entry (cases
    may arm pyrt's boundary cut); arm_cut = 0 for the DEADLINE callers (the
@@ -2597,6 +2702,11 @@ void _frame_interrupt_apply(frame_t* f, uint8_t arm_cut,
       log_error("frame: the interrupted cell at '%s' closes WITHOUT its "
                 "durable cell.result (out of memory) — the tail's missing "
                 "record is resume-repair-visible loud", f->sid_path);
+      /* The engine state dies here without the terminate's funnel (this
+         corner never reaches one) — the pending ask goes with it (the same
+         discipline as every other engine-owned byte; the parked publish
+         flag follows). */
+      _frame_engine_ask_clear(f);
       f->cell_interrupted_corr = f->cell_pyrt_corr;
       f->cell_pending = 0;
       f->cell_status = 1;
@@ -3512,8 +3622,12 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
                f->engine.phase == FRAME_PHASE_CELL &&
                f->engine.turn_open != 0)
                   ? 1 : 0;
-          if (_frame_engine_result_close_post(f, result_payload,
-                                              with_riders) != 0) {
+          int close_rc =
+              (with_riders != 0 && f->engine.pending_ask.ask_id != NULL)
+                  ? _frame_engine_ask_close_post(f, result_payload)
+                  : _frame_engine_result_close_post(f, result_payload,
+                                                    with_riders);
+          if (close_rc != 0) {
             log_error("frame: the cell.result event for corr %llu was refused "
                       "pre-post at '%s' (already logged)",
                       (unsigned long long)f->cell_corr, f->sid_path);
@@ -3809,17 +3923,160 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
                              "aborted: cell exceeded the watchdog deadline");
       break;
     }
-    case FRM_ASK:
-      /* The blocked-ask publish (Task 2 wires the real park): in this
-         build the park machinery is NOT wired in — the loud late-drop is
-         the case (never silence): a real session must see its ask refused
-         on the log, not die unheard. The payload stays INTACT on purpose:
-         actor_run retires it through the frm_ask_payload_destroy the post
-         site attached (frame_messages.h's contract — no destroy table
-         exists here; every payload dies by its attached destroyer). */
-      log_error("frame: an ask arrived at the frame's mailbox — the park "
-                "machinery is not wired in this build; refusing loud");
+    case FRM_ASK: {
+      /* The blocked-ask publish (escalation spec §1.3): the ask DEFERS to the
+         turn close — the engine mints the ask_id, OWNS the question/options
+         into the park, and returns; the close batch (cell.result + step.end
+         + the "ask" record + turn.end{blocked}) composes when this cell
+         completes (the PYRT_RESULT close's ask sibling). The case CONSUMES
+         the payload exactly like FRM_STEER: the shell retires here, the
+         stolen strings live in the park until the engine's clear.
+         One ask per frame at a time: the verb's publish flag refuses
+         same-turn refires (the second ask never posts); THIS belt is the
+         dispatch-time twin for a hand-crafted or otherwise-raced publish. */
+      frm_ask_payload_t* ap = (frm_ask_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (ap == NULL) {
+        log_error("frame: FRM_ASK with no payload at '%s'", f->sid_path);
+        break;
+      }
+      uint8_t options_torn = (ap->options == NULL && ap->noptions > 0) ? 1 : 0;
+      for (size_t i = 0; !options_torn && i < ap->noptions; i++) {
+        if (ap->options[i] == NULL || ap->options[i][0] == '\0') {
+          options_torn = 1;
+        }
+      }
+      if (ap->question == NULL || ap->question[0] == '\0' || options_torn) {
+        log_error("frame: FRM_ASK at '%s' refuses a malformed ask (no "
+                  "question, or an empty/torn option) — dropped loud",
+                  f->sid_path);
+        frm_ask_payload_destroy(ap);
+        break;
+      }
+      if (f->engine.pending_ask.ask_id != NULL) {
+        log_error("frame: a second ask arrived at '%s' while one is parked "
+                  "(%s) — refused", f->sid_path, f->engine.pending_ask.ask_id);
+        frm_ask_payload_destroy(ap);
+        break;
+      }
+      if (f->engine.engine_live == 0 || f->engine.turn_open == 0) {
+        log_error("frame: an ask arrived at '%s' with no live OPEN turn to "
+                  "close in — the ask cannot park; refusing loud",
+                  f->sid_path);
+        frm_ask_payload_destroy(ap);
+        break;
+      }
+      /* Mint from the ROOT allocator (the sid's mechanism, one allocator —
+         no collisions): the same 8-hex shape the session sids use. */
+      char minted[9];
+      _frame_sid_generate(f->root, minted);
+      f->engine.pending_ask.ask_id = strdup(minted);
+      if (f->engine.pending_ask.ask_id == NULL) {
+        log_error("frame: out of memory boxing the ask at '%s' — refuse loud",
+                  f->sid_path);
+        frm_ask_payload_destroy(ap);
+        break;
+      }
+      /* OWN the ask (steal the payload's strings; the shell is torn down now
+         — its destroyer finds empty slots only). */
+      f->engine.pending_ask.corr = ap->corr;
+      f->engine.pending_ask.question = ap->question;
+      ap->question = NULL;
+      f->engine.pending_ask.options = ap->options;
+      f->engine.pending_ask.noptions = ap->noptions;
+      ap->options = NULL;
+      ap->noptions = 0;
+      frm_ask_payload_destroy(ap);
+      log_info("frame: ask %s parked under '%s' — the turn closes blocked at "
+               "its cell's completion", f->engine.pending_ask.ask_id,
+               f->sid_path);
       break;
+    }
+    case FRM_ASK_REPLY: {
+      /* The parked ask's resolution (escalation spec §1.4): validate against
+         the park; a stale ask_id is dropped LOUD (async — the wire ack
+         CANNOT see this; §3.1's contract) while a match composes ONE
+         reply batch [the "ask.reply" record, the answer's user-side
+         msg.append] and resumes via the ordinary FRM_TURN continuation. The
+         pending ask is consumed EXACTLY ONCE: the park's clear follows the
+         batch's POST (a refused batch leaves it standing for the retry). */
+      frm_ask_reply_payload_t* rp = (frm_ask_reply_payload_t*)msg->payload;
+      msg->payload = NULL;
+      if (rp == NULL || rp->ask_id == NULL || rp->ask_id[0] == '\0' ||
+          rp->decision > 1 ||
+          (rp->decision == 0 && (rp->value == NULL || rp->value[0] == '\0'))) {
+        log_error("frame: FRM_ASK_REPLY at '%s' refuses a malformed reply "
+                  "(ask_id, decision 0|1, an answer's value) — dropped loud",
+                  f->sid_path);
+        frm_ask_reply_payload_destroy(rp);
+        break;
+      }
+      if (f->engine.pending_ask.ask_id == NULL ||
+          strcmp(rp->ask_id, f->engine.pending_ask.ask_id) != 0) {
+        log_error("frame: a reply for ask %s arrived at '%s' — no park holds "
+                  "it (current %s) — dropped",
+                  rp->ask_id, f->sid_path,
+                  (f->engine.pending_ask.ask_id != NULL)
+                      ? f->engine.pending_ask.ask_id : "none");
+        frm_ask_reply_payload_destroy(rp);
+        break;
+      }
+      /* The durable resolution's words (the standing decision law: a reject
+         is data the model reads — the generic verb's wording on an empty
+         refusal; the ladder's default wording is the plan-gate slice's). */
+      const char* decision_name =
+          (rp->decision == 0) ? "answer" : "reject";
+      const char* content;
+      if (rp->decision == 0) {
+        content = rp->value;
+      } else if (rp->value != NULL && rp->value[0] != '\0') {
+        content = rp->value;   /* reject WITH text: the objection rides verbatim */
+      } else {
+        content = "Owner declined.";
+      }
+      json_value_t* reply_payload = json_new_object();
+      json_value_t* append_payload = _frame_msg_append_payload("user", content);
+      if (reply_payload != NULL) {
+        json_object_set(reply_payload, "kind", json_new_string("ask-reply"));
+        json_object_set(reply_payload, "askId", json_new_string(rp->ask_id));
+        json_object_set(reply_payload, "decision",
+                        json_new_string(decision_name));
+        json_object_set(reply_payload, "value",
+                        (rp->value != NULL && rp->value[0] != '\0')
+                            ? json_new_string(rp->value) : json_new_null());
+      }
+      if (reply_payload == NULL || append_payload == NULL) {
+        json_value_destroy(reply_payload);
+        json_value_destroy(append_payload);
+        /* The park stands (nothing was posted) — the same reply lands again
+           once the compose succeeds; the loud trail above names it. */
+        log_error("frame: out of memory composing the ask reply's records at "
+                  "'%s' — the park stands for the retry", f->sid_path);
+        frm_ask_reply_payload_destroy(rp);
+        break;
+      }
+      const char* names[2] = {"ask.reply", "msg.append"};
+      json_value_t* payloads[2] = {reply_payload, append_payload};
+      int rc = _frame_event_batch_post_fire(f, names, payloads, 2, "ask reply");
+      frm_ask_reply_payload_destroy(rp);   /* the reply was consumed — the
+                                              shell retires on EVERY path */
+      if (rc != 0) {
+        /* Nothing was posted (the pre-post refusal already logged): the park
+           stands for a retry; the engine's state keeps its compose-time
+           truth. */
+        break;
+      }
+      /* The park is CLEAR (the funnel: it also drops the pyrt publish flag
+         — no engine park, no parked ask) and the engine re-enters via the
+         ordinary FRM_TURN continuation (a fresh turn over a derive that now
+         carries the answer): the same repost idiom frame_interrupt's
+         continuation uses on its own mailbox. */
+      _frame_engine_ask_clear(f);
+      f->engine.phase = FRAME_PHASE_NONE;
+      _frame_post(&f->actor, (uint32_t)FRM_TURN, NULL, NULL,
+                  "the ask's resolution turn continuation");
+      break;
+    }
     default:
       break;
   }
@@ -5017,6 +5274,72 @@ int _frame_steer_post(frame_t* f, const char* role, const char* content) {
   return 0;
 }
 
+/* The posted ask reply (frame_internal.h's contract — the steer post's
+   verbatim shape): ONE FRM_ASK_REPLY into the frame's own mailbox; the
+   frame's dispatch validates against the park and composes the durable
+   reply batch there. 0 = POSTED (never a commit confirm). */
+int _frame_ask_reply_post(frame_t* f, const char* ask_id, uint8_t decision,
+                          const char* value) {
+  if (f == NULL || f->st == NULL) {
+    log_error("frame: ask reply post on a dead frame");
+    return -1;
+  }
+  if (ask_id == NULL || ask_id[0] == '\0') {
+    log_error("frame: ask reply post needs an ask_id");
+    return -1;
+  }
+  if (decision > 1) {
+    log_error("frame: ask reply post needs decision 0 (answer) or 1 (reject)");
+    return -1;
+  }
+  frm_ask_reply_payload_t* rp =
+      (frm_ask_reply_payload_t*)get_clear_memory(sizeof(frm_ask_reply_payload_t));
+  rp->ask_id = strdup(ask_id);
+  rp->decision = decision;
+  rp->value = strdup((value != NULL) ? value : "");
+  if (rp->ask_id == NULL || rp->value == NULL) {
+    log_error("frame: out of memory composing an ask reply for '%s'",
+              f->sid_path);
+    frm_ask_reply_payload_destroy(rp);
+    return -1;
+  }
+  _frame_post(&f->actor, (uint32_t)FRM_ASK_REPLY, rp,
+              frm_ask_reply_payload_destroy, "wire ask reply");
+  return 0;
+}
+
+int frame_ask_reply(frame_t* f, const char* ask_id, uint8_t decision,
+                    const char* value) {
+  /* The boundary's validation (fail loud, never silent truncation — the ask
+     fields' standing rule): a dead frame, an empty/oversized ask_id, a
+     decision outside 0|1, an oversized value, and an answer with no text
+     are all refused BEFORE any post (rc < 0). */
+  if (f == NULL || f->st == NULL) {
+    log_error("frame_ask_reply: dead frame");
+    return -1;
+  }
+  if (ask_id == NULL || ask_id[0] == '\0' || strlen(ask_id) > 40) {
+    log_error("frame_ask_reply: an ask_id up to 40 chars is required");
+    return -1;
+  }
+  if (decision > 1) {
+    log_error("frame_ask_reply: decision must be 0 (answer) or 1 (reject)");
+    return -1;
+  }
+  if (decision == 0 && (value == NULL || value[0] == '\0')) {
+    log_error("frame_ask_reply: an ANSWER carries its answer text (a reject "
+              "is allowed to be empty)");
+    return -1;
+  }
+  if (value != NULL && strlen(value) > SA_BUDGET_BRIDGE_VALUE_BYTES) {
+    log_error("frame_ask_reply: the value exceeds the bridge budget "
+              "(%u bytes) — refused, never truncated",
+              (unsigned)SA_BUDGET_BRIDGE_VALUE_BYTES);
+    return -1;
+  }
+  return _frame_ask_reply_post(f, ask_id, decision, value);
+}
+
 scheduler_pool_t* frame_pool(const frame_t* f) {
   return (f != NULL) ? f->pool : NULL;
 }
@@ -5086,6 +5409,10 @@ static void _frame_destroy_run(frame_t* f) {
      the CHILDREN yield included — must not leak the last cell's bytes. */
   free(f->engine.doom_last_code);
   f->engine.doom_last_code = NULL;
+  /* The parked ask dies with the frame the same way (a destroy mid-park
+     abandons the owner's dialog; the ask record + turn.end{blocked} are the
+     durable truth a replay/reconnect sees). */
+  _frame_engine_ask_clear(f);
   if (f->engine.turn_reply != NULL) {
     /* A live engine's in-flight turn reply dies here (a destroy mid-turn —
        the engine state is not the queue's business). */
