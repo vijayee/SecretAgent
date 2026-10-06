@@ -5482,6 +5482,11 @@ frame_t* frame_resume(wave_database_root_t* db, const char* sid,
 fail:
   if (f->st != NULL) database_subtree_close(f->st);
   free(f->sid_path);
+  /* The parent path is restored BEFORE every refusal below (the escalation
+     ladder's check included) — the label tears it down too, exactly like the
+     create site's fail label; every earlier goto here rides parent_path NULL
+     and free(NULL) is a no-op. */
+  free(f->parent_path);
   free(f->model_base_url);
   free(f->model_api_key);
   free(f->model_name);

@@ -546,6 +546,23 @@ TEST(TestFrame, TestEscalationModeInherits) {
   bad_resume_cfg.escalation_mode = 7;
   EXPECT_EQ(frame_resume(inline_db, sid.c_str(), &bad_resume_cfg), nullptr)
       << "a mode outside the ladder refuses loud at resume too";
+
+  /* The CHILD-shaped refusal (the resume fail label's teardown pin): a child
+     subtree's meta/parent is restored BEFORE the escalation-mode gate, so a
+     refusal there must tear parent_path down with everything else — the
+     label frees it like the create site's does (free(NULL) for the
+     root-shaped refusal above; LSan proves the child shape here). */
+  frame_t* spawn_root2 = frame_create(inline_db, NULL, "leak ladder root", &cfg);
+  ASSERT_NE(spawn_root2, nullptr);
+  frame_t* child2 = frame_spawn(spawn_root2, "leak ladder leaf", NULL);
+  ASSERT_NE(child2, nullptr);
+  std::string child_sid = frame_sid(child2);
+  ASSERT_EQ(_frame_set_status_done(child2), 0);
+  frame_destroy(child2);
+  frame_destroy(spawn_root2);
+  EXPECT_EQ(frame_resume(inline_db, child_sid.c_str(), &bad_resume_cfg), nullptr)
+      << "a child-shaped resume with a mode outside the ladder refuses loud "
+         "(and its restored parent_path lands in the fail label's teardown)";
   wave_db_close(inline_db);
 }
 
