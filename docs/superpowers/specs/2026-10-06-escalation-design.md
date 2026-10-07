@@ -183,8 +183,12 @@ the approval gate **auto-approves**: at the plan turn's close the engine writes
 surface involvement at any point. The log trail records which mode governed every transition.
 `agent.ask` under bypass **refuses as data** ("escalation bypassed: asked questions have no
 answerer") — an open question with no answerer would park the frame forever; refusing loudly is
-the honest behavior. The same refusal applies wherever no client owns the session (this is the
-no-UI default INVERTED from PA's block-by-default, only here).
+the honest behavior. THE REFUSAL KEYS OFF THE BYPASS MODE, not the answerer's presence: a
+non-bypass frame without a live answering client PARKS on its ask, and the parked ask is
+recoverable without one — the ask record replays to a reconnecting client, the steer/interrupt
+wakeup latches answer it durably (§4), and a later `frame_ask_reply`/resume consumes the
+record. (The old draft's "no client owns the session" wording mis-stated the trigger: the parked
+flag is the mode's, never the surface's.)
 
 ### 2.4 The approval consult
 
@@ -291,7 +295,11 @@ The park is the first DURABLE quiescence point, and the wakeup classes latch the
 
 ## 5. Error handling (every path lands data or fails loud)
 
-- Stale/unknown `ask_id` → dropped loud, ack `delivered:false` (§3.1).
+- Stale/unknown `ask_id` → dropped loud; THE ACK CANNOT SEE IT (`delivered:1` = the reply was
+  posted into the frame's mailbox — bind/post only, §3.1's pinned contract): a wrong id POSTS
+  and then drops loud at the engine, and the stale truth lives in the events stream (no
+  `ask.reply` record; the standing park). Only the unbindable shapes (an unknown sid, no such
+  frame, the post refused) get `delivered:false`.
 - A second `agent.ask` while parked or pre-park-in-turn → the verb's refusal return (§1.1).
 - Malformed verb inputs (empty/oversized question, bad options list) → the verb's refusal
   return, data (§1.1). Boundary caps from the budget table; no silent truncation of ask fields.
@@ -322,6 +330,12 @@ The park is the first DURABLE quiescence point, and the wakeup classes latch the
 - The wire's frame-creation escalation knob (client-chosen `escalation_mode` at PROMPT-create
   time) — client frames run `free` this slice (§2); a CONFIG-pair extension if the Pondr slice
   asks for it.
+- The demo's DIRECT console leg live re-prove — the serve/client (wire) legs proved live in the
+  slice's live gate; the direct console leg (the local one-frame path) re-proves its ask surface
+  when an answerable model endpoint is up again (the slice task ran endpoint-blocked).
+- The positional `frame_config_t` brace-init cleanup candidate — `test_model_decode.cpp`'s 11
+  bumped inits re-read their positional initializers when the struct next grows fields; a
+  designated-initializer pass is a tidy-up candidate, not this slice's business (recorded).
 
 ## 7. Tests (the falsifiable set)
 
@@ -330,13 +344,17 @@ The park is the first DURABLE quiescence point, and the wakeup classes latch the
   latch (auto-answer "superseded", the steer served); interrupt-during-park (auto-answer
   "interrupted", idle-resumable frame, no poison); both-arrive (interrupt wins, steer carried);
   second-ask refusal; stale FRM_ASK_REPLY dropped loud; the free-mode standing pins (no ask
-  machinery touched); child-frame ask (parent stays parked in CHILDREN; one owner-surface ask).
+  machinery touched); the ask verb's refusal under BYPASS.
 - **`test/test_frame.cpp`**: the ladder — plan turn tools-null (`_model_request_body`'s
   no-tools shape asserted), the plan-instructions block in the derive, approve → act turns free
   (a real cell runs), reject → replan, reject-with-text → the text visible, the
   `plan-approved` control record, phase recovery across restart (act persists), BYPASS
-  (plan → auto-approve control record `{auto:true}` → act, NO ask record ever, the ask verb's
-  refusal) — plus BYPASS inheritance.
+  (plan → auto-approve control record `{auto:true}` → act, NO ask record ever) — plus BYPASS
+  inheritance; the CHILD-FRAME ASK (parent stays parked in CHILDREN, the child parks on its
+  ask, the owner's answer resumes the child and the report resumes the parent —
+  `TestFrameTree.TestChildAskParksTheChildAndTheParentWaits`); the plan gate's double-boxing
+  belt (the standing-park pre-box refusal, fault-injected standing ask —
+  `TestPlanGateBeltRefusesAStandingParkedAsk`).
 - **`test/test_lifecycle.cpp`**: `blocked`'s first-writer fold + the balanced-tail repair rule
   (no spurious closers over ask+blocked) + the repair-composer's blocked row.
 - **`test/test_client_api_wire.cpp`**: CA_ASK_REPLY 16/17 encode/decode round-trips (bytes +
