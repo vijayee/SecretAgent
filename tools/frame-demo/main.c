@@ -702,12 +702,14 @@ static int _demo_parked_ask_scan(frame_t* f, demo_ask_slot_t* slot) {
  * handler's write(2), the unistd includes; the platform layer has no
  * fd-poll surface — its poll-dancer watchers are socket watchers), so the
  * demo keeps the honest minimal tool. A partial line waits in the buffer;
- * bytes past a buffer's cap drop with a note (the demo never grows
- * unbounded); EOF after a partial line flushes the rest as the line. */
+ * a line PAST the cap drops entirely (it could otherwise never complete
+ * and wedge the console) — stdin resyncs past the paste at the line's
+ * own newline; EOF after a partial line flushes the rest as the line. */
 typedef struct {
   char pending[1024];
   size_t len;
   int eof;
+  int over;   /* 1: an oversized line is mid-drop, riding out to its '\n' */
 } demo_stdin_buf_t;
 
 /* Returns 1 = a full line at `line` ('\n' stripped, NUL-terminated),
@@ -744,6 +746,7 @@ static int _demo_stdin_line(demo_stdin_buf_t* b, int timeout_ms, char* line,
                                 re-checks its own wait state */
     if (got == 0) {
       b->eof = 1;
+      if (b->over != 0) return -1;   /* the dropped line's tail rides nothing */
       if (b->len == 0) return -1;
       size_t take = (b->len < cap - 1) ? b->len : cap - 1;
       memcpy(line, b->pending, take);
@@ -753,11 +756,24 @@ static int _demo_stdin_line(demo_stdin_buf_t* b, int timeout_ms, char* line,
                      the NEXT call returns the EOF */
     }
     for (ssize_t i = 0; i < got; i++) {
-      if (b->len >= sizeof(b->pending)) {
+      if (b->over == 0 && b->len >= sizeof(b->pending)) {
+        /* a full buffer with no newline can never complete a line, so the
+           WHOLE line drops — the bytes ride out until the line's own '\n'
+           lands and the buffer clears (the resync below) */
+        b->over = 1;
         fprintf(stderr, "frame-demo: a console line overflowed the %zu byte "
-                "buffer — its head rides, its tail was dropped\n",
+                "buffer — it drops entirely; stdin resyncs at the line's "
+                "next newline\n",
                 sizeof(b->pending) - 1);
-        break;
+      }
+      if (b->over != 0) {
+        if (chunk[i] == '\n') {
+          b->over = 0;
+          b->len = 0;
+          fprintf(stderr, "frame-demo: stdin resynced past an oversized "
+                  "paste\n");
+        }
+        continue;
       }
       b->pending[b->len++] = chunk[i];
     }
@@ -798,13 +814,16 @@ static int _demo_direct_parked_wait(frame_t* f, const demo_ask_slot_t* ask,
       fflush(stdout);
       continue;
     }
-    _demo_answer_resolve_value(ask, &parts.value);
-    if (parts.reject == 0 &&
-        (parts.value == NULL || parts.value[0] == '\0')) {
-      fprintf(stderr, "frame-demo: an answer carries its value (an option's "
-              "label or index, or free text — 'reject' refuses)\n");
-      _demo_answer_line_clear(&parts);
-      continue;
+    /* the rejection's text rides verbatim — the option resolution is an
+       ANSWER's convenience (the client path gates the same way) */
+    if (parts.reject == 0) {
+      _demo_answer_resolve_value(ask, &parts.value);
+      if (parts.value == NULL || parts.value[0] == '\0') {
+        fprintf(stderr, "frame-demo: an answer carries its value (an option's "
+                "label or index, or free text — 'reject' refuses)\n");
+        _demo_answer_line_clear(&parts);
+        continue;
+      }
     }
     int posted = frame_ask_reply(f, ask->ask_id, parts.reject, parts.value);
     _demo_answer_line_clear(&parts);
@@ -1193,6 +1212,8 @@ static void _demo_asks_set(demo_prompt_result_t* r, const char* sid,
     }
     if (free_slot == 4 && r->asks[i].ask_id == NULL) free_slot = i;
   }
+  /* The full registry's eviction lands on slot 0 — a demo-bounded shape
+     (four concurrent parked asks saturate it; not a fair cache). */
   demo_ask_slot_t* target = (matched < 4)
                                 ? &r->asks[matched]
                                 : ((free_slot < 4) ? &r->asks[free_slot]
@@ -1739,6 +1760,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "frame-demo: cannot re-arm the interrupt watcher — "
                 "the resume run rides unwatched (the flag is polled at the "
                 "next console wait)\n");
+      } else {
+        /* the re-arm restores the watch: the disarm cleared it, and a watch
+           frame left NULL turns every later SIGINT into a frame_interrupt
+           on nothing */
+        g_demo_watch_frame = f;
       }
     } else {
       printf("frame-demo: the frame yielded to live children — pumping\n");
