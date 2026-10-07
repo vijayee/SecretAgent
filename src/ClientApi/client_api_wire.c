@@ -780,7 +780,8 @@ static int _decode_ask_reply_request(cbor_item_t* frame, uint64_t req_id,
   return 0;
 }
 
-/* [17, req_id, delivered] */
+/* [17, req_id, delivered] — the closed vocabulary's byte: a delivered > 1
+   refuses loud (the request's decision carries the same bound) */
 static int _decode_ask_reply_response(cbor_item_t* frame, uint64_t req_id,
                                       void** payload) {
   ca_ask_reply_response_t* res;
@@ -793,7 +794,7 @@ static int _decode_ask_reply_response(cbor_item_t* frame, uint64_t req_id,
   item = cbor_array_get(frame, 2);
   rc = item == NULL ? -1 : _decode_u8(item, &res->delivered);
   cbor_decref(&item);
-  if (rc != 0) {
+  if (rc != 0 || res->delivered > 1) {
     ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, res);
     return -1;
   }
@@ -878,6 +879,9 @@ static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
       break;
     case CA_ASK_REPLY_RESPONSE:
       rc = _decode_ask_reply_response(frame, *req_id, payload);
+      /* delivered rides *status; the sa_client consumer reads the PAYLOAD's
+         delivered member, never trusting status==0 (the standing ok-idiom
+         would invert a 0 into an error) */
       if (rc == 0) *status = ((ca_ask_reply_response_t*)*payload)->delivered;
       break;
     default:

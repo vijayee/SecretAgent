@@ -848,15 +848,47 @@ TEST(TestClientApiWire, TestAskReplyRoundTrip) {
   payload = NULL;
   free(raw);
 
-  /* the response-side refusal: a malformed element count refuses loud */
+  /* the response-side refusals: the count guard (a 2-element or 4-element
+     frame refuses — [17, req_id, "x", "y"] is the 3-element count + 1) and,
+     pinned separately, a string in the delivered seat refuses at _decode_u8
+     (a string is not a uint, even at the valid 3-element count) */
   uint8_t* raw2 = NULL;
   size_t raw2_len = 0;
   payload = NULL;
-  _hand_frame(CA_ASK_REPLY_RESPONSE, 3, {"extra"}, &raw2, &raw2_len);
+  _hand_frame(CA_ASK_REPLY_RESPONSE, 3, {}, &raw2, &raw2_len);
   EXPECT_EQ(ca_wire_decode_bytes(raw2, raw2_len, &type, &payload, &req_id,
-                                 &status), -1);
+                                 &status), -1)
+      << "the 2-element count refuses";
   EXPECT_EQ(payload, nullptr);
   free(raw2);
+
+  _hand_frame(CA_ASK_REPLY_RESPONSE, 3, {"x", "y"}, &raw2, &raw2_len);
+  EXPECT_EQ(ca_wire_decode_bytes(raw2, raw2_len, &type, &payload, &req_id,
+                                 &status), -1)
+      << "the 4-element count refuses";
+  EXPECT_EQ(payload, nullptr);
+  free(raw2);
+
+  _hand_frame(CA_ASK_REPLY_RESPONSE, 3, {"not-a-number"}, &raw2, &raw2_len);
+  EXPECT_EQ(ca_wire_decode_bytes(raw2, raw2_len, &type, &payload, &req_id,
+                                 &status), -1)
+      << "a string in the delivered seat refuses at _decode_u8";
+  EXPECT_EQ(payload, nullptr);
+  free(raw2);
+
+  /* the delivered byte's bound: the closed vocabulary carries 0/1 only —
+     a delivered > 1 refuses at decode (the request's decision carries the
+     same bound) */
+  res.req_id = 41;
+  res.delivered = 5;
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_RESPONSE, &res, &raw, &raw_len), 0);
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
 }
 
 TEST(TestClientApiWire, TestAskReplyPairAssertsExtend) {
