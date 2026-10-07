@@ -2529,6 +2529,14 @@ int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
        tail, the driver's loud stall or the resume repair's business). */
     f->engine.turn_open = 0;
     f->engine.step_open = 0;
+    /* The ask-exemption marker's NORMAL close (the spoof guard's clear —
+       the marker's fork already routed the no-publish shape loud before
+       this composer could be the turn's ender): a close of a plan turn
+       whose exempted cell result arrived with a park standing belongs to
+       the ask close above, so any normal-completed close of a marked cell
+       means the marker's turn is over — spend it (the engine-start/end
+       resets cover the odd leftover shapes). */
+    f->engine.plan_ask_cell = 0;
   }
   return rc;
 }
@@ -2654,6 +2662,10 @@ int _frame_engine_ask_close_post(frame_t* f, json_value_t* result_payload) {
   f->engine.turn_open = 0;
   f->engine.step_open = 0;
   f->engine.phase = FRAME_PHASE_ASK;
+  /* The honest exempted plan cell's marker clears at ITS close (the parked
+     close is the publish's proof — the plan-ask slice's spoof guard never
+     fires on this shape). */
+  f->engine.plan_ask_cell = 0;
   return 0;
 }
 
@@ -3820,11 +3832,31 @@ static void _frame_behavior_impl(void* state, message_t* msg) {
                f->engine.phase == FRAME_PHASE_CELL &&
                f->engine.turn_open != 0)
                   ? 1 : 0;
-          int close_rc =
-              (with_riders != 0 && f->engine.pending_ask.ask_id != NULL)
-                  ? _frame_engine_ask_close_post(f, result_payload)
-                  : _frame_engine_result_close_post(f, result_payload,
-                                                    with_riders);
+          /* THE PLAN-ASK EXEMPTION'S OUTCOME CHECK (the review's spoof
+             guard): the exempted plan cell's result with NO park standing —
+             the reply-time needle scan matched the code's TEXT but the run
+             published no ask. The bare audit answer goes FIRST (the honest
+             run's cell.result keeps its pairing; the completed riders are
+             stripped — the turn's end rides the fail close below as
+             {error}), then `_frame_engine_plan_ask_cell_fail` fails the turn
+             loud and ends it — a spoofed needle's plan cell never silently
+             passes for an ask (the honest parked cell never reaches this
+             fork: its published park routes to the ask close instead). */
+          uint8_t ask_spoofed =
+              (with_riders != 0 && f->engine.plan_ask_cell != 0 &&
+               f->engine.pending_ask.ask_id == NULL)
+                  ? 1 : 0;
+          int close_rc;
+          if (ask_spoofed != 0) {
+            close_rc = _frame_engine_result_close_post(f, result_payload, 0);
+            _frame_engine_plan_ask_cell_fail(f);
+          } else {
+            close_rc =
+                (with_riders != 0 && f->engine.pending_ask.ask_id != NULL)
+                    ? _frame_engine_ask_close_post(f, result_payload)
+                    : _frame_engine_result_close_post(f, result_payload,
+                                                      with_riders);
+          }
           if (close_rc != 0) {
             log_error("frame: the cell.result event for corr %llu was refused "
                       "pre-post at '%s' (already logged)",

@@ -131,6 +131,21 @@ typedef struct frame_engine_state_t {
      (the model_retry_step lifecycle: a DEAD/restarted engine never carries
      it — the next run's first derive re-consults the records). */
   uint8_t ladder_act;
+  /* The plan turn's ask-EXEMPTION marker (escalation spec §2.2; the review's
+     spoof guard): 1 = this turn's tool call was exempted by the reply-time
+     needle scan (`actor.ask` in the cell's code — the model's clarifying
+     ask). The scan verifies the INTENT only (a bare strstr over the code's
+     text), so the cell's close verifies the OUTCOME: the result close must
+     find a PUBLISHED ask (the parked close clears the marker) or the turn
+     fails loud — "the exempted ask cell published no ask" (the result close's
+     fork). ACCEPTED CONSEQUENCE: a spoofed needle (the needle inside a
+     comment or a dead string) DOES run its cell before the loud failure —
+     the escape is loud-visible and the turn ends error, never silent.
+     Cleared at every close path (the parked close, the normal close, the
+     sync-cell-refusal close) and reset at the engine's start and end (the
+     model_retry_step lifecycle); ONE exempted cell per plan turn — its close
+     ends the turn either way. */
+  uint8_t plan_ask_cell;
   uint8_t engine_failed;       /* the last terminal step failed (frame_run_loop's rc) */
   size_t live_children;        /* children admitted-and-STARTED, not yet resumed
                                   (Task 5; single-writer: the frame's dispatch
@@ -376,6 +391,20 @@ void _frame_engine_model_arrived(frame_t* f, frm_model_payload_t* payload);
    (Synchronous cell refusals — pending never set — let the FRM_CELL_RUN reply
    step resume; see _frame_engine_store_reply's CELL_RUN path.) */
 void _frame_engine_cell_done(frame_t* f);
+
+/* The plan turn's ask-exemption verification's OUTCOME half (the spoof guard;
+   the review's Important finding): frame.c's PYRT_RESULT close fork calls it
+   when the exempted cell's result arrived and NO park stands — the needle
+   scan matched the code's TEXT, but the run published no ask. Clears the
+   turn-scoped marker and fails the turn loud via the standing fail close —
+   the control {plan-mode, ...} + turn.end{error} batch, then the terminate:
+   the frame stays resumable (the next run re-enters plan, ladder_act
+   untouched) and the poison rules are UNTOUCHED (a model-behavior failure,
+   never a runtime fault). The caller composes the BARE cell.result first
+   (the audit's answer keeps its pairing; the completed riders would lie) and
+   calls this after. A parked ask standing here is a loud no-op clear (the
+   fork never routes one here — the honest cell's result is the ask close). */
+void _frame_engine_plan_ask_cell_fail(frame_t* f);
 
 /* End the live engine (loop.c implements; the failure surfaces AND
    frame.c's interrupt synthesis call it): ok=0 → engine_failed + a CHILD's

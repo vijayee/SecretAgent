@@ -4243,6 +4243,139 @@ TEST(TestFrame, TestModelAskDuringPlanStaysPlanAfterTheReply) {
   wave_db_close(db);
 }
 
+TEST(TestFrame, TestPlanCellNeedleSpoofFailsLoud) {
+  /* THE ASK EXEMPTION'S OUTCOME CHECK (the review's spoof guard): the
+     reply-time needle scan reads the cell code's TEXT — `actor.ask` inside a
+     COMMENT matches it and exempts the plan turn's tool call. THE SPOOFED
+     CELL **DOES RUN** (the accepted consequence: the needle scan is
+     intent-only; the escape is loud-visible and the model self-corrects on
+     its next derive) — `print(1+1)` executes and its cell.result answers the
+     audit honestly — but the cell publishes NO ask: py_agent's ask verb is
+     never called (the log proves it — ZERO "ask" records anywhere), so the
+     close-side outcome check takes the verdict: the fail close — control
+     {plan-mode, "the exempted ask cell published no ask"} + turn.end{error}
+     — and the terminate. The frame stays resumable: the next run is STILL
+     plan (ladder_act never flipped) and gates normally. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "plan: spoofed ask needle", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {
+      canned_cell_body("# actor.ask in a comment\nprint(1+1)"),
+      lf_content_body("Plan: the retried plan after the loud failure")};
+  frame_set_model_backend(f, &lm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 1) << "the spoofed exempted cell failed loud";
+  EXPECT_EQ(frame_is_done(f), 0) << "the failed terminate never ends a top frame";
+  ASSERT_EQ(lm.tools_seen.size(), 1u);
+  EXPECT_EQ(lm.tools_seen[0], "json-null")
+      << "the exempted cell's turn was a PLAN turn (tools-null)";
+  ASSERT_EQ(lm.captured.size(), 1u);
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  /* THE RECORDER SHAPE: zero publishes — no "ask" record exists anywhere
+     (the ask verb's publish always parks + records; nothing was answered). */
+  EXPECT_EQ(fr_count_type(events, "ask"), 0u)
+      << "the spoofed cell published NO ask";
+  EXPECT_EQ(fr_count_type(events, "ask.reply"), 0u);
+  EXPECT_EQ(lf_find_gate_ask(events), nullptr)
+      << "the gate never fired on the spoofed turn";
+
+  /* THE AUDIT STAYS HONEST: the cell DID run — its cell.result pair answers
+     the turn's cell.run line. Find the LAST cell.result (this turn's). */
+  json_value_t* result_rec = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "cell.result")) {
+      result_rec = json_at(events, i);
+    }
+  }
+  ASSERT_NE(result_rec, nullptr)
+      << "the ran (spoofed) cell's audit answer is still written";
+
+  /* THE FAIL CLOSE: control {plan-mode, ...} + turn.end{error} AFTER the
+     cell.result (the bare close's order). */
+  json_value_t* failure = lf_find_control(events, "plan-mode");
+  ASSERT_NE(failure, nullptr) << "the loud verdict's control record";
+  ASSERT_GT(lf_seq_of(failure), lf_seq_of(result_rec))
+      << "the audit answer precedes the fail close";
+  {
+    json_value_t* fp = lf_payload_of(failure);
+    json_value_t* text_v = json_get(fp, "text");
+    ASSERT_NE(text_v, nullptr);
+    EXPECT_STREQ(json_as_string(text_v),
+                 "the exempted ask cell published no ask");
+  }
+  json_value_t* turn_end = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "turn.end")) {
+      turn_end = json_at(events, i);
+    }
+  }
+  ASSERT_NE(turn_end, nullptr);
+  {
+    json_value_t* tp = lf_payload_of(turn_end);
+    json_value_t* reason = json_get(tp, "reason");
+    ASSERT_NE(reason, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "error");
+  }
+  /* THE FAIL CLOSE IS ONE BATCH: control + step.end (the cell's step durably
+     started) + turn.end{error} — three consecutive seqs after the cell.result
+     (the standing failure-close shape, plan turn or free turn). */
+  {
+    long long base_seq = lf_seq_of(failure);
+    json_value_t* found_step = NULL;
+    for (size_t i = 0; i < json_size(events); i++) {
+      json_value_t* rec = json_at(events, i);
+      if (!event_is(rec, "step.end")) continue;
+      if (lf_seq_of(rec) == base_seq + 1) {
+        found_step = rec;
+        break;
+      }
+    }
+    ASSERT_NE(found_step, nullptr) << "the fail close carries its step.end";
+    EXPECT_EQ(lf_seq_of(turn_end), base_seq + 2)
+        << "the control + step.end + turn.end group is contiguous";
+  }
+  /* NO phase transition rode the spoofed turn (this is NOT the gate). */
+  EXPECT_EQ(lf_find_control(events, "plan-requested"), nullptr);
+  EXPECT_EQ(lf_find_control(events, "plan-approved"), nullptr);
+  json_value_destroy(events);
+
+  /* THE FRAME RESUMABLE: the next run is STILL plan — and it gates normally
+     on the retried plan (the loud failure's consequence, the honest
+     self-correction path). */
+  EXPECT_EQ(frame_run_loop(f), 2) << "the next run is STILL plan";
+  ASSERT_EQ(lm.tools_seen.size(), 2u);
+  EXPECT_EQ(lm.tools_seen[1], "json-null")
+      << "the next request is STILL tools-null";
+  EXPECT_NE(lm.captured[1].find("PLAN mode"), std::string::npos)
+      << "the plan block still rides";
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* gate = lf_find_gate_ask(events);
+  ASSERT_NE(gate, nullptr) << "the retried plan's turn gated normally";
+  {
+    json_value_t* gp = lf_payload_of(gate);
+    json_value_t* plan_v = json_get(gp, "plan");
+    ASSERT_NE(plan_v, nullptr);
+    EXPECT_EQ(json_type(plan_v), JSON_STRING);
+    EXPECT_STREQ(json_as_string(plan_v),
+                 "Plan: the retried plan after the loud failure");
+  }
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 #endif /* SA_HAS_PYTHON */
 
 #endif /* SA_HAS_WDB */

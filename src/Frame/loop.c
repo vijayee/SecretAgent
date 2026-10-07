@@ -804,6 +804,42 @@ static void _loop_fail(frame_t* f, frame_engine_state_t* e, const char* kind,
                      payload owns its own copy) */
 }
 
+/* The plan turn's ask-exemption verification's OUTCOME half (frame_internal.h;
+   frame.c's PYRT_RESULT close fork calls it): the exempted cell's result
+   arrived and NO park stands — the reply-time needle scan matched the code's
+   TEXT, but the run published no ask (a comment, a dead string, a dead branch
+   rode the scan and the cell executed anything — the pre-approval execution
+   escape spec §2.2 forbids; the doom guard's existence proves the untrusted-
+   model threat model applies here). Clear the turn-scoped marker, then fail
+   the turn LOUD via the standing fail close — the control {plan-mode, ...} +
+   turn.end{error} batch, then the terminate. The frame stays resumable (the
+   next run re-enters plan, ladder_act untouched) and the poison rules are
+   UNTOUCHED (this is a model-behavior failure, never a runtime fault).
+   ACCEPTED CONSEQUENCE (the spoofed needle's cell DOES run before this
+   failure): the escape is loud-visible — the turn ends error, the control
+   record names the miss, and the model self-corrects on its next derive.
+   THE HONEST ORDER (why the check can only see a REAL miss): the ask verb
+   publishes FRM_ASK from INSIDE the running cell — py_agent.c posts it to
+   the frame actor mid-cell, and the pyrt worker posts the cell's PYRT_RESULT
+   only AFTER the run returns (both posts from the same thread); the frame's
+   mailbox is FIFO, so the FRM_ASK receipt — which mints the ask_id into
+   pending_ask — always precedes the PYRT_RESULT dispatch. A result with
+   pending NULL here is therefore a REAL no-publish: the honest cell's park
+   is already set, and the close fork routes THAT shape to the ask close
+   (never here). */
+void _frame_engine_plan_ask_cell_fail(frame_t* f) {
+  frame_engine_state_t* e = _frame_engine_state(f);
+  if (e == NULL) {
+    log_error("loop: the plan-ask exemption check at an unusable frame "
+              "(already logged)");
+    return;
+  }
+  uint8_t spoofed = (e->pending_ask.ask_id == NULL) ? 1 : 0;
+  e->plan_ask_cell = 0;   /* the turn-scoped marker is spent either way */
+  if (spoofed == 0) return;
+  _loop_fail(f, e, "plan-mode", "the exempted ask cell published no ask");
+}
+
 /* The python availability gate: a WDB-only build has no runtime, so a tool
    call can NEVER execute. The check is lazy (at the first tool call) rather
    than at run_loop entry — a content-only scripted loop stays runnable, and
@@ -836,6 +872,10 @@ static void _loop_engine_end(frame_t* f, frame_engine_state_t* e, uint8_t failed
      lifecycle: a DEAD engine never carries it — a restart's first derive
      re-consults the log's plan-approved control record, spec §2.4). */
   e->ladder_act = 0;
+  /* The plan turn's ask-exemption marker dies with the engine too (the same
+     discipline; frame_internal.h's field contract — its verdict lives only
+     inside the turn whose close it verifies). */
+  e->plan_ask_cell = 0;
   /* The wake latch resets with the engine (a dying engine's queued
      continuation is either consumed or dead-queued — a resumed run must
      wake on its own inputs, never inherit a stale one). */
@@ -1616,12 +1656,22 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
        owner's answer the next turn is STILL plan. The scan is the
        reply-time shape check, the standing cell scripts' spell; a check it
        fails (an aliased import or a scan-evasion spelling) refuses loud —
-       the refusal direction is always safe. */
-    if (_loop_ladder_gating(f, e) != 0 &&
-        _loop_plan_cell_is_the_model_ask(reply->tool_code) == 0) {
-      _loop_fail(f, e, "plan-mode", "the model sent tool calls in a plan turn");
-      model_reply_destroy(reply);
-      return;
+       the refusal direction is always safe. THE SCAN IS INTENT-ONLY: the
+       needle is a plain strstr over the code's TEXT (a comment or a dead
+       string rides it), so the exemption's OUTCOME is verified at the cell's
+       close — the turn-scoped marker below plus frame.c's result-close fork
+       (`_frame_engine_plan_ask_cell_fail`): a no-publish result of an
+       exempted cell fails the turn loud. The spoofed cell DOES run before
+       failing (the accepted consequence: loud-visible, the model
+       self-corrects). */
+    if (_loop_ladder_gating(f, e) != 0) {
+      if (_loop_plan_cell_is_the_model_ask(reply->tool_code) == 0) {
+        _loop_fail(f, e, "plan-mode",
+                   "the model sent tool calls in a plan turn");
+        model_reply_destroy(reply);
+        return;
+      }
+      e->plan_ask_cell = 1;   /* the close must find the published ask */
     }
     _loop_tool_path(f, e, reply);
     return;
@@ -2110,7 +2160,12 @@ static void _loop_engine_on_cell_run(frame_t* f, frame_engine_state_t* e, int rc
      status-1 cell.result right here (the audit-honesty fix — the refused
      cell.run line's counterpart) with the envelope riders riding the SAME
      atomic batch (Task 2 rider 3 — the same composer the PYRT completion
-     uses), then the next turn re-derives from it. */
+     uses), then the next turn re-derives from it.
+     THE EXEMPTION'S MARKER SPENDS HERE TOO (the ask-exemption slice's spoof
+     guard): the refused cell never RAN — no ask could have been published,
+     and the spoof verdict judges a RUN's outcome. The refusal result below
+     is the honest answer; the model re-derives and self-corrects. */
+  e->plan_ask_cell = 0;
   json_value_t* result_payload = json_new_object();
   if (result_payload == NULL) {
     log_error("loop: out of memory building the refused cell's paired "
@@ -2255,6 +2310,9 @@ int _frame_engine_start(frame_t* f) {
   e->ladder_act = 0;   /* the ladder re-consults the log's control records on
                           this run's FIRST derive (spec §2.4) — a restarted
                           engine never inherits the act phase in memory */
+  /* The ask-exemption marker never survives a restart either (the same
+     lifecycle; its verdict is a LIVING turn's close outcome). */
+  e->plan_ask_cell = 0;
   atomic_store(&e->continuation_queued, 0);   /* the wake latch is a per-run
                                    knob: a restart wakes on its own inputs */
   e->engine_failed = 0;
