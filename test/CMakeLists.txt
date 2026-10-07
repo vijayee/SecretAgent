@@ -271,6 +271,7 @@ if (BUILD_TESTING)
            # against a real cell too — its sibling's registration was missed
            # at Task 2 and its full-LSan run fails on the same classes.
            _test_name MATCHES "^TestFrame.TestAskParksAndBlocksTheTurn$" OR
+           _test_name MATCHES "^TestFrame.TestModelAskDuringPlanStaysPlanAfterTheReply$" OR
            _test_name MATCHES "^TestFrame.TestAskStaleReplyIsDroppedLoud$" OR
            _test_name MATCHES "^TestFrame.TestAskSecondAskInSameTurnRefused$" OR
            _test_name MATCHES "^TestFrame.TestAskReplyRefusedBatchKeepsTheParkedAskStanding$")

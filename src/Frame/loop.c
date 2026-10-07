@@ -1210,19 +1210,12 @@ static void _loop_tool_path(frame_t* f, frame_engine_state_t* e,
 
 /* The engine's turn-finish main payload for a plan turn's close: the
    assistant msg.append (the plan text — the content path's ordinary main
-   record), or the empty-turn control when the reply carried no content.
-   Both mirrors of `_frame_engine_finish_post`'s main-record compose (the
-   shape the derive projects exactly the same way). */
+   record). The mirror of `_frame_engine_finish_post`'s main-record compose
+   (the shape the derive projects exactly the same way). An empty plan never
+   reaches here: `_loop_content_path` fails the turn loud before the fork
+   (Fix 2 — the empty-turn degrade would have asked the owner to approve a
+   plan:null, and the bypass's close would have approved one). */
 static json_value_t* _loop_plan_main_payload(const char* content) {
-  if (content == NULL) {
-    /* The empty-turn control event (the exact payload _loop_control
-       composes; the standing finish shape). */
-    json_value_t* c = json_new_object();
-    if (c == NULL) return NULL;
-    json_object_set(c, "kind", json_new_string("empty-turn"));
-    json_object_set(c, "text", json_new_null());
-    return c;
-  }
   json_value_t* m = json_new_object();
   if (m == NULL) return NULL;
   json_object_set(m, "role", json_new_string("assistant"));
@@ -1260,13 +1253,28 @@ static json_value_t* _loop_plan_control_payload(const char* kind, int auto_ok,
    pre-allocation rolled back — the standing fire-and-post discipline) and
    the caller clears the half-boxed ask and fails the turn loud: the parked
    state's truth rides committed records ONLY.
-   content = the plan turn's model text (borrowed; NULL = the empty-turn
-   control, the finishing shape). Returns the pre-post rc (0 = posted). */
+   content = the plan turn's model text (borrowed, non-NULL — the caller
+   fails an empty plan loud before this runs: Fix 2). Returns the pre-post
+   rc (0 = posted; the belt's pre-box refusal returns -1 with the turn
+   already closed error). */
 static int _loop_plan_gate_post(frame_t* f, frame_engine_state_t* e,
                                 const char* content) {
+  /* THE GATE'S BELT (the standing second-ask refusal's shape — frame.c's
+     FRM_ASK consume): a park stands — one ask at a time; the gate never
+     boxes over it. Unreachable in the standing flow (a parked engine
+     re-enters no turns — the phase guards), which is exactly what a belt
+     is for: fail the turn loud HERE, leave the standing park untouched,
+     and report the refusal (rc -1) for the caller's bookkeeping. */
+  if (e->pending_ask.ask_id != NULL) {
+    log_error("loop: a second ask authored at '%s' while one is parked (%s) "
+              "— refused", frame_sid(f), e->pending_ask.ask_id);
+    _loop_fail(f, e, "plan-mode", "the plan gate found a standing ask");
+    return -1;
+  }
   /* The park: the mint (root allocator — no collisions), then the OWNED
-     strings (the FRM_ASK receipt's boxing shape; corr is 0 — no bridge
-     reply sink authored this ask). */
+     strings (the FRM_ASK receipt's boxing shape; corr is boxed EXPLICITLY 0
+     — no bridge reply sink authored this ask, and the gate never relies on
+     struct zeroing). */
   char minted[9];
   _frame_engine_ask_id_mint(f, minted);
   if (minted[0] != '\0') e->pending_ask.ask_id = strdup(minted);
@@ -1287,6 +1295,7 @@ static int _loop_plan_gate_post(frame_t* f, frame_engine_state_t* e,
     return -1;
   }
   e->pending_ask.plan_gate = 1;
+  e->pending_ask.corr = 0;
 
   /* The ask record's plan renders the content CAP-CAPPED (an OUTPUT render —
      the budget table's bridge value cap + the truncate-marker helper; an
@@ -1305,41 +1314,19 @@ static int _loop_plan_gate_post(frame_t* f, frame_engine_state_t* e,
 
   json_value_t* control = _loop_plan_control_payload("plan-requested", 0, 0);
   json_value_t* main = _loop_plan_main_payload(content);
-  json_value_t* ask = json_new_object();
-  json_value_t* options = (ask != NULL) ? json_new_array() : NULL;
+  json_value_t* ask = _frame_ask_record_compose(
+      e->pending_ask.ask_id, e->pending_ask.question, e->pending_ask.options,
+      e->pending_ask.noptions, plan_capped);
   json_value_t* step_start =
       lifecycle_step_json(e->turn_counter, 1);
   json_value_t* step_end =
       lifecycle_step_json(e->turn_counter, 1);
   json_value_t* turn_end =
       lifecycle_turn_end_json(e->turn_counter, LIFE_REASON_BLOCKED, NULL);
-  if (ask != NULL) {
-    if (options != NULL) {
-      json_object_set(ask, "kind", json_new_string("ask"));
-      json_object_set(ask, "askId",
-                      json_new_string(e->pending_ask.ask_id));
-      json_object_set(ask, "question",
-                      json_new_string(e->pending_ask.question));
-      for (size_t i = 0; i < e->pending_ask.noptions; i++) {
-        json_array_append(options,
-                          json_new_string(e->pending_ask.options[i]));
-      }
-      json_object_set(ask, "options", options);   /* takes the value */
-      json_object_set(ask, "plan",
-                      (plan_capped[0] != '\0')
-                          ? json_new_string(plan_capped)
-                          : json_new_null());
-    } else {
-      /* options OOM'd: the half-composed ask record is dropped; the failure
-         below clears the park. */
-      json_value_destroy(ask);
-      ask = NULL;
-    }
-  }
   if (control == NULL || main == NULL || step_start == NULL ||
       step_end == NULL || turn_end == NULL || ask == NULL) {
-    /* The destroyers are NULL-tolerant; the parked ask's OWNED strings (and
-       any options array living inside `ask`) die with the records here. */
+    /* The destroyers are NULL-tolerant; the parked ask's OWNED strings die
+       with the records here. */
     json_value_destroy(control);
     json_value_destroy(main);
     json_value_destroy(ask);
@@ -1353,8 +1340,8 @@ static int _loop_plan_gate_post(frame_t* f, frame_engine_state_t* e,
     return -1;
   }
   const char* names[6] = {LIFE_EVENT_STEP_START, "control",
-                          (content != NULL) ? "msg.append" : "control",
-                          "ask", LIFE_EVENT_STEP_END, LIFE_EVENT_TURN_END};
+                          "msg.append", "ask", LIFE_EVENT_STEP_END,
+                          LIFE_EVENT_TURN_END};
   json_value_t* payloads[6] = {step_start, control, main, ask, step_end,
                                turn_end};
   int rc = _frame_event_batch_post_fire(f, names, payloads, 6, "plan gate");
@@ -1400,10 +1387,8 @@ static int _loop_bypass_plan_close_post(frame_t* f, frame_engine_state_t* e,
               frame_sid(f));
     return -1;
   }
-  const char* names[5] = {LIFE_EVENT_STEP_START,
-                          (content != NULL) ? "msg.append" : "control",
-                          "control", LIFE_EVENT_STEP_END,
-                          LIFE_EVENT_TURN_END};
+  const char* names[5] = {LIFE_EVENT_STEP_START, "msg.append", "control",
+                          LIFE_EVENT_STEP_END, LIFE_EVENT_TURN_END};
   json_value_t* payloads[5] = {step_start, main, control, step_end, turn_end};
   int rc = _frame_event_batch_post_fire(f, names, payloads, 5,
                                         "bypass plan close");
@@ -1437,6 +1422,20 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
      frame — a plan approval must keep the engine for its act phase). */
   uint8_t gating = _loop_ladder_gating(f, e);
   if (gating != 0) {
+    /* THE EMPTY PLAN (escalation spec §2.2; Fix 2): a plan turn's reply text
+       IS the plan. An EMPTY reply has nothing for the owner to approve and
+       nothing for the bypass to auto-approve — the old degrade path here
+       would have composed the empty-turn control and gated on a plan:null.
+       Fail the turn LOUD instead: the close is the failure's own (the
+       plan-mode control + turn.end error), no ask record, no park, and the
+       loop resumes — the next turn is STILL plan (ladder_act untouched).
+       BOTH closes fall out of this shared fork (the degrade lived in their
+       one main-payload compose). */
+    if (content == NULL) {
+      model_reply_destroy(reply);
+      _loop_fail(f, e, "plan-mode", "the model returned an empty plan");
+      return;
+    }
     unsigned mode = _frame_escalation_mode(f);
     if (mode == (unsigned)FRAME_ESCALATION_BYPASS) {
       int brc = _loop_bypass_plan_close_post(f, e, content);
@@ -1456,6 +1455,12 @@ static void _loop_content_path(frame_t* f, frame_engine_state_t* e,
     model_reply_destroy(reply);
     if (grc == 0) {
       return;   /* parked (FRAME_PHASE_ASK set post-commit by the composer) */
+    }
+    if (e->turn_open == 0) {
+      /* The gate's OWN belt failed this turn loud already (it refused to box
+         over a standing ask): the failure close sits in the log and the
+         standing park stayed untouched — nothing left for this path. */
+      return;
     }
     /* The close was refused pre-post (logged; the seq range rolled back —
        the records committed NOTHING): the half-boxed ask dies with it and
@@ -1505,6 +1510,17 @@ static const char* _loop_cause_name(guards_cause_e cause) {
     case GUARDS_CAUSE_OVERFLOW: return "overflow";
     default: return "fallback";
   }
+}
+
+/* THE PLAN TURN'S ONE ALLOWED CELL (escalation spec §2.2): the model's
+   clarifying `agent.ask` — the ask verb's call on the runtime's injected
+   `actor` module (the standing cell scripts' spell, `actor.ask(...)`). Any
+   other tool call in a plan turn stays the plan-mode refusal (the model
+   cannot execute a cell in plan — it may only ask one owner question out of
+   it, and that ask parks the turn with the Task-2 machinery, plan_gate 0).
+   A scan miss refuses loud — the refusal direction is the safe one. */
+static int _loop_plan_cell_is_the_model_ask(const char* code) {
+  return (code != NULL && strstr(code, "actor.ask") != NULL) ? 1 : 0;
 }
 
 /* The reply processing, shared by the sync and the async arrival paths —
@@ -1591,8 +1607,18 @@ static void _frame_engine_reply(frame_t* f, frame_engine_state_t* e,
        offered), so a tool-call reply is an unexpected shape at a plan turn.
        Loud — `_loop_fail` ends the turn error (the control's wording rides
        the failure close); a LATER run over this gate-free state re-enters
-       plan (ladder_act never flipped — nothing happened). */
-    if (_loop_ladder_gating(f, e) != 0) {
+       plan (ladder_act never flipped — nothing happened).
+       THE ONE EXEMPTION — the model's clarifying ask (spec §2.2): a plan
+       cell whose code calls the ask verb (`actor.ask(...)` — the runtime's
+       injected module + verb) is the model's clarifying QUESTION, not
+       execution: the ordinary Task-2 flow runs it, the ask parks the turn
+       identically (plan_gate 0 — the gate has not fired), and after the
+       owner's answer the next turn is STILL plan. The scan is the
+       reply-time shape check, the standing cell scripts' spell; a check it
+       fails (an aliased import or a scan-evasion spelling) refuses loud —
+       the refusal direction is always safe. */
+    if (_loop_ladder_gating(f, e) != 0 &&
+        _loop_plan_cell_is_the_model_ask(reply->tool_code) == 0) {
       _loop_fail(f, e, "plan-mode", "the model sent tool calls in a plan turn");
       model_reply_destroy(reply);
       return;

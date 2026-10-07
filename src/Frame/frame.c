@@ -2533,35 +2533,55 @@ int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
   return rc;
 }
 
-/* The parked ask's RECORD compose (escalation spec §1.3): the "ask" event's
-   payload {kind, askId, question, options[], plan} — plan is JSON null here:
-   this composer serves the CELL closes (a generic agent.ask carries no plan
-   text); the ladder's runtime-authored plan gate composes its OWN record in
-   loop.c (with the turn's plan text). The parked ask's question/options are
-   BORROWED here (the park owns the strings). NULL on OOM — loud. */
-static json_value_t* _frame_ask_record_payload(frame_t* f,
-                                               const frame_engine_state_t* e) {
+/* THE ONE "ask" RECORD COMPOSER (Fix 4; escalation spec §1.3 + §2.2): the
+   event's payload {kind, askId, question, options[], plan} — plan is JSON
+   null on a NULL/empty plan text, the composed string otherwise. ONE key
+   order (kind, askId, question, options, plan) and ONE plan rule for BOTH
+   compose sites — the cell close (a generic agent.ask: the plan text is
+   NULL) and the ladder's runtime-authored plan gate (its turn's
+   cap-capped plan text) — so the standing record pins never observe a
+   shape drift between the sites. The strings are BORROWED (the caller owns
+   them — the park owns the question/options, the gate owns the capped
+   plan). NULL on OOM — loud. */
+json_value_t* _frame_ask_record_compose(const char* ask_id,
+                                        const char* question,
+                                        char** options, size_t noptions,
+                                        const char* plan) {
   json_value_t* payload = json_new_object();
-  if (payload == NULL) {
-    log_error("frame: out of memory composing the ask record payload at '%s'",
-              f->sid_path);
-    return NULL;
-  }
-  json_value_t* options = json_new_array();
-  if (options == NULL) {
+  if (payload == NULL) return NULL;
+  json_value_t* options_v = json_new_array();
+  if (options_v == NULL) {
     json_value_destroy(payload);
-    log_error("frame: out of memory composing the ask's options at '%s'",
-              f->sid_path);
     return NULL;
   }
   json_object_set(payload, "kind", json_new_string("ask"));
-  json_object_set(payload, "askId", json_new_string(e->pending_ask.ask_id));
-  json_object_set(payload, "question", json_new_string(e->pending_ask.question));
-  for (size_t i = 0; i < e->pending_ask.noptions; i++) {
-    json_array_append(options, json_new_string(e->pending_ask.options[i]));
+  json_object_set(payload, "askId", json_new_string(ask_id));
+  json_object_set(payload, "question", json_new_string(question));
+  for (size_t i = 0; i < noptions; i++) {
+    json_array_append(options_v, json_new_string(options[i]));
   }
-  json_object_set(payload, "options", options);
-  json_object_set(payload, "plan", json_new_null());
+  json_object_set(payload, "options", options_v);
+  json_object_set(payload, "plan",
+                  (plan != NULL && plan[0] != '\0') ? json_new_string(plan)
+                                                    : json_new_null());
+  return payload;
+}
+
+/* The parked ask's RECORD compose (escalation spec §1.3): the cell close's
+   shape over the parked state — the generic agent.ask carries NO plan text
+   (plan null). This is the frame-side wrapper on the ONE composer above
+   (the ladder's gate composes ITS record through the same composer in
+   loop.c, plan text riding). The parked ask's question/options are
+   BORROWED here (the park owns the strings). NULL on OOM — loud. */
+static json_value_t* _frame_ask_record_payload(frame_t* f,
+                                               const frame_engine_state_t* e) {
+  json_value_t* payload = _frame_ask_record_compose(
+      e->pending_ask.ask_id, e->pending_ask.question, e->pending_ask.options,
+      e->pending_ask.noptions, NULL);
+  if (payload == NULL) {
+    log_error("frame: out of memory composing the ask record payload at '%s'",
+              f->sid_path);
+  }
   return payload;
 }
 

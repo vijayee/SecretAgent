@@ -3804,6 +3804,82 @@ TEST(TestFrame, TestPlanModeToolCallReplyRefusesLoud) {
   wave_db_close(db);
 }
 
+TEST(TestFrame, TestPlanModeEmptyPlanTurnFailsLoud) {
+  /* THE EMPTY PLAN'S LOUD FAILURE (escalation spec §2.2): a plan turn's
+     reply text IS the plan — an EMPTY reply has nothing for the owner to
+     approve. The old empty-turn degrade path (which would gate on a
+     plan:null, and the bypass's close would auto-approve one even) is gone:
+     the turn fails loud ("plan-mode"), NO ask record is composed, and the
+     loop resumes — the next turn is STILL plan and gates normally. */
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "ladder: empty plan", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {lf_content_body(""), lf_content_body("Plan: the retried plan")};
+  frame_set_model_backend(f, &lm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 1) << "the empty plan turn failed loud";
+  EXPECT_EQ(frame_is_done(f), 0);
+  ASSERT_EQ(lm.tools_seen.size(), 1u);
+  EXPECT_EQ(lm.tools_seen[0], "json-null")
+      << "the empty plan's turn ran the plan-shaped request";
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(fr_count_type(events, "ask"), 0u)
+      << "no ask record — nothing to approve";
+  EXPECT_EQ(lf_find_gate_ask(events), nullptr)
+      << "the gate never fired on the empty plan";
+  EXPECT_EQ(lf_find_control(events, "plan-requested"), nullptr)
+      << "no phase transition was written";
+  EXPECT_EQ(lf_find_control(events, "plan-approved"), nullptr);
+  json_value_t* failure = lf_find_control(events, "plan-mode");
+  ASSERT_NE(failure, nullptr) << "the failure's control rides its close";
+  {
+    json_value_t* fp = lf_payload_of(failure);
+    json_value_t* text_v = json_get(fp, "text");
+    ASSERT_NE(text_v, nullptr);
+    EXPECT_STREQ(json_as_string(text_v), "the model returned an empty plan");
+  }
+  json_value_t* turn_end = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "turn.end")) {
+      turn_end = json_at(events, i);
+    }
+  }
+  ASSERT_NE(turn_end, nullptr);
+  {
+    json_value_t* tp = lf_payload_of(turn_end);
+    json_value_t* reason = json_get(tp, "reason");
+    ASSERT_NE(reason, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "error");
+  }
+  json_value_destroy(events);
+
+  /* The loop resumed: the NEXT turn is STILL plan and it gates normally
+     (the retried plan content closes at the gate). */
+  EXPECT_EQ(frame_run_loop(f), 2) << "the next turn is STILL plan";
+  ASSERT_EQ(lm.tools_seen.size(), 2u);
+  EXPECT_EQ(lm.tools_seen[1], "json-null");
+  EXPECT_NE(lm.captured[1].find("PLAN mode"), std::string::npos);
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* gate = lf_find_gate_ask(events);
+  ASSERT_NE(gate, nullptr) << "the retried plan gated normally";
+  json_value_t* plan_v = json_get(lf_payload_of(gate), "plan");
+  ASSERT_NE(plan_v, nullptr);
+  EXPECT_EQ(json_type(plan_v), JSON_STRING);
+  EXPECT_STREQ(json_as_string(plan_v), "Plan: the retried plan");
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
 TEST(TestFrame, TestApprovalPersistsAcrossRestart) {
   /* The approval consult (escalation spec §2.4): the durable control record
      is the approval's mechanism — the approve lands, the act turn FAILS
@@ -3968,5 +4044,205 @@ TEST(TestFrame, TestBypassPlansThenAutoApprovesWithoutAsking) {
   frame_destroy(f);
   wave_db_close(db);
 }
+
+/* --- the model's clarifying ask MID-PLAN (escalation spec §2.2) ----------
+   A python-gated corner of the ladder family: the plan turn's ONE allowed
+   tool call is the model's ask — a REAL cell runs it through the frame's
+   own pyrt (the standing ask family's shape, this plan phase's pin). */
+#if defined(SA_HAS_PYTHON)
+
+extern "C" void py_agent_init(void);   /* idempotent; re-mounts the bridge sink */
+
+TEST(TestFrame, TestModelAskDuringPlanStaysPlanAfterTheReply) {
+  /* PLAN_ASK_ACT; turn 1's model turn replies a tool call whose REAL cell
+     calls actor.ask("which storage?", ['wave','onyx']) — the model's
+     clarifying question mid-plan: the ask verb is the ONE tool call a plan
+     turn allows, and the Task-2 flow parks the turn with the CELL's ask
+     record — NOT the plan gate's. THE OBSERVABLE SHAPE difference (the
+     review's pin): the model ask's record carries plan JSON NULL while the
+     gate's carries the turn's plan text, and the parked ask's bookkeeping
+     distinguishes them the same way (the cell's bridge corr NONZERO +
+     plan_gate 0 — the gate's is corr 0 / plan_gate 1). The answer "wave"
+     rides [ask.reply + msg.append] with NO plan-approved control record
+     written ANYWHERE (the gate hasn't fired), and the NEXT model request is
+     STILL plan-shaped (tools json-null + the plan block) — that turn's own
+     content closes at the gate, whose ask NOW rides the plan text. */
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "mid-plan clarification", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  /* The ask cell rides canned_cell_body (the python-gated family's builder:
+     it escapes the script's newlines — lf_tool_body escapes quotes only
+     enough for its one-line standing pin). */
+  lm.replies = {
+      canned_cell_body("import actor\nactor.ask('which storage?', "
+                       "['wave', 'onyx'])\nprint('asked')"),
+      lf_content_body("Plan: store on wave, mirror on onyx")};
+  frame_set_model_backend(f, &lm.base);
+
+  /* Turn 1 (plan): the model's ask cell RAN (a real cell), and the turn
+     parked on the cell's ask. */
+  EXPECT_EQ(frame_run_loop(f), 2) << "the model's ask parked the plan turn";
+  EXPECT_EQ(frame_is_done(f), 0);
+  ASSERT_EQ(lm.captured.size(), 1u);
+  ASSERT_EQ(lm.tools_seen.size(), 1u);
+  EXPECT_EQ(lm.tools_seen[0], "json-null")
+      << "the plan request stays tools-null across the model ask too";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+
+  /* THE MODEL ASK'S RECORD: question + options are the CELL's; the plan
+     field is present and JSON NULL (the gate's record rides the plan
+     text — the observable distinction). */
+  json_value_t* ask_rec = NULL;
+  size_t ask_index = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (!event_is(rec, "ask")) continue;
+    json_value_t* q = json_get(lf_payload_of(rec), "question");
+    ASSERT_NE(q, nullptr);
+    if (strcmp(json_as_string(q), "which storage?") == 0) {
+      ASSERT_EQ(ask_rec, nullptr) << "the one model ask";
+      ask_rec = rec;
+      ask_index = i;
+    }
+  }
+  ASSERT_NE(ask_rec, nullptr) << "the cell's ask was parked";
+  std::string ask_id;
+  {
+    json_value_t* p = lf_payload_of(ask_rec);
+    json_value_t* id = json_get(p, "askId");
+    ASSERT_NE(id, nullptr);
+    ask_id = json_as_string(id);
+    EXPECT_EQ(ask_id.size(), 8u);
+    json_value_t* options = json_get(p, "options");
+    ASSERT_NE(options, nullptr);
+    ASSERT_EQ(json_size(options), 2u);
+    EXPECT_STREQ(json_as_string(json_at(options, 0)), "wave");
+    EXPECT_STREQ(json_as_string(json_at(options, 1)), "onyx");
+    json_value_t* plan_v = json_get(p, "plan");
+    ASSERT_NE(plan_v, nullptr) << "the plan field is PRESENT (a model ask too)";
+    EXPECT_EQ(json_type(plan_v), JSON_NULL)
+        << "THE SHAPE: a model ask's record carries plan NULL — the plan "
+           "gate's rides the turn's plan text";
+  }
+  {
+    frame_engine_state_t* e = _frame_engine_state(f);
+    ASSERT_NE(e, nullptr);
+    EXPECT_NE(e->pending_ask.corr, 0ull)
+        << "the CELL's bridge corr stands (the gate's park is corr 0)";
+    EXPECT_EQ(e->pending_ask.plan_gate, 0u)
+        << "the gate has not fired — this park is a model ask's";
+  }
+
+  /* The close batch: cell.result + step.end + ask + turn.end{blocked} —
+     FOUR consecutive seqs (the Task-2 shape, plan turn or free turn). */
+  {
+    ASSERT_GE(ask_index, 2u) << "cell.result and step.end precede it";
+    long long base_seq = lf_seq_of(json_at(events, ask_index - 2));
+    for (long long k = 0; k <= 2; k++) {
+      json_value_t* at = json_at(events, ask_index - 2 + (size_t)k);
+      ASSERT_NE(at, nullptr);
+      EXPECT_EQ(lf_seq_of(at), base_seq + k)
+          << "the ask close is ONE atomic group; record " << k;
+    }
+    EXPECT_TRUE(event_is(json_at(events, ask_index - 2), "cell.result"));
+    EXPECT_TRUE(event_is(json_at(events, ask_index - 1), "step.end"));
+    json_value_t* turn_end_rec = json_at(events, ask_index + 1);
+    ASSERT_NE(turn_end_rec, nullptr);
+    ASSERT_TRUE(event_is(turn_end_rec, "turn.end"));
+    json_value_t* tp = lf_payload_of(turn_end_rec);
+    json_value_t* reason = json_get(tp, "reason");
+    ASSERT_NE(reason, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "blocked");
+  }
+
+  /* NO gate machinery anywhere: the question is the model's, the gate has
+     not fired. */
+  EXPECT_EQ(lf_find_gate_ask(events), nullptr)
+      << "no runtime-authored gate ask in this turn";
+  EXPECT_EQ(lf_find_control(events, "plan-requested"), nullptr);
+  EXPECT_EQ(lf_find_control(events, "plan-approved"), nullptr);
+  EXPECT_EQ(lf_find_control(events, "plan-mode"), nullptr)
+      << "the ask cell is the ANSWERED shape, not the plan-mode refusal";
+  json_value_destroy(events);
+
+  /* THE ANSWER: the ride batch [ask.reply, msg.append user "wave"] — then a
+     fresh turn that is STILL plan (no plan-approved control was ever
+     written), whose plan content closes at the GATE. */
+  EXPECT_EQ(frame_ask_reply(f, ask_id.c_str(), 0, "wave"), 0);
+  EXPECT_EQ(frame_run_loop(f), 2) << "the next turn is STILL plan (it gated)";
+  ASSERT_EQ(lm.captured.size(), 2u);
+  ASSERT_EQ(lm.tools_seen.size(), 2u);
+  EXPECT_EQ(lm.tools_seen[1], "json-null")
+      << "the next request is STILL tools-null";
+  EXPECT_NE(lm.captured[1].find("PLAN mode"), std::string::npos)
+      << "the plan block still rides";
+  EXPECT_NE(lm.captured[1].find("wave"), std::string::npos)
+      << "the answer reached the derive as the recorded msg.append";
+  {
+    frame_engine_state_t* e = _frame_engine_state(f);
+    ASSERT_NE(e, nullptr);
+    EXPECT_NE(e->pending_ask.ask_id, nullptr) << "the gate parked turn 2";
+    EXPECT_EQ(e->pending_ask.plan_gate, 1u) << "the GATE holds this park";
+    EXPECT_EQ(e->pending_ask.corr, 0ull)
+        << "the gate's boxing carries no bridge corr";
+  }
+
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(lf_find_control(events, "plan-approved"), nullptr)
+      << "NO plan-approved control record was ever written";
+  json_value_t* gate = lf_find_gate_ask(events);
+  ASSERT_NE(gate, nullptr) << "the gate fired at turn 2's close";
+  {
+    json_value_t* gp = lf_payload_of(gate);
+    json_value_t* plan_v = json_get(gp, "plan");
+    ASSERT_NE(plan_v, nullptr);
+    EXPECT_EQ(json_type(plan_v), JSON_STRING)
+        << "THE GATE'S SHAPE: the plan text rides (the model ask's is NULL)";
+    EXPECT_STREQ(json_as_string(plan_v), "Plan: store on wave, mirror on onyx");
+  }
+  /* The answer's ride batch: [ask.reply, msg.append user "wave"]. */
+  json_value_t* reply_rec = NULL;
+  size_t reply_index = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    if (event_is(rec, "ask.reply") &&
+        strcmp(json_as_string(json_get(lf_payload_of(rec), "askId")),
+               ask_id.c_str()) == 0) {
+      reply_rec = rec;
+      reply_index = i;
+      break;
+    }
+  }
+  ASSERT_NE(reply_rec, nullptr);
+  {
+    json_value_t* rp = lf_payload_of(reply_rec);
+    EXPECT_STREQ(json_as_string(json_get(rp, "decision")), "answer");
+    EXPECT_STREQ(json_as_string(json_get(rp, "value")), "wave");
+    json_value_t* append_rec = json_at(events, reply_index + 1);
+    ASSERT_NE(append_rec, nullptr);
+    /* The seqs are contiguous — the append is the NEXT record. */
+    ASSERT_EQ(lf_seq_of(reply_rec) + 1, lf_seq_of(append_rec));
+    ASSERT_TRUE(event_is(append_rec, "msg.append"));
+    json_value_t* ap = lf_payload_of(append_rec);
+    EXPECT_STREQ(json_as_string(json_get(ap, "role")), "user");
+    EXPECT_STREQ(json_as_string(json_get(ap, "content")), "wave");
+  }
+  json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+#endif /* SA_HAS_PYTHON */
 
 #endif /* SA_HAS_WDB */

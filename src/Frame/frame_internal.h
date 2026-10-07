@@ -673,6 +673,17 @@ int _frame_engine_result_close_post(frame_t* f, json_value_t* result_payload,
    payload on every path. Returns the pre-post rc (0 = posted). */
 int _frame_engine_ask_close_post(frame_t* f, json_value_t* result_payload);
 
+/* THE ONE "ask" RECORD COMPOSER (escalation spec §1.3 + §2.2): the event
+   payload {kind, askId, question, options[], plan} — the standing shape for
+   BOTH compose sites (the cell close: a generic agent.ask rides plan NULL;
+   the ladder's plan gate: its turn's cap-capped plan text). plan NULL/empty
+   renders JSON null. The strings are BORROWED (the caller owns them).
+   NULL on OOM — loud at the callers. */
+json_value_t* _frame_ask_record_compose(const char* ask_id,
+                                        const char* question,
+                                        char** options, size_t noptions,
+                                        const char* plan);
+
 /* The parked-ask state's clear (the pending ask dies whenever the engine's
    bookkeeping dies — every engine-end funnel plus the frame teardown): frees
    the OWNED ask_id, zeroes the corr/plan_gate, and — SA_HAS_PYTHON builds —
