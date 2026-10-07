@@ -529,6 +529,35 @@ TEST(TestFrame, TestEscalationModeInherits) {
       << "the restart cfg's mode rides the resume";
   frame_destroy(resumed);
 
+  /* THE OTHER LADDER VALUE rides the SAME value-copy lines (BYPASS = 2):
+     the parent-heritage branch (one copy line — the pooled child-create
+     and the frame_spawn both land there) and the resume's cfg copy. The
+     explicit-cfg create asserts above are literally the same assignment. */
+  frame_config_t bypass_cfg = test_config();
+  bypass_cfg.escalation_mode = FRAME_ESCALATION_BYPASS;
+  frame_t* bypass_root = frame_create(inline_db, NULL, "bypass spawn root",
+                                      &bypass_cfg);
+  ASSERT_NE(bypass_root, nullptr);
+  frame_t* bypassed = frame_spawn(bypass_root, "bypass spawned leaf", NULL);
+  ASSERT_NE(bypassed, nullptr);
+  EXPECT_EQ(_frame_escalation_mode(bypassed), FRAME_ESCALATION_BYPASS)
+      << "BYPASS rides the parent-heritage copy line like PLAN_ASK_ACT";
+  frame_destroy(bypassed);
+  frame_destroy(bypass_root);   /* the spawn probe's own teardown (the
+                                   pristine spawn section's shape) */
+  frame_t* bypass_src = frame_create(inline_db, NULL, "bypass resume me",
+                                     &bypass_cfg);
+  ASSERT_NE(bypass_src, nullptr);
+  std::string bypass_sid = frame_sid(bypass_src);
+  ASSERT_EQ(_frame_set_status_done(bypass_src), 0);
+  frame_destroy(bypass_src);
+  frame_t* bypass_resumed = frame_resume(inline_db, bypass_sid.c_str(),
+                                         &bypass_cfg);
+  ASSERT_NE(bypass_resumed, nullptr);
+  EXPECT_EQ(_frame_escalation_mode(bypass_resumed), FRAME_ESCALATION_BYPASS)
+      << "BYPASS rides the resume's cfg copy line like PLAN_ASK_ACT";
+  frame_destroy(bypass_resumed);
+
   /* The cfg-less shape: zeroed = FREE — every standing frame unchanged. */
   frame_config_t plain_cfg = test_config();
   frame_t* plain = frame_create(inline_db, NULL, "free root", &plain_cfg);
@@ -2622,6 +2651,164 @@ TEST(TestFrameTree, TestPooledTreeKeepsOneReportPerChildWithContiguousSeq) {
   scheduler_pool_destroy(pool);
 }
 
+TEST(TestFrameTree, TestChildAskParksTheChildAndTheParentWaits) {
+  /* THIS SPEC bullet's tree shape (§7's child-frame ask: "parent stays
+     parked in CHILDREN; one owner-surface ask"): a child's `actor.ask`
+     parks the CHILD only — the parent's parked CHILDREN await stands
+     (its engine never sees the child's park), and the OWNER's answer
+     resumes the CHILD, whose report then binds up and resumes the
+     PARENT. THE SIMPLIFICATION (honest pin of the COOPERATION, not the
+     full spawn flow): the child is admitted by the TEST-HELD
+     `frame_spawn` on the LIVE parent engine — the same START branch a
+     cell's `actor.spawn` reply rides (the admission + start + count), so
+     it still gives the honest START-branch live_children and the
+     inherited backend — but the test HOLDS the child handle so the
+     owner's reply can reach its mailbox. The parent's turn 1 is a
+     content turn (its yield rides the finish batch's live_children
+     rule); the ladder mode is free (the ask machinery is all modes' —
+     the modes' own ask pins live in the ladder family). */
+
+  py_agent_init();
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* parent = frame_create(db, NULL, "parent goal", &cfg);
+  ASSERT_NE(parent, nullptr);
+
+  goal_keyed_model_t gk = {};   /* zero-init: the vtable's members set below */
+  gk.base.complete = goal_keyed_complete;
+  gk.queues["parent goal"].push_back(
+      canned_content_body("parent waits on the leaf"));
+  gk.queues["parent goal"].push_back(
+      canned_content_body("parent saw the leaf's answer"));
+  gk.queues["child goal"].push_back(
+      canned_cell_body("import actor\nactor.ask('child needs direction?', "
+                       "['go', 'stop'])\nprint('asked')"));
+  gk.queues["child goal"].push_back(canned_content_body("child done quietly"));
+  frame_set_model_backend(parent, &gk.base);
+
+  /* The engine is queued FIRST (frame_start), THEN the spawn — so the START
+     branch sees the live engine and the child starts + counts. */
+  ASSERT_EQ(frame_start(parent), 0);
+  frame_t* child = frame_spawn(parent, "child goal", NULL);
+  ASSERT_NE(child, nullptr);
+  ASSERT_EQ(_frame_engine_state(parent)->live_children, 1u)
+      << "the START branch counted the child";
+
+  /* THE PARENT'S YIELD: the content turn's finish saw the live child and
+     yields — run_loop rc 2, parked in CHILDREN, still running. */
+  EXPECT_EQ(frame_run_loop(parent), 2) << "yielded awaiting the child";
+  EXPECT_EQ(frame_is_done(parent), 0);
+  {
+    frame_engine_state_t* pe = _frame_engine_state(parent);
+    ASSERT_NE(pe, nullptr);
+    EXPECT_EQ(pe->phase, FRAME_PHASE_CHILDREN) << "the parked-CHILDREN state";
+  }
+
+  /* THE CHILD ASKS: the ask parks the CHILD (run_loop rc 2, one "ask"
+     record) and the parent's park does not move — the tree's cooperation
+     under test. */
+  EXPECT_EQ(frame_run_loop(child), 2) << "the child parked on its ask";
+  {
+    frame_engine_state_t* ce = _frame_engine_state(child);
+    ASSERT_NE(ce, nullptr);
+    EXPECT_EQ(ce->phase, FRAME_PHASE_ASK) << "the child's own park";
+    frame_engine_state_t* pe = _frame_engine_state(parent);
+    EXPECT_EQ(pe->phase, FRAME_PHASE_CHILDREN)
+        << "the child's ask did not move the parent's park";
+  }
+  json_value_t* child_events = load_events(child);
+  ASSERT_NE(child_events, nullptr);
+  EXPECT_EQ(fr_count_type(child_events, "ask"), 1u)
+      << "exactly ONE owner-surface ask from the child";
+  std::string ask_id;
+  json_value_t* ask_rec = NULL;
+  for (size_t i = 0; i < json_size(child_events); i++) {
+    json_value_t* rec = json_at(child_events, i);
+    if (event_is(rec, "ask")) {
+      ask_rec = rec;
+      break;
+    }
+  }
+  ASSERT_NE(ask_rec, nullptr);
+  {
+    json_value_t* ap = json_get(ask_rec, "payload");
+    ASSERT_NE(ap, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(ap, "question")),
+                 "child needs direction?");
+    json_value_t* id = json_get(ap, "askId");
+    ASSERT_NE(id, nullptr);
+    ask_id = json_as_string(id);
+  }
+  ASSERT_EQ(ask_id.size(), 8u);
+  EXPECT_EQ(fr_count_type(child_events, "ask.reply"), 0u)
+      << "nothing resolved while parked";
+  json_value_destroy(child_events);
+  json_value_t* parent_events = load_events(parent);
+  ASSERT_NE(parent_events, nullptr);
+  EXPECT_EQ(fr_count_type(parent_events, "ask"), 0u)
+      << "the parent's log NEVER holds the child's ask (one owner-surface "
+         "ask lives in the child's subtree)";
+  json_value_destroy(parent_events);
+
+  /* THE OWNER'S ANSWER: the parked CHILD consumes it, its next content turn
+     is its quiet-completion outcome, and the engine ends — the report's
+     bind may trail the child's engine end (the residual chain is the
+     driver drain's business, pumped below). */
+  EXPECT_EQ(frame_ask_reply(child, ask_id.c_str(), 0, "the tree says go"), 0);
+  EXPECT_EQ(frame_run_loop(child), 0) << "the answer resumed the child";
+  EXPECT_EQ(frame_is_done(child), 1);
+
+  /* The parent's park stands through the residual chain: the engine-driven
+     bind composed + posted during the child's drive (the pump order), its
+     corr reply routes at the CHILD's actor — still queued for the driver.
+     The interim run pumps empty and returns the standing rc 2. */
+  EXPECT_EQ(frame_run_loop(parent), 2)
+      << "the bind's reply awaits its route at the child";
+  /* The residual pump (the TestChildTurnLimit precedent's shape): dispatch
+     the bind reply at the child — its route posts FRM_CHILD_REPORT at the
+     parent (the run drains the child's mailbox and returns false). */
+  actor_run(_frame_actor(child), ACTOR_BATCH_SIZE);
+  EXPECT_EQ(frame_run_loop(parent), 0)
+      << "the report's resume continued the parent to done";
+  EXPECT_EQ(frame_is_done(parent), 1) << "the parent continued and completed";
+
+  /* THE BIND's effects in the parent's log (+ the child's own honest ask
+     trail). */
+  parent_events = load_events(parent);
+  ASSERT_NE(parent_events, nullptr);
+  size_t n_spawn = 0, n_report = 0, n_join = 0;
+  std::string report_text;
+  for (size_t i = 0; i < json_size(parent_events); i++) {
+    json_value_t* rec = json_at(parent_events, i);
+    if (event_is(rec, "frame.spawn")) n_spawn++;
+    if (event_is(rec, "frame.report")) {
+      n_report++;
+      report_text = json_as_string(
+          json_get(json_get(rec, "payload"), "text"));
+    }
+    if (event_is(rec, "frame.join")) n_join++;
+  }
+  EXPECT_EQ(n_spawn, 1u);
+  EXPECT_EQ(n_report, 1u)
+      << "the child's report FLOWED BACK UP through the park";
+  EXPECT_EQ(report_text, "child done quietly")
+      << "the quiet completion reports the child's own content";
+  EXPECT_EQ(n_join, 1u);
+  EXPECT_EQ(fr_count_type(parent_events, "ask"), 0u);
+  json_value_destroy(parent_events);
+
+  child_events = load_events(child);
+  ASSERT_NE(child_events, nullptr);
+  EXPECT_EQ(fr_count_type(child_events, "ask.reply"), 1u)
+      << "the owner's answer consumed exactly once";
+  json_value_destroy(child_events);
+
+  frame_destroy(child);
+  frame_destroy(parent);
+  wave_db_close(db);
+}
+
 TEST(TestFrame, TestInlineParentYieldsAwaitingChildren) {
   /* NO pool: the inline shape. The parent's scripted model answers its FIRST
      turn with the spawn tool call (its cell admits + starts the child — the
@@ -4040,6 +4227,112 @@ TEST(TestFrame, TestBypassPlansThenAutoApprovesWithoutAsking) {
         << "the plan turn still closes its own envelope (completed)";
   }
   json_value_destroy(events);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestFrame, TestPlanGateBeltRefusesAStandingParkedAsk) {
+  /* THE DOUBLE-BOXING BELT (loop.c's `_loop_plan_gate_post` pre-box check):
+     the gate never boxes over a standing park — one ask at a time. The belt
+     is UNREACHABLE by the honest flow (a parked engine re-enters no turns —
+     the phase guards; only a race could stand a second park), so this pin
+     FAULT-INJECTS the standing park: a hand-crafted `pending_ask.ask_id` on
+     the still-dead engine, before frame_start — exactly the raced-shape the
+     belt exists for. The verdict: the gate fires at the plan turn's close
+     and REFUSES — the fail close (control {plan-mode, "the plan gate found
+     a standing ask"} + turn.end{error}), ZERO ask records (the gate never
+     boxed over it — no park state ever reached the records), and the forged
+     string dies with the engine's end (the ask-clear funnel; valgrind
+     proves the single free). */
+  frame_config_t cfg = test_config();
+  cfg.escalation_mode = FRAME_ESCALATION_PLAN_ASK_ACT;
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "belt: a forged standing ask", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  ladder_model_t lm = {};
+  lm.base.complete = ladder_complete;
+  lm.replies = {
+      lf_content_body("Plan: 1. forge 2. refuse 3. resume"),
+      lf_content_body("Plan: the honest plan after the belt"),
+      lf_content_body("the act phase ran after the belt")};
+  frame_set_model_backend(f, &lm.base);
+
+  frame_engine_state_t* e = _frame_engine_state(f);
+  ASSERT_NE(e, nullptr);
+  e->pending_ask.ask_id = strdup("aa00beef");   /* THE FORGE: the engine
+                                                   owns it from here (the
+                                                   end-funnels clear it —
+                                                   never a test free) */
+  EXPECT_EQ(frame_run_loop(f), 1) << "the belt failed the turn loud";
+  EXPECT_EQ(frame_is_done(f), 0)
+      << "a failed terminate never ends a top frame's status";
+
+  json_value_t* events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  EXPECT_EQ(fr_count_type(events, "ask"), 0u)
+      << "the gate refused to box over the standing park";
+  EXPECT_EQ(fr_count_type(events, "ask.reply"), 0u);
+  json_value_t* failure = lf_find_control(events, "plan-mode");
+  ASSERT_NE(failure, nullptr) << "the belt's loud verdict";
+  {
+    json_value_t* fp = lf_payload_of(failure);
+    ASSERT_NE(fp, nullptr);
+    json_value_t* text_v = json_get(fp, "text");
+    ASSERT_NE(text_v, nullptr);
+    EXPECT_STREQ(json_as_string(text_v), "the plan gate found a standing ask");
+  }
+  json_value_t* turn_end = NULL;
+  for (size_t i = 0; i < json_size(events); i++) {
+    if (event_is(json_at(events, i), "turn.end")) {
+      turn_end = json_at(events, i);
+    }
+  }
+  ASSERT_NE(turn_end, nullptr);
+  {
+    json_value_t* tp = lf_payload_of(turn_end);
+    json_value_t* reason = json_get(tp, "reason");
+    ASSERT_NE(reason, nullptr);
+    EXPECT_STREQ(json_as_string(json_get(reason, "kind")), "error");
+  }
+  /* The standing park stayed UNTOUCHED in the records: no phase transition
+     rode the turn (this is NOT the gate's close — it never composed). */
+  EXPECT_EQ(lf_find_control(events, "plan-requested"), nullptr);
+  EXPECT_EQ(lf_find_control(events, "plan-approved"), nullptr);
+  EXPECT_EQ(fr_count_type(events, "msg.append"), 0u)
+      << "the plan text never durable-committed (the gate never reached its "
+         "own close batch)";
+  EXPECT_EQ(fr_count_type(events, "turn.start"), 1u);
+  EXPECT_EQ(fr_count_type(events, "turn.end"), 1u);
+  json_value_destroy(events);
+
+  /* RESUMABLE: the belt refused and did not break — the next run re-enters
+     plan and gates HONESTLY (the real gate ask stands, the forge is gone):
+     the forged id is not the parked one, and the ladder completes. */
+  EXPECT_EQ(frame_run_loop(f), 2) << "the next run is STILL plan";
+  events = load_events(f);
+  ASSERT_NE(events, nullptr);
+  json_value_t* gate = lf_find_gate_ask(events);
+  ASSERT_NE(gate, nullptr) << "the retried plan's turn gated normally";
+  {
+    json_value_t* gp = lf_payload_of(gate);
+    json_value_t* id = json_get(gp, "askId");
+    ASSERT_NE(id, nullptr);
+    std::string real_id = json_as_string(id);
+    EXPECT_EQ(real_id.size(), 8u);
+    EXPECT_NE(real_id, "aa00beef") << "the gate minted a FRESH id";
+    json_value_destroy(events);
+    /* The approve consumes and the act turn runs to done. */
+    EXPECT_EQ(frame_ask_reply(f, real_id.c_str(), 0, "approve"), 0);
+  }
+  EXPECT_EQ(frame_run_loop(f), 0) << "the ladder completed after the belt";
+  EXPECT_EQ(frame_is_done(f), 1);
+  ASSERT_EQ(lm.captured.size(), 3u);
+  ASSERT_EQ(lm.tools_seen.size(), 3u);
+  EXPECT_EQ(lm.tools_seen[2], "none-pointer")
+      << "the approved act turn ran with tools";
 
   frame_destroy(f);
   wave_db_close(db);
