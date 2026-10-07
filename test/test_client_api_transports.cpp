@@ -75,10 +75,14 @@ typedef struct {
 
 /* 0 = set up; nonzero = which step failed. cfg's model_base_url stays NULL:
    a frame WITHOUT the shared backend builds a NULL default backend and its
-   engine fails fast, deterministic and network-free. */
-static int fixture_setup_common(fixture_t* fx, model_backend_t* shared_backend) {
+   engine fails fast, deterministic and network-free. escalation_mode rides
+   the fixture's frame-cfg template into every api-created frame (the
+   escalation slice's ask tests carry FRAME_ESCALATION_PLAN_ASK_ACT). */
+static int fixture_setup_common(fixture_t* fx, model_backend_t* shared_backend,
+                                unsigned escalation_mode) {
   memset(fx, 0, sizeof(*fx));
   fx->cfg = test_config();
+  fx->cfg.escalation_mode = escalation_mode;
   fx->pool = scheduler_pool_create(2);
   if (fx->pool == NULL) return -1;
   scheduler_pool_start(fx->pool);
@@ -104,7 +108,7 @@ static int fixture_setup_common(fixture_t* fx, model_backend_t* shared_backend) 
 
 /* The UNIX variant: the socket file's permission is the auth (no key). */
 static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
-  int rc = fixture_setup_common(fx, shared_backend);
+  int rc = fixture_setup_common(fx, shared_backend, FRAME_ESCALATION_FREE);
   if (rc != 0) return rc;
 
   fx->transport = unix_transport_create(fx->pool, fx->server,
@@ -119,7 +123,7 @@ static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
    refusal's latency budget in the tests stays honest). The transport binds
    port 0 and reports the bound address back (create's out_addr param). */
 static int fixture_setup_tcp(fixture_t* fx, model_backend_t* shared_backend) {
-  int rc = fixture_setup_common(fx, shared_backend);
+  int rc = fixture_setup_common(fx, shared_backend, FRAME_ESCALATION_FREE);
   if (rc != 0) return rc;
 
   char hash[64];
@@ -905,7 +909,7 @@ TEST(TestClientApiUnix, TestConnCloseMidReplayPurges) {
    no unauthenticated TCP, ever (unix leans on file permissions; TCP cannot). */
 TEST(TestClientApiTcp, TestTransportRefusesToStartWithoutAKey) {
   fixture_t fx;
-  ASSERT_EQ(fixture_setup_common(&fx, NULL), 0);
+  ASSERT_EQ(fixture_setup_common(&fx, NULL, FRAME_ESCALATION_FREE), 0);
   EXPECT_EQ(tcp_transport_create(fx.pool, fx.server, "127.0.0.1", 0, NULL,
                                  NULL), nullptr)
       << "the NULL key hash refuses";
@@ -1120,5 +1124,242 @@ TEST(TestClientApiUnix, TestInterruptPostsOverTheSocket) {
 }
 
 #endif /* SA_HAS_PYTHON */
+
+/* --- the escalation slice's ask tests (the wire's [16]/[17] pair over the
+   REAL transports; NO pyrt anywhere — the gate ask is runtime-authored
+   from a content-only plan reply) ------------------------------------------ */
+
+/* The escalated UNIX variant: the fixture's frame-cfg template carries the
+   plan-ask-act mode (the server copies it at create — every api-created
+   frame parks at the runtime-authored plan gate). */
+static int fixture_setup_escalated_unix(fixture_t* fx,
+                                        model_backend_t* shared_backend) {
+  int rc = fixture_setup_common(fx, shared_backend,
+                                FRAME_ESCALATION_PLAN_ASK_ACT);
+  if (rc != 0) return rc;
+  fx->transport = unix_transport_create(fx->pool, fx->server,
+                                        fx->socket_path);
+  if (fx->transport == NULL) return -6;
+  unix_transport_start(fx->transport);
+  return 0;
+}
+
+/* The escalated TCP twin: the auth machinery's shape, the parked gate's
+   SAME template knob. */
+static int fixture_setup_escalated_tcp(fixture_t* fx,
+                                       model_backend_t* shared_backend) {
+  int rc = fixture_setup_common(fx, shared_backend,
+                                FRAME_ESCALATION_PLAN_ASK_ACT);
+  if (rc != 0) return rc;
+  char hash[64];
+  if (bcrypt_generate(FIXTURE_API_KEY, 4, hash, sizeof(hash)) != 0) return -7;
+  fx->tcp_transport = tcp_transport_create(fx->pool, fx->server,
+                                           "127.0.0.1", 0, hash,
+                                           &fx->tcp_addr);
+  if (fx->tcp_transport == NULL) return -6;
+  tcp_transport_start(fx->tcp_transport);
+  return 0;
+}
+
+static ca_ask_reply_request_t* ask_reply_req_heap(uint64_t req_id,
+                                                  const char* sid,
+                                                  const char* ask_id,
+                                                  uint8_t decision,
+                                                  const char* value) {
+  ca_ask_reply_request_t* req =
+      (ca_ask_reply_request_t*)get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
+  req->sid = (sid != NULL) ? strdup(sid) : NULL;
+  req->ask_id = (ask_id != NULL) ? strdup(ask_id) : NULL;
+  req->decision = decision;
+  req->value = (value != NULL) ? strdup(value) : NULL;
+  return req;
+}
+
+/* The parked plan gate's ask id, polled off the registry frame's event log
+   (the handlers' suite's same helper — the events-stream truth). "" when
+   the ask never landed within the bound. */
+static std::string fixture_parked_ask_id(fixture_t* fx,
+                                         const std::string& sid) {
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  if (f == NULL) return "";
+  for (int i = 0; i < 800; i++) {
+    char* json = frame_debug_events(f);
+    if (json == NULL) return "";
+    char* err = NULL;
+    json_value_t* events = json_parse(json, strlen(json), &err);
+    if (err != NULL) free(err);
+    free(json);
+    if (events == NULL) return "";
+    std::string found;
+    for (size_t j = 0; j < json_size(events); j++) {
+      json_value_t* rec = json_at(events, j);
+      json_value_t* t_v = json_get(rec, "type");
+      if (t_v == NULL || strcmp(json_as_string(t_v), "ask") != 0) continue;
+      json_value_t* p = json_get(rec, "payload");
+      json_value_t* id = (p != NULL) ? json_get(p, "askId") : NULL;
+      if (id != NULL && json_type(id) == JSON_STRING) {
+        found = json_as_string(id);
+        break;
+      }
+    }
+    json_value_destroy(events);
+    if (!found.empty()) return found;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return "";
+}
+
+/* The gate ask's durable consumption (the ask.reply record resolving
+   `ask_id` with {answer, value}) — polled on the frame's log. */
+static bool fixture_ask_reply_committed(fixture_t* fx, const std::string& sid,
+                                        const std::string& ask_id,
+                                        const char* value, int rounds) {
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  if (f == NULL) return false;
+  for (int i = 0; i < rounds; i++) {
+    bool found = false;
+    char* json = frame_debug_events(f);
+    if (json == NULL) return false;
+    char* err = NULL;
+    json_value_t* events = json_parse(json, strlen(json), &err);
+    if (err != NULL) free(err);
+    free(json);
+    if (events == NULL) return false;
+    for (size_t j = 0; j < json_size(events); j++) {
+      json_value_t* rec = json_at(events, j);
+      json_value_t* t_v = json_get(rec, "type");
+      if (t_v == NULL || strcmp(json_as_string(t_v), "ask.reply") != 0) {
+        continue;
+      }
+      json_value_t* p = json_get(rec, "payload");
+      json_value_t* id_v = (p != NULL) ? json_get(p, "askId") : NULL;
+      json_value_t* val_v = (p != NULL) ? json_get(p, "value") : NULL;
+      if (id_v != NULL && json_type(id_v) == JSON_STRING &&
+          strcmp(json_as_string(id_v), ask_id.c_str()) == 0 &&
+          val_v != NULL && json_type(val_v) == JSON_STRING &&
+          strcmp(json_as_string(val_v), value) == 0) {
+        found = true;
+        break;
+      }
+    }
+    json_value_destroy(events);
+    if (found) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
+TEST(TestClientApiUnix, TestAskReplyTransitsUnix) {
+  /* The wire's raw bytes end-to-end (spec §3.1): the client sends [16,
+     req_id, sid, ask_id, decision, value] over the REAL unix socket; the
+     transport's framer extracts it, the handlers bind + post, and the [17,
+     req_id, delivered] ack comes back DECODED on the socket. The consumed
+     park's ask.reply record is the tail's proof that the bytes didn't just
+     bounce — the engine ate the reply. */
+  std::vector<std::string> replies = {
+      std::string(
+          R"json({"choices":[{"message":{"role":"assistant","content":)json"
+          R"json("Plan: 1. measure 2. cut 3. report"}}]})json"),
+      std::string(
+          R"json({"choices":[{"message":{"role":"assistant","content":)json"
+          R"json("the act ran quiet"}}]})json")};
+  unix_scripted_t sm;
+  memset(&sm, 0, sizeof(sm));
+  sm.base.complete = unix_scripted_complete;
+  sm.replies = &replies;
+
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_escalated_unix(&fx, &sm.base), 0);
+  test_client_t client;
+  ASSERT_EQ(client_connect(&client, fx.socket_path), 0);
+
+  std::string sid = prompt_create_sid(&client, 1, "plan over the wire");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+
+  std::string ask_id = fixture_parked_ask_id(&fx, sid);
+  ASSERT_EQ(ask_id.size(), 8u) << "the gate ask parked";
+
+  ca_ask_reply_request_t* req =
+      ask_reply_req_heap(2, sid.c_str(), ask_id.c_str(), 0, "Approve");
+  ASSERT_EQ(client_send_frame(&client, CA_ASK_REPLY_REQUEST, req), 0);
+  ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);
+
+  size_t idx = 0;
+  ASSERT_EQ(client_wait_frame(&client, CA_ASK_REPLY_RESPONSE, 2, &idx, 600),
+            1) << "the [17] ack came back over the socket";
+  {
+    uint64_t t = 0, rid = 0;
+    void* p = NULL;
+    uint8_t st = 0;
+    ASSERT_TRUE(client_decode(&client, idx, &t, &p, &rid, &st));
+    ASSERT_EQ(t, (uint64_t)CA_ASK_REPLY_RESPONSE);
+    ASSERT_EQ(rid, 2u);
+    ca_ask_reply_response_t* res = (ca_ask_reply_response_t*)p;
+    EXPECT_EQ(res->delivered, 1u) << "the bind/post's honest ack";
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, p);
+  }
+
+  EXPECT_TRUE(
+      fixture_ask_reply_committed(&fx, sid, ask_id, "Approve", 800))
+      << "the consumption landed durably (the bytes reached the engine)";
+
+  client_close(&client);
+  fixture_teardown(&fx);
+}
+
+TEST(TestClientApiTcp, TestAskReplyTransitsTcp) {
+  /* The TCP-auth twin: the SAME [16]/[17] exchange rides the AUTHED
+     loopback channel — the api-key exchange ran FIRST at connect, and the
+     reply's bytes traverse the framer either way. */
+  std::vector<std::string> replies = {
+      std::string(
+          R"json({"choices":[{"message":{"role":"assistant","content":)json"
+          R"json("Plan: 1. measure 2. cut 3. report"}}]})json"),
+      std::string(
+          R"json({"choices":[{"message":{"role":"assistant","content":)json"
+          R"json("the act ran quiet"}}]})json")};
+  unix_scripted_t sm;
+  memset(&sm, 0, sizeof(sm));
+  sm.base.complete = unix_scripted_complete;
+  sm.replies = &replies;
+
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_escalated_tcp(&fx, &sm.base), 0);
+  test_client_t client;
+  ASSERT_EQ(
+      client_connect_tcp(&client, "127.0.0.1", fixture_tcp_port(&fx)), 0);
+  ASSERT_EQ(client_authenticate(&client, 1, FIXTURE_API_KEY), 0)
+      << "the auth exchange's status 0";
+
+  std::string sid = prompt_create_sid(&client, 2, "plan over tcp");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+
+  std::string ask_id = fixture_parked_ask_id(&fx, sid);
+  ASSERT_EQ(ask_id.size(), 8u) << "the gate ask parked";
+
+  ca_ask_reply_request_t* req =
+      ask_reply_req_heap(3, sid.c_str(), ask_id.c_str(), 0, "Approve");
+  ASSERT_EQ(client_send_frame(&client, CA_ASK_REPLY_REQUEST, req), 0);
+  ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);
+
+  size_t idx = 0;
+  ASSERT_EQ(client_wait_frame(&client, CA_ASK_REPLY_RESPONSE, 3, &idx, 600),
+            1) << "the [17] ack came back over the authed channel";
+  {
+    uint64_t t = 0, rid = 0;
+    void* p = NULL;
+    uint8_t st = 0;
+    ASSERT_TRUE(client_decode(&client, idx, &t, &p, &rid, &st));
+    ASSERT_EQ(t, (uint64_t)CA_ASK_REPLY_RESPONSE);
+    ASSERT_EQ(rid, 3u);
+    ca_ask_reply_response_t* res = (ca_ask_reply_response_t*)p;
+    EXPECT_EQ(res->delivered, 1u);
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, p);
+  }
+
+  client_close(&client);
+  fixture_teardown(&fx);
+}
 
 #endif /* SA_HAS_WDB && SA_HAS_STREAMS */

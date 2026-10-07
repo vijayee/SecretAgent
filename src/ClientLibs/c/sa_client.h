@@ -228,6 +228,27 @@ int sa_client_prompt(sa_client_t* client, const char* sid, const char* text,
 int sa_client_interrupt(sa_client_t* client, const char* sid,
                         sa_client_interrupt_cb_t callback, void* ctx);
 
+/* Reply to a parked owner-surface ask (the escalation slice's reply verb;
+ * the asks ARRIVE as kind:"ask" event records — see the events callback
+ * above). decision 0 = answer, 1 = reject; value = the answer/refusal text
+ * (a reject may carry an empty/NULL value; an ANSWER requires its text —
+ * the daemon delivers the refusal as the ack's delivered=false).
+ * BLOCKING (the prompt/interrupt contract; ONE in-flight per connection;
+ * the busy slot completes the callback with SA_CLIENT_STATUS_BUSY). The
+ * events-callback re-entry rule covers this op: NEVER reply from inside
+ * an events callback — the caller's own thread.
+ * The callback's status: 0 = the ack reported delivered (the reply entered
+ * the frame's mailbox); 1 = NOT delivered (unbound/no mailbox/empty answer)
+ * or the transport failed. NEVER the daemon's stale-ask outcome: the wire's
+ * ack contract reflects ONLY the bind/post — a stale ask_id still acks
+ * delivered (the engine drops it asynchronously; the events stream carries
+ * the refusal). Same blocking + return contract as the interrupt (including
+ * the events-callback re-entry refusal: -1, no callback). */
+int sa_client_ask_reply(sa_client_t* client, const char* sid,
+                        const char* ask_id, uint8_t decision,
+                        const char* value, sa_client_interrupt_cb_t callback,
+                        void* ctx);
+
 /* List the store's sessions. Same blocking + return contract (including the
  * events-callback re-entry refusal: -1, no callback). */
 int sa_client_list_sessions(sa_client_t* client,

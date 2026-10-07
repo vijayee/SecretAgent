@@ -1367,6 +1367,65 @@ static void _ca_on_interrupt(ca_session_server_t* server, void* payload_raw,
   (void)_ca_send(iface, CA_INTERRUPT_RESPONSE, res);
 }
 
+/* The ask reply's ack (the escalate slice; spec §3.1): the response's
+   delivered byte reflects ONLY the bind/post — the engine's stale-ask drop
+   is events-stream truth. */
+static void _ca_ask_reply_ack(ca_session_conn_t* iface, uint64_t req_id,
+                              uint8_t delivered) {
+  ca_ask_reply_response_t* res =
+      (ca_ask_reply_response_t*)get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
+  res->delivered = delivered;
+  (void)_ca_send(iface, CA_ASK_REPLY_RESPONSE, res);
+}
+
+/* The parked ask's owner resolution (the interrupt handler's shape):
+   bind sid → frame, hand the reply to the engine's PUBLIC entry
+   (frame_ask_reply — the fire-and-post into the frame's own mailbox; no
+   store round trip, so no pending kind), and ack per the pinned ACK
+   CONTRACT (escalation spec §3.1): delivered=1 = the reply POSTED into the
+   frame's mailbox — NEVER the engine's consumption outcome (a stale ask_id
+   on a live parked frame still answers delivered 1; the engine drops it
+   asynchronously, loud, and the events stream carries the refusal). A done
+   frame has no mailbox a reply can enter: delivered 0 loud (NOT CA_ERROR —
+   the unbound reply is an honest "no", not a protocol violation). */
+static void _ca_on_ask_reply(ca_session_server_t* server, void* payload_raw,
+                             ca_session_conn_t* iface) {
+  ca_ask_reply_request_t* req = (ca_ask_reply_request_t*)payload_raw;
+  uint64_t req_id = req->req_id;
+
+  if (req->sid == NULL) {
+    log_error("ca: an ask reply carries no session — refused loud");
+    _ca_send_error(iface, req_id, 1, "the ask reply carries no session");
+    return;
+  }
+  frame_t* f = _ca_reg_find(server, req->sid);
+  if (f == NULL) {
+    log_error("ca: an ask reply names unknown session '%s' — refused loud",
+              req->sid);
+    _ca_send_error(iface, req_id, 2, "session unknown '%s'", req->sid);
+    return;
+  }
+  if (frame_is_done(f) != 0) {
+    log_error("ca: an ask reply arrived for the done session '%s' — "
+              "delivered false loud (a done frame has no mailbox to enter)",
+              req->sid);
+    _ca_ask_reply_ack(iface, req_id, 0);
+    return;
+  }
+  /* rc == 0 = POSTED (the pinned contract); rc < 0 = the reply never
+     entered the mailbox (an EMPTY answer's value, an invalid decision) —
+     delivered false loud. */
+  if (frame_ask_reply(f, req->ask_id, req->decision, req->value) != 0) {
+    log_error("ca: the ask reply for session '%s' (ask %s) refused at the "
+              "frame's boundary — delivered false loud",
+              req->sid, req->ask_id != NULL ? req->ask_id : "(missing)");
+    _ca_ask_reply_ack(iface, req_id, 0);
+    return;
+  }
+  _ca_ask_reply_ack(iface, req_id, 1);
+}
+
 static void _ca_on_sessions(ca_session_server_t* server, void* payload_raw,
                             ca_session_conn_t* iface) {
   ca_sessions_request_t* req = (ca_sessions_request_t*)payload_raw;
@@ -1417,6 +1476,9 @@ static void _ca_work_run(void* raw) {
       break;
     case CA_INTERRUPT_REQUEST:
       _ca_on_interrupt(server, w->payload, w->iface);
+      break;
+    case CA_ASK_REPLY_REQUEST:
+      _ca_on_ask_reply(server, w->payload, w->iface);
       break;
     case CA_SESSIONS_REQUEST:
       _ca_on_sessions(server, w->payload, w->iface);

@@ -26,6 +26,8 @@ extern "C" {
 #include "../src/ClientApi/Unix/unix_transport.h"
 #include "../src/ClientApi/Tcp/tcp_transport.h"
 #include "../src/ClientApi/client_api_wire.h"
+#include "../src/ClientApi/handlers.h"   /* ca_session_server_frame — the
+                                            parked ask's registry accessor */
 #include "../src/Frame/frame.h"
 #include "../src/Frame/model.h"
 #include "../src/Scheduler/scheduler.h"
@@ -33,6 +35,7 @@ extern "C" {
 #include "../src/Platform/platform.h"
 #include "../src/Util/allocator.h"
 #include "../src/Util/bcrypt.h"
+#include "../src/Util/json.h"
 }
 
 #if defined(SA_HAS_WDB) && defined(SA_HAS_STREAMS)
@@ -57,7 +60,8 @@ typedef struct {
   char dir_path[120];
 } fixture_t;
 
-static int fixture_setup_common(fixture_t* fx) {
+static int fixture_setup_common(fixture_t* fx, model_backend_t* shared_backend,
+                                unsigned escalation_mode) {
   memset(fx, 0, sizeof(*fx));
   memset(&fx->cfg, 0, sizeof(fx->cfg));
   fx->cfg.model_base_url = NULL;   /* a NULL-backend engine fails fast: no
@@ -65,6 +69,7 @@ static int fixture_setup_common(fixture_t* fx) {
   fx->cfg.model_api_key = NULL;
   fx->cfg.model_name = "unused";
   fx->cfg.max_depth = 4;
+  fx->cfg.escalation_mode = escalation_mode;
   fx->pool = scheduler_pool_create(2);
   if (fx->pool == NULL) return -1;
   scheduler_pool_start(fx->pool);
@@ -77,7 +82,7 @@ static int fixture_setup_common(fixture_t* fx) {
   fx->loop = streams_loop_create();
   if (fx->loop == NULL) return -3;
   fx->server = ca_session_server_create(fx->db, fx->pool, fx->loop, &fx->cfg,
-                                        NULL);
+                                        shared_backend);
   if (fx->server == NULL) return -4;
   char tmpl[] = "/tmp/sa-ca7-XXXXXX";
   char* dir = mkdtemp(tmpl);
@@ -88,7 +93,7 @@ static int fixture_setup_common(fixture_t* fx) {
 }
 
 static int fixture_setup(fixture_t* fx) {
-  int rc = fixture_setup_common(fx);
+  int rc = fixture_setup_common(fx, NULL, FRAME_ESCALATION_FREE);
   if (rc != 0) return rc;
   fx->transport = unix_transport_create(fx->pool, fx->server,
                                         fx->socket_path);
@@ -98,7 +103,7 @@ static int fixture_setup(fixture_t* fx) {
 }
 
 static int fixture_setup_tcp(fixture_t* fx) {
-  int rc = fixture_setup_common(fx);
+  int rc = fixture_setup_common(fx, NULL, FRAME_ESCALATION_FREE);
   if (rc != 0) return rc;
   char hash[64];
   if (bcrypt_generate(FIXTURE_API_KEY, 4, hash, sizeof(hash)) != 0) return -7;
@@ -106,6 +111,21 @@ static int fixture_setup_tcp(fixture_t* fx) {
                                            "127.0.0.1", 0, hash, &fx->tcp_addr);
   if (fx->tcp_transport == NULL) return -6;
   tcp_transport_start(fx->tcp_transport);
+  return 0;
+}
+
+/* The escalated variant (the escalation slice's ask tests): the template
+   carries the plan-ask-act mode for every api-created frame, and the
+   SHARED scripted backend makes the plan turn deterministic. */
+static int fixture_setup_escalated(fixture_t* fx,
+                                   model_backend_t* shared_backend) {
+  int rc = fixture_setup_common(fx, shared_backend,
+                                FRAME_ESCALATION_PLAN_ASK_ACT);
+  if (rc != 0) return rc;
+  fx->transport = unix_transport_create(fx->pool, fx->server,
+                                        fx->socket_path);
+  if (fx->transport == NULL) return -6;
+  unix_transport_start(fx->transport);
   return 0;
 }
 
@@ -164,13 +184,19 @@ typedef struct rec_t {
      (unreleased-at-destroy), release first, then double-release */
   bool hold_payloads = false;
   std::vector<void*> kept;
-  /* the re-entry harness (armed by one test): the events callback's FIRST
-     record delivery calls sa_client_prompt — the client must refuse it
-     immediately (return -1, no callback, the subscription keeps flowing) */
   std::atomic<int> attempt_reentry{0};
   std::atomic<int> reentry_attempts{0};
   std::atomic<int> reentry_rc{-2};
   std::atomic<int> reentry_ms{-1};
+  /* the ask replies (the escalation slice's op): one slot per completion */
+  std::vector<uint8_t> askreply_status;
+  /* the ask-reply RE-ENTRY harness (armed by the roundtrip test): the
+     events callback's FIRST record delivery calls sa_client_ask_reply —
+     the client must refuse it immediately (return -1, no callback) */
+  std::atomic<int> attempt_askreentry{0};
+  std::atomic<int> askreentry_attempts{0};
+  std::atomic<int> askreentry_rc{-2};
+  std::atomic<int> askreentry_ms{-1};
 } rec_t;
 
 static void rec_release(rec_t* r, void* p) {
@@ -194,6 +220,12 @@ static void rec_interrupt(void* ctx, uint8_t status) {
   rec_t* r = (rec_t*)ctx;
   std::lock_guard<std::mutex> g(r->m);
   r->interrupt_status.push_back(status);
+}
+
+static void rec_askreply(void* ctx, uint8_t status) {
+  rec_t* r = (rec_t*)ctx;
+  std::lock_guard<std::mutex> g(r->m);
+  r->askreply_status.push_back(status);
 }
 
 static void rec_sessions(void* ctx, uint8_t status,
@@ -263,6 +295,18 @@ static void rec_events(void* ctx, const char* sid, uint64_t seq, uint8_t op,
     r->reentry_rc.store(rc, std::memory_order_relaxed);
     r->reentry_ms.store(ms, std::memory_order_relaxed);
   }
+  /* THE ASK-REPLY's twin (the escalation slice): the re-entry rule covers
+     the reply op the same way — refused -1, instantly, no callback. */
+  if (r->attempt_askreentry.load(std::memory_order_relaxed) == 1 && seq > 0 &&
+      r->askreentry_attempts.fetch_add(1, std::memory_order_relaxed) == 0) {
+    auto t0 = std::chrono::steady_clock::now();
+    int rc = sa_client_ask_reply(r->client, "sessions/nowhere", "c0ffee12",
+                                 0, "too late", rec_askreply, r);
+    int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    r->askreentry_rc.store(rc, std::memory_order_relaxed);
+    r->askreentry_ms.store(ms, std::memory_order_relaxed);
+  }
 }
 
 static void rec_error(void* ctx, uint64_t rid, uint8_t status,
@@ -289,6 +333,156 @@ static sa_client_config_t client_config(const fixture_t* fx) {
   c.socket_path = fx->socket_path;
   c.error_cb = rec_error;
   return c;   /* error_ctx wired by the caller (the recorder is the ctx) */
+}
+
+/* --- the escalation slice's ask tests' machinery -------------------------- */
+
+/* A content-only completion body (test_loop.cpp's canned_content_body
+   shape): the plan-ask-act turn's content reply IS the plan — the ladder's
+   runtime-authored gate ask parks on its close (NO pyrt anywhere: no cells
+   run in the ask fixtures). */
+static std::string sa_content_body(const std::string& text) {
+  return std::string(
+      R"json({"choices":[{"message":{"role":"assistant","content":")json") +
+      text + std::string(R"json("}}]})json");
+}
+
+/* The scripted backend injected at the server (the handlers' suite's
+   wire_scripted_t shape, renamed for this file's namespace). */
+typedef struct sa_scripted_t {
+  model_backend_t base;
+  std::vector<std::string>* replies;
+} sa_scripted_t;
+
+static int sa_scripted_decode(const std::string& body,
+                              model_reply_t** reply_out, char** error_out) {
+  char* err = NULL;
+  json_value_t* root = json_parse(body.c_str(), body.size(), &err);
+  if (err != NULL) free(err);
+  if (root == NULL) {
+    *error_out = strdup("sa scripted model: body is not valid JSON");
+    return -1;
+  }
+  json_value_t* choices = json_get(root, "choices");
+  json_value_t* choice =
+      (choices != NULL && json_type(choices) == JSON_ARRAY)
+          ? json_at(choices, 0) : NULL;
+  json_value_t* message =
+      (choice != NULL && json_type(choice) == JSON_OBJECT)
+          ? json_get(choice, "message") : NULL;
+  if (message == NULL) {
+    json_value_destroy(root);
+    *error_out = strdup("sa scripted model: no message in choices[0]");
+    return -1;
+  }
+  model_reply_t* r = (model_reply_t*)get_clear_memory(sizeof(model_reply_t));
+  json_value_t* content = json_get(message, "content");
+  if (content == NULL || json_type(content) == JSON_NULL) {
+    r->content = strdup("");
+  } else {
+    r->content = strdup(json_as_string(content));
+  }
+  json_value_destroy(root);
+  *reply_out = r;
+  return 0;
+}
+
+static int sa_scripted_complete(void* self, json_value_t* messages,
+                                json_value_t* tools, char** raw_out,
+                                model_reply_t** reply_out, char** error_out) {
+  (void)messages;
+  (void)tools;
+  (void)raw_out;
+  *reply_out = NULL;
+  *error_out = NULL;
+  sa_scripted_t* sm = (sa_scripted_t*)self;
+  if (sm->replies->empty()) {
+    *error_out = strdup("sa scripted model: queue empty");
+    return -1;
+  }
+  std::string body = sm->replies->front();
+  sm->replies->erase(sm->replies->begin());
+  return sa_scripted_decode(body, reply_out, error_out) == 0 ? 0 : -1;
+}
+
+/* The parked plan gate's ask id, polled off the registry frame's event log
+   (the handlers' accessor — the events-stream is the ask's delivery).
+   "" when the ask never landed within the bound. */
+static std::string fixture_parked_ask_id(fixture_t* fx,
+                                         const std::string& sid) {
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  if (f == NULL) return "";
+  for (int i = 0; i < 800; i++) {
+    char* json = frame_debug_events(f);
+    if (json == NULL) return "";
+    char* err = NULL;
+    json_value_t* events = json_parse(json, strlen(json), &err);
+    if (err != NULL) free(err);
+    free(json);
+    if (events == NULL) return "";
+    std::string found;
+    for (size_t j = 0; j < json_size(events); j++) {
+      json_value_t* rec = json_at(events, j);
+      json_value_t* t_v = json_get(rec, "type");
+      if (t_v == NULL || strcmp(json_as_string(t_v), "ask") != 0) continue;
+      json_value_t* p = json_get(rec, "payload");
+      json_value_t* id = (p != NULL) ? json_get(p, "askId") : NULL;
+      if (id != NULL && json_type(id) == JSON_STRING) {
+        found = json_as_string(id);
+        break;
+      }
+    }
+    json_value_destroy(events);
+    if (!found.empty()) return found;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return "";
+}
+
+/* Whether ONE read of the frame's log shows the ask.reply record resolving
+   `ask_id` {answer, value}. */
+static bool fixture_ask_reply_committed(fixture_t* fx, const std::string& sid,
+                                        const std::string& ask_id,
+                                        const char* value) {
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  if (f == NULL) return false;
+  char* json = frame_debug_events(f);
+  if (json == NULL) return false;
+  char* err = NULL;
+  json_value_t* events = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  if (events == NULL) return false;
+  bool found = false;
+  for (size_t j = 0; j < json_size(events); j++) {
+    json_value_t* rec = json_at(events, j);
+    json_value_t* t_v = json_get(rec, "type");
+    if (t_v == NULL || strcmp(json_as_string(t_v), "ask.reply") != 0) continue;
+    json_value_t* p = json_get(rec, "payload");
+    json_value_t* id_v = (p != NULL) ? json_get(p, "askId") : NULL;
+    json_value_t* val_v = (p != NULL) ? json_get(p, "value") : NULL;
+    json_value_t* d_v = (p != NULL) ? json_get(p, "decision") : NULL;
+    if (id_v != NULL && val_v != NULL && d_v != NULL &&
+        strcmp(json_as_string(id_v), ask_id.c_str()) == 0 &&
+        strcmp(json_as_string(d_v), "answer") == 0 &&
+        strcmp(json_as_string(val_v), value) == 0) {
+      found = true;
+      break;
+    }
+  }
+  json_value_destroy(events);
+  return found;
+}
+
+/* Polls fixture_ask_reply_committed until the consume lands. */
+static bool fixture_wait_reply_committed(fixture_t* fx, const std::string& sid,
+                                         const std::string& ask_id,
+                                         const char* value, int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    if (fixture_ask_reply_committed(fx, sid, ask_id, value)) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
 }
 
 /* --- the tests (unix) -------------------------------------------------------- */
@@ -714,7 +908,7 @@ static void silent_server_stop(silent_server_t* s) {
 
 TEST(TestSaClient, TestSilentServerTimesOutTheRequest) {
   fixture_t fx;
-  ASSERT_EQ(fixture_setup_common(&fx), 0);   /* the store/server stay DOWN —
+  ASSERT_EQ(fixture_setup_common(&fx, NULL, FRAME_ESCALATION_FREE), 0);  /* the store/server stay DOWN —
                                                 only the silent listener */
   silent_server_t silent;
   memset(&silent, 0, sizeof(silent));
@@ -760,7 +954,7 @@ TEST(TestSaClient, TestServerDeathMidRequestFailsClean) {
      callback both fire, and the destroy (no subscription active) lands
      clean. */
   fixture_t fx;
-  ASSERT_EQ(fixture_setup_common(&fx), 0);
+  ASSERT_EQ(fixture_setup_common(&fx, NULL, FRAME_ESCALATION_FREE), 0);
   silent_server_t silent;
   memset(&silent, 0, sizeof(silent));
   char path[120];
@@ -982,6 +1176,210 @@ TEST(TestSaClientConfigFfi, TestProbesPinTheStructShape) {
   /* the out-of-range bounds answer 0 (the probe's documented floor) */
   EXPECT_EQ(sa_client_config_ffi_offset(10), (size_t)0);
   EXPECT_EQ(sa_client_config_ffi_offset(-1), (size_t)0);
+}
+
+/* --- the escalation slice's ask tests -------------------------------------- */
+
+TEST(TestSaClient, TestAskReplyRoundTrip) {
+  /* The parked plan gate over the REAL unix stack (the handlers' shape):
+     the create's PLAN_ASK_ACT frame parks at the gate; the answer through
+     sa_client_ask_reply completes cb(0) — the ack's delivered member read
+     off the payload — and the engine consumes durably (ask.reply + the
+     answer's user msg.append). Then the re-entry rule's probe (the armed
+     events callback refuses the op -1) and the one-in-flight slot's
+     (an overlapping second call completes cb(BUSY), never a -1). */
+  std::vector<std::string> replies = {
+      sa_content_body("Plan: 1. measure 2. cut 3. report"),
+      sa_content_body("the act ran quiet")};
+  sa_scripted_t sm;
+  memset(&sm, 0, sizeof(sm));
+  sm.base.complete = sa_scripted_complete;
+  sm.replies = &replies;
+
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_escalated(&fx, &sm.base), 0);
+  rec_t rec;
+  sa_client_config_t cfg = client_config(&fx);
+  cfg.error_ctx = &rec;
+  sa_client_t* cl = sa_client_connect(&cfg);
+  ASSERT_NE(cl, nullptr);
+  rec.client = cl;
+
+  /* the create: the frame parks at the gate */
+  ASSERT_EQ(sa_client_prompt(cl, NULL, "plan the cut", rec_prompt, &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.prompt_sid.empty();
+  }));
+  std::string sid;
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.prompt_status.back(), 0u);
+    sid = rec.prompt_sid.back();
+  }
+  std::string ask_id = fixture_parked_ask_id(&fx, sid);
+  ASSERT_EQ(ask_id.size(), 8u) << "the gate ask parked";
+
+  /* THE ANSWER: cb(0) — the ack reported delivered. */
+  ASSERT_EQ(sa_client_ask_reply(cl, sid.c_str(), ask_id.c_str(), 0,
+                                "Approve", rec_askreply, &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.askreply_status.empty();
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.askreply_status.size(), 1u);
+    EXPECT_EQ(rec.askreply_status.back(), 0u) << "delivered";
+    EXPECT_EQ(rec.err_status.size(), 0u)
+        << "the delivered ack carries no error-channel entry";
+  }
+  ASSERT_TRUE(fixture_wait_reply_committed(&fx, sid, ask_id, "Approve", 800))
+      << "the engine consumed the answer durably";
+
+  /* THE RE-ENTRY (the events callback's own thread): subscribing replays
+     the log's records — the first record delivery calls the blocking op,
+     which must refuse -1 instantly, firing NO callback. */
+  rec.attempt_askreentry.store(1);
+  ASSERT_EQ(sa_client_subscribe_events(cl, sid.c_str(), rec_events, &rec), 0);
+  ASSERT_TRUE(wait_for([&] { return rec.askreentry_rc.load() == -1; }))
+      << "an events callback's sa_client_ask_reply refuses immediately";
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    EXPECT_LT(rec.askreentry_ms.load(), 100)
+        << "the refusal is microseconds, not a timeout stall";
+    ASSERT_EQ(rec.askreply_status.size(), 1u)
+        << "the re-entry fired no ask-reply callback";
+  }
+
+  /* THE ONE-IN-FLIGHT SLOT: a SILENT peer holds the first call mid-flight;
+     the overlapping second call completes cb(BUSY) on ITS thread (the
+     op contract: rc 0 + a delivered failure status — -1 is ONLY the
+     re-entry refusal). The slot's value is order-agnostic: whichever call
+     won the slot times out, the other refuses busy. */
+  silent_server_t silent;
+  memset(&silent, 0, sizeof(silent));
+  char silent_path[160];
+  snprintf(silent_path, sizeof(silent_path), "%s/silent2.sock",
+           fx.dir_path);
+  silent_server_start(&silent, silent_path);
+  rec_t recb;
+  sa_client_config_t cfg2 = client_config(&fx);
+  cfg2.socket_path = silent_path;
+  cfg2.request_timeout_ms = 300;   /* the held call's bounded end */
+  cfg2.error_ctx = &recb;
+  sa_client_t* cl2 = sa_client_connect(&cfg2);
+  ASSERT_NE(cl2, nullptr);
+  recb.client = cl2;
+  std::thread held([&] {
+    sa_client_ask_reply(cl2, "sessions/0000000000000000000deadbeef",
+                        "abcdef12", 0, "late answer", rec_askreply, &recb);
+  });
+  /* the first call's slot grab is its own thread's first act — the 20 ms
+     handicap keeps the overlap honest (the held call WINS the slot) */
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  ASSERT_EQ(sa_client_ask_reply(cl2, "sessions/0000000000000000000deadbeef",
+                                "abcdef12", 0, "the overlapping call",
+                                rec_askreply, &recb), 0);
+  held.join();
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(recb.m);
+    return recb.askreply_status.size() == 2;
+  }));
+  {
+    std::lock_guard<std::mutex> g(recb.m);
+    ASSERT_EQ(recb.askreply_status.size(), 2u);
+    bool saw_busy = false, saw_timeout = false;
+    for (uint8_t st : recb.askreply_status) {
+      saw_busy |= (st == (uint8_t)SA_CLIENT_STATUS_BUSY);
+      saw_timeout |= (st == (uint8_t)SA_CLIENT_STATUS_TIMEOUT);
+    }
+    EXPECT_TRUE(saw_busy) << "the overlapping second call completed BUSY "
+                             "(rc 0 — the delivery, not the refusal)";
+    EXPECT_TRUE(saw_timeout) << "the held call ended at its bound";
+  }
+  sa_client_destroy(cl2);
+  silent_server_stop(&silent);
+  platform_file_unlink(silent_path);
+
+  sa_client_destroy(cl);
+  fixture_teardown(&fx);
+}
+
+TEST(TestSaClient, TestAskReplyDeliveredFalseFailsTheCallback) {
+  /* The delivered-0 ack → cb(1) — the PAYLOAD's delivered member read,
+     NEVER the status-0-ok idiom (the codec's trap: the response's
+     delivered byte rides *status OUT of the decode, so an rstatus idiom
+     would invert this no into a success). The probe: an ANSWER with an
+     empty value — the engine's boundary refuses it (an answer carries its
+     text), the handler acks delivered 0, and the frame's park STAYS
+     (no ask.reply record). No error-channel entry either. */
+  std::vector<std::string> replies = {
+      sa_content_body("Plan: the only plan"),
+      sa_content_body("the act ran quiet")};
+  sa_scripted_t sm;
+  memset(&sm, 0, sizeof(sm));
+  sm.base.complete = sa_scripted_complete;
+  sm.replies = &replies;
+
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_escalated(&fx, &sm.base), 0);
+  rec_t rec;
+  sa_client_config_t cfg = client_config(&fx);
+  cfg.error_ctx = &rec;
+  sa_client_t* cl = sa_client_connect(&cfg);
+  ASSERT_NE(cl, nullptr);
+  rec.client = cl;
+
+  ASSERT_EQ(sa_client_prompt(cl, NULL, "plan the empty answer", rec_prompt,
+                             &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.prompt_sid.empty();
+  }));
+  std::string sid;
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    sid = rec.prompt_sid.back();
+  }
+  std::string ask_id = fixture_parked_ask_id(&fx, sid);
+  ASSERT_EQ(ask_id.size(), 8u);
+
+  /* The EMPTY answer: the daemon's boundary refuses — the honest no rides
+     delivered 0 → cb(1). */
+  ASSERT_EQ(sa_client_ask_reply(cl, sid.c_str(), ask_id.c_str(), 0, "",
+                                rec_askreply, &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.askreply_status.empty();
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.askreply_status.size(), 1u);
+    EXPECT_EQ(rec.askreply_status.back(), 1u)
+        << "delivered 0 completes the callback 1 (the payload's member)";
+    EXPECT_EQ(rec.err_status.size(), 0u)
+        << "the unbound reply is the ack's no — not the error channel";
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_FALSE(fixture_ask_reply_committed(&fx, sid, ask_id, ""))
+      << "the empty answer never entered the mailbox (no resolution record)";
+
+  /* And the honest answer STILL consumes the standing park (the refusal
+     never ate it). */
+  ASSERT_EQ(sa_client_ask_reply(cl, sid.c_str(), ask_id.c_str(), 0,
+                                "Approve", rec_askreply, &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return rec.askreply_status.size() == 2;
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    EXPECT_EQ(rec.askreply_status.back(), 0u);
+  }
+
+  sa_client_destroy(cl);
+  fixture_teardown(&fx);
 }
 
 #endif /* SA_HAS_WDB && SA_HAS_STREAMS */

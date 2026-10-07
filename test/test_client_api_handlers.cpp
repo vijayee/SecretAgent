@@ -70,12 +70,14 @@ typedef struct {
    borrowed "unused" model tag above. */
 static int fixture_setup_cfg(fixture_t* fx, model_backend_t* shared_backend,
                              const char* base_url, const char* api_key,
-                             const char* model_name) {
+                             const char* model_name,
+                             unsigned escalation_mode) {
   memset(fx, 0, sizeof(*fx));
   fx->cfg = test_config();
   fx->cfg.model_base_url = base_url;
   fx->cfg.model_api_key = api_key;
   fx->cfg.model_name = model_name;
+  fx->cfg.escalation_mode = escalation_mode;
   fx->pool = scheduler_pool_create(2);
   if (fx->pool == NULL) return -1;
   scheduler_pool_start(fx->pool);
@@ -94,7 +96,20 @@ static int fixture_setup_cfg(fixture_t* fx, model_backend_t* shared_backend,
 }
 
 static int fixture_setup(fixture_t* fx, model_backend_t* shared_backend) {
-  return fixture_setup_cfg(fx, shared_backend, NULL, NULL, "unused");
+  return fixture_setup_cfg(fx, shared_backend, NULL, NULL, "unused",
+                           FRAME_ESCALATION_FREE);
+}
+
+/* The escalated variant (the escalation slice's ask tests): the template
+   carries the plan-ask-act mode — the server copies frame_cfg BY VALUE at
+   create, so every api-created frame parks at the runtime-authored plan
+   gate. The fixture's cfg IS the knob (the test owns the template; the
+   wire/CA_CONFIG never carried a field — the demo CLI's flags own the
+   server-side plumbing). */
+static int fixture_setup_escalated(fixture_t* fx,
+                                   model_backend_t* shared_backend) {
+  return fixture_setup_cfg(fx, shared_backend, NULL, NULL, "unused",
+                           FRAME_ESCALATION_PLAN_ASK_ACT);
 }
 
 /* The documented teardown order (handlers.h): the connections are closed by
@@ -260,6 +275,23 @@ static ca_config_request_t* config_req(uint64_t req_id, const char* base_url,
     req->key_len = strlen(api_key);
   }
   if (model != NULL) req->model = strdup(model);
+  return req;
+}
+
+/* The ASK_REPLY request builder (the escalation slice's reply verb): the
+   value rides NULL for the reject's empty shape (the wire's "" sentinel).
+   Ownership transfers into ca_session_handle. */
+static ca_ask_reply_request_t* ask_reply_req(uint64_t req_id, const char* sid,
+                                             const char* ask_id,
+                                             uint8_t decision,
+                                             const char* value) {
+  ca_ask_reply_request_t* req =
+      (ca_ask_reply_request_t*)get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
+  req->sid = (sid != NULL) ? strdup(sid) : NULL;
+  req->ask_id = (ask_id != NULL) ? strdup(ask_id) : NULL;
+  req->decision = decision;
+  req->value = (value != NULL) ? strdup(value) : NULL;
   return req;
 }
 
@@ -1550,7 +1582,8 @@ TEST(TestClientApiHandlers, TestConfigGetAndSetTheTemplate) {
      honest by construction: the template is read at frame_create only,
      PINNED at _ca_on_config — the frame's copies are frame-owned dups). */
   fixture_t fx;
-  ASSERT_EQ(fixture_setup_cfg(&fx, NULL, NULL, NULL, NULL), 0);
+  ASSERT_EQ(fixture_setup_cfg(&fx, NULL, NULL, NULL, NULL,
+                              FRAME_ESCALATION_FREE), 0);
   conn_double_t conn;
   conn_double_init(&conn);
 
@@ -1710,6 +1743,314 @@ TEST(TestClientApiHandlers, TestConfigGetAndSetTheTemplate) {
 
   fixture_teardown(&fx);
   /* The ref discipline proved (the fixture's existing backstop). */
+  EXPECT_EQ(conn.refs.load(), 0);
+  conn_double_destroy(&conn);
+}
+
+/* --- the escalation slice's ask tests (the parked plan gate's handlers
+   shapes; NO pyrt anywhere — the gate ask is runtime-authored from a
+   content-only plan reply, so no cells run) ------------------------------- */
+
+/* A content-only completion body (test_loop.cpp's canned_content_body
+   shape): a PLAN_ASK_ACT turn's content reply IS the plan — the ladder's
+   runtime-authored gate ask parks on its turn close. */
+static std::string content_body(const std::string& text) {
+  return std::string(
+      R"json({"choices":[{"message":{"role":"assistant","content":")json") +
+      text + std::string(R"json("}}]})json");
+}
+
+/* The parked plan gate's ask id, polled off the registry frame's event log.
+   "" when the ask never landed within the bound. */
+static std::string parked_ask_id(fixture_t* fx, const std::string& sid) {
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  if (f == NULL) return "";
+  for (int i = 0; i < 800; i++) {
+    char* json = frame_debug_events(f);
+    if (json == NULL) return "";
+    char* err = NULL;
+    json_value_t* events = json_parse(json, strlen(json), &err);
+    if (err != NULL) free(err);
+    free(json);
+    if (events == NULL) return "";
+    std::string found;
+    for (size_t j = 0; j < json_size(events); j++) {
+      json_value_t* rec = json_at(events, j);
+      json_value_t* t_v = json_get(rec, "type");
+      if (t_v == NULL || json_type(t_v) != JSON_STRING ||
+          strcmp(json_as_string(t_v), "ask") != 0) {
+        continue;
+      }
+      json_value_t* p = json_get(rec, "payload");
+      json_value_t* id = (p != NULL) ? json_get(p, "askId") : NULL;
+      if (id != NULL && json_type(id) == JSON_STRING) {
+        found = json_as_string(id);
+        break;
+      }
+    }
+    json_value_destroy(events);
+    if (!found.empty()) return found;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return "";
+}
+
+/* Whether ONE read of the frame's log shows BOTH durable halves of the
+   owner resolution's consume (spec §1.4's standing law): the ask.reply
+   record resolving `ask_id` {answer, value} AND the answer's user-side
+   msg.append (content == value). */
+static bool reply_consumed_now(fixture_t* fx, const std::string& sid,
+                               const std::string& ask_id, const char* value,
+                               bool* saw_reply, bool* saw_append) {
+  *saw_reply = false;
+  *saw_append = false;
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  if (f == NULL) return false;
+  char* json = frame_debug_events(f);
+  if (json == NULL) return false;
+  char* err = NULL;
+  json_value_t* events = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  if (events == NULL) return false;
+  for (size_t j = 0; j < json_size(events); j++) {
+    json_value_t* rec = json_at(events, j);
+    json_value_t* t_v = json_get(rec, "type");
+    const char* t = (t_v != NULL && json_type(t_v) == JSON_STRING)
+                        ? json_as_string(t_v) : NULL;
+    json_value_t* p = json_get(rec, "payload");
+    if (t != NULL && strcmp(t, "ask.reply") == 0) {
+      json_value_t* id_v = (p != NULL) ? json_get(p, "askId") : NULL;
+      json_value_t* d_v = (p != NULL) ? json_get(p, "decision") : NULL;
+      json_value_t* val_v = (p != NULL) ? json_get(p, "value") : NULL;
+      if (id_v != NULL && d_v != NULL && val_v != NULL &&
+          strcmp(json_as_string(id_v), ask_id.c_str()) == 0 &&
+          strcmp(json_as_string(d_v), "answer") == 0 &&
+          strcmp(json_as_string(val_v), value) == 0) {
+        *saw_reply = true;
+      }
+    }
+    if (t != NULL && strcmp(t, "msg.append") == 0) {
+      json_value_t* role = (p != NULL) ? json_get(p, "role") : NULL;
+      json_value_t* content = (p != NULL) ? json_get(p, "content") : NULL;
+      if (role != NULL && json_type(role) == JSON_STRING &&
+          strcmp(json_as_string(role), "user") == 0 &&
+          content != NULL && json_type(content) == JSON_STRING &&
+          strcmp(json_as_string(content), value) == 0) {
+        *saw_append = true;
+      }
+    }
+  }
+  json_value_destroy(events);
+  return *saw_reply && *saw_append;
+}
+
+/* Polls reply_consumed_now until the pair lands (the engine's consume runs
+   on the pool — the ack posted LONG before the log's batch commits). */
+static bool wait_reply_consumed(fixture_t* fx, const std::string& sid,
+                                const std::string& ask_id, const char* value,
+                                int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    bool saw_reply = false, saw_append = false;
+    if (reply_consumed_now(fx, sid, ask_id, value, &saw_reply, &saw_append)) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
+TEST(TestClientApiHandlers, TestAskReplyBindsAndPosts) {
+  /* The escalation ladder's handlers slice (spec §3.2): a PLAN_ASK_ACT
+     frame created by the SERVER (the fixture's template carries the mode)
+     parks at the runtime-authored plan gate; the wire's ASK_REPLY binds
+     sid→frame and hands the reply to the engine's PUBLIC entry — the ack
+     {delivered 1} reflects ONLY the post (the pinned contract), and the
+     consumption lands durably in the frame's log: the ask.reply record +
+     the answer's user-side msg.append (ONE batch, the engine's pool
+     dispatch). */
+  std::vector<std::string> replies = {
+      content_body("Plan: 1. measure the beam 2. cut once 3. report"),
+      content_body("did it quietly")};
+  wire_scripted_t sm;
+  memset(&sm, 0, sizeof(sm));
+  sm.base.complete = wire_scripted_complete;
+  sm.replies = &replies;
+
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_escalated(&fx, &sm.base), 0);
+  conn_double_t conn;
+  conn_double_init(&conn);
+
+  std::string sid = prompt_create_and_sid(&fx, &conn, 1, "plan the cut");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+
+  std::string ask_id = parked_ask_id(&fx, sid);
+  ASSERT_EQ(ask_id.size(), 8u) << "the gate ask parked (the minted id)";
+
+  ca_session_handle(fx.server, CA_ASK_REPLY_REQUEST,
+                    ask_reply_req(3, sid.c_str(), ask_id.c_str(), 0,
+                                  "Approve"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 2, 600)) << "the reply's ack";
+  {
+    void* p = NULL;
+    uint64_t t = 0, rid = 0;
+    uint8_t st = 0;
+    ASSERT_TRUE(conn_decode(&conn, 1, &t, &p, &rid, &st));
+    ASSERT_EQ(t, (uint64_t)CA_ASK_REPLY_RESPONSE);
+    ASSERT_EQ(rid, 3u);
+    ca_ask_reply_response_t* res = (ca_ask_reply_response_t*)p;
+    EXPECT_EQ(res->delivered, 1u) << "the reply POSTED (the pinned contract)";
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, p);
+  }
+
+  /* The engine's consumption (async, on the pool): the reply's durable
+     pair. */
+  EXPECT_TRUE(wait_reply_consumed(&fx, sid, ask_id, "Approve", 800))
+      << "the ask.reply record + the answer's user-side msg.append";
+
+  fixture_teardown(&fx);
+  EXPECT_EQ(conn.refs.load(), 0);
+  conn_double_destroy(&conn);
+}
+
+TEST(TestClientApiHandlers, TestAskReplyUnboundGetsDeliveredFalse) {
+  /* The UNBOUND shapes against their honest acks (spec §3.1): an unknown
+     sid is a protocol refusal (CA_ERROR, the req_id echoing); a done
+     frame's mailbox is gone → delivered 0; and a STALE ask_id on a live
+     parked frame still answers delivered 1 — the POST succeeded, the
+     engine drops it asynchronously (the pinned ack contract: the
+     events stream carries the refusal, never the ack). */
+  std::vector<std::string> replies = {
+      content_body("Plan: the only plan"),
+      content_body("the act ran quiet")};
+  wire_scripted_t sm;
+  memset(&sm, 0, sizeof(sm));
+  sm.base.complete = wire_scripted_complete;
+  sm.replies = &replies;
+
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_escalated(&fx, &sm.base), 0);
+  conn_double_t conn;
+  conn_double_init(&conn);
+
+  std::string sid = prompt_create_and_sid(&fx, &conn, 1, "unbound probes");
+  ASSERT_EQ(sid.rfind("sessions/", 0), 0u);
+
+  /* The UNKNOWN sid: CA_ERROR loud (the interrupt's refusal shape). */
+  ca_session_handle(fx.server, CA_ASK_REPLY_REQUEST,
+                    ask_reply_req(10, "sessions/0000000000000000000deadbeef",
+                                  "c0ffee12", 0, "Approve"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 2, 600));
+  {
+    void* p = NULL;
+    uint64_t t = 0, rid = 0;
+    uint8_t st = 0;
+    ASSERT_TRUE(conn_decode(&conn, 1, &t, &p, &rid, &st));
+    ASSERT_EQ(t, (uint64_t)CA_ERROR);
+    ASSERT_EQ(rid, 10u);
+    ca_error_t* err = (ca_error_t*)p;
+    EXPECT_EQ(err->status, 2u) << "the unknown-session status";
+    ca_wire_payload_destroy(CA_ERROR, p);
+  }
+
+  std::string ask_id = parked_ask_id(&fx, sid);
+  ASSERT_EQ(ask_id.size(), 8u) << "the gate ask parked";
+
+  /* The STALE ask_id on the LIVE parked frame: delivered 1 — only the
+     post's truth rides the ack. */
+  ca_session_handle(fx.server, CA_ASK_REPLY_REQUEST,
+                    ask_reply_req(2, sid.c_str(), "c0ffee12", 0, "Approve"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 3, 600));
+  {
+    void* p = NULL;
+    uint64_t t = 0, rid = 0;
+    uint8_t st = 0;
+    ASSERT_TRUE(conn_decode(&conn, 2, &t, &p, &rid, &st));
+    ASSERT_EQ(t, (uint64_t)CA_ASK_REPLY_RESPONSE);
+    ASSERT_EQ(rid, 2u);
+    ca_ask_reply_response_t* res = (ca_ask_reply_response_t*)p;
+    EXPECT_EQ(res->delivered, 1u)
+        << "the stale reply POSTED (the engine drops it — events truth)";
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, p);
+  }
+
+  /* The REAL answer consumes the park; the act turn runs to its content
+     close and the frame goes done. */
+  ca_session_handle(fx.server, CA_ASK_REPLY_REQUEST,
+                    ask_reply_req(3, sid.c_str(), ask_id.c_str(), 0,
+                                  "Approve"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 4, 600));
+  {
+    void* p = NULL;
+    uint64_t t = 0, rid = 0;
+    uint8_t st = 0;
+    ASSERT_TRUE(conn_decode(&conn, 3, &t, &p, &rid, &st));
+    ASSERT_EQ(t, (uint64_t)CA_ASK_REPLY_RESPONSE);
+    ASSERT_EQ(rid, 3u);
+    ca_ask_reply_response_t* res = (ca_ask_reply_response_t*)p;
+    EXPECT_EQ(res->delivered, 1u);
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, p);
+  }
+  EXPECT_TRUE(wait_reply_consumed(&fx, sid, ask_id, "Approve", 800))
+      << "the answer's durable pair";
+
+  frame_t* f = ca_session_server_frame(fx.server, sid.c_str());
+  ASSERT_NE(f, nullptr);
+  for (int i = 0; i < 800 && frame_is_done(f) == 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(frame_is_done(f), 1u) << "the act turn completed";
+
+  /* The DONE frame: its mailbox is gone — the honest no. */
+  ca_session_handle(fx.server, CA_ASK_REPLY_REQUEST,
+                    ask_reply_req(4, sid.c_str(), ask_id.c_str(), 0,
+                                  "Too late"),
+                    &conn.iface);
+  ASSERT_TRUE(conn_wait_count(&conn, 5, 600));
+  {
+    void* p = NULL;
+    uint64_t t = 0, rid = 0;
+    uint8_t st = 0;
+    ASSERT_TRUE(conn_decode(&conn, 4, &t, &p, &rid, &st));
+    ASSERT_EQ(t, (uint64_t)CA_ASK_REPLY_RESPONSE)
+        << "a done frame's unbound reply is NOT a CA_ERROR (an honest no)";
+    ASSERT_EQ(rid, 4u);
+    ca_ask_reply_response_t* res = (ca_ask_reply_response_t*)p;
+    EXPECT_EQ(res->delivered, 0u);
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, p);
+  }
+
+  /* The stale reply never consumed anything: exactly ONE ask.reply record
+     resolved the parked ask. */
+  bool saw_reply = false, saw_append = false;
+  ASSERT_TRUE(reply_consumed_now(&fx, sid, ask_id, "Approve", &saw_reply,
+                                 &saw_append));
+  frame_t* f2 = ca_session_server_frame(fx.server, sid.c_str());
+  char* json = frame_debug_events(f2);
+  ASSERT_NE(json, nullptr);
+  char* err = NULL;
+  json_value_t* events = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  ASSERT_NE(events, nullptr);
+  size_t replies_count = 0;
+  for (size_t j = 0; j < json_size(events); j++) {
+    json_value_t* rec = json_at(events, j);
+    json_value_t* t_v = json_get(rec, "type");
+    if (t_v != NULL && strcmp(json_as_string(t_v), "ask.reply") == 0) {
+      replies_count++;
+    }
+  }
+  json_value_destroy(events);
+  EXPECT_EQ(replies_count, 1u)
+      << "the stale id's drop left no resolution record";
+
+  fixture_teardown(&fx);
   EXPECT_EQ(conn.refs.load(), 0);
   conn_double_destroy(&conn);
 }

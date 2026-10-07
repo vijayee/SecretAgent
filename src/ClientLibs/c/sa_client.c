@@ -920,6 +920,73 @@ int sa_client_interrupt(sa_client_t* client, const char* sid,
   return 0;
 }
 
+int sa_client_ask_reply(sa_client_t* client, const char* sid,
+                        const char* ask_id, uint8_t decision,
+                        const char* value, sa_client_interrupt_cb_t callback,
+                        void* ctx) {
+  ca_ask_reply_request_t* req;
+  uint64_t rid = 0, rtype = 0;
+  uint8_t rstatus = 0, fail = 0;
+  void* resp = NULL;
+  int rc;
+
+  if (client == NULL || sid == NULL || ask_id == NULL || ask_id[0] == '\0')
+    return -1;
+  if (_reentry_refused(client)) {
+    log_error("sa_client_ask_reply: a blocking op from an events callback is "
+              "refused (status=%u)", SA_CLIENT_STATUS_REENTRANT);
+    return -1;   /* no callback fires — see the header's re-entry note */
+  }
+  req = get_clear_memory(sizeof(*req));
+  if (req == NULL) {
+    _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory building the ask reply");
+    return 0;
+  }
+  req->sid = _dup_string(sid);
+  req->ask_id = _dup_string(ask_id);
+  req->decision = decision;
+  /* a NULL value rides (the reject's empty shape; the wire's encode renders
+     it "" and the daemon's decode sends it back NULL) */
+  req->value = _dup_string(value);
+  if (req->sid == NULL || req->ask_id == NULL || req->value == NULL) {
+    _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
+                 "out of memory building the ask reply");
+    ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);
+    return 0;
+  }
+  rc = _roundtrip(client, CA_ASK_REPLY_RESPONSE, req, CA_ASK_REPLY_REQUEST,
+                  &rid, &rtype, &rstatus, &resp, &fail);
+  ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);
+  if (rc < 0) return -1;
+  if (rc == 1) {
+    if (callback != NULL) callback(ctx, fail);
+    return 0;
+  }
+  if (rtype != CA_ASK_REPLY_RESPONSE) {
+    /* unreachable (the slot filters by the pairing) — drop loud, move on */
+    ca_wire_payload_destroy(rtype, resp);
+    return 0;
+  }
+  {
+    ca_ask_reply_response_t* res = (ca_ask_reply_response_t*)resp;
+    /* THE ACK CONTRACT (the codec's trap comment): the response's delivered
+       byte rides *status OUT of the decode — a status==0-ok idiom reading
+       rstatus here would invert every delivered-0 ack into success. The
+       PAYLOAD's delivered member is the truth. */
+    uint8_t delivered = res->delivered;
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, res);
+    if (delivered != 1) {
+      log_error("sa_client: the ask reply was not delivered (sid %s, ask %s)",
+                sid, ask_id);
+      if (callback != NULL) callback(ctx, 1);
+      return 0;
+    }
+    if (callback != NULL) callback(ctx, SA_CLIENT_STATUS_OK);
+  }
+  return 0;
+}
+
 /* Frees a whole rows build (the array AND every non-NULL string in it) —
    the copy failure's unwind and the OOM-hold's cancellation share this. */
 static void _free_rows(sa_client_session_row_t* rows, size_t nrecords) {
