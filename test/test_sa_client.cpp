@@ -485,6 +485,118 @@ static bool fixture_wait_reply_committed(fixture_t* fx, const std::string& sid,
   return false;
 }
 
+/* Whether ONE read of the frame's log shows the ask.reply record resolving
+   `ask_id` as the REJECT (decision "reject") — the poll's existence probe. */
+static bool fixture_ask_reject_recorded(fixture_t* fx, const std::string& sid,
+                                        const std::string& ask_id) {
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  if (f == NULL) return false;
+  char* json = frame_debug_events(f);
+  if (json == NULL) return false;
+  char* err = NULL;
+  json_value_t* events = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  if (events == NULL) return false;
+  bool found = false;
+  for (size_t j = 0; j < json_size(events); j++) {
+    json_value_t* rec = json_at(events, j);
+    json_value_t* t_v = json_get(rec, "type");
+    if (t_v == NULL || strcmp(json_as_string(t_v), "ask.reply") != 0) continue;
+    json_value_t* p = json_get(rec, "payload");
+    json_value_t* id_v = (p != NULL) ? json_get(p, "askId") : NULL;
+    json_value_t* d_v = (p != NULL) ? json_get(p, "decision") : NULL;
+    if (id_v != NULL && d_v != NULL &&
+        strcmp(json_as_string(id_v), ask_id.c_str()) == 0 &&
+        strcmp(json_as_string(d_v), "reject") == 0) {
+      found = true;
+      break;
+    }
+  }
+  json_value_destroy(events);
+  return found;
+}
+
+/* THE REJECT CONSUME'S SHAPE: the value's null is the NULL ride's terminal
+   shape ("" on the wire → absent at the daemon's decode → null in the
+   record); the same batch's default-wording user append rides next; and no
+   plan-approved control record anywhere (a reject never transitions the
+   ladder). */
+static void fixture_check_reject_consumed(fixture_t* fx,
+                                          const std::string& sid,
+                                          const std::string& ask_id) {
+  frame_t* f = ca_session_server_frame(fx->server, sid.c_str());
+  ASSERT_NE(f, nullptr);
+  char* json = frame_debug_events(f);
+  ASSERT_NE(json, nullptr);
+  char* err = NULL;
+  json_value_t* events = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  ASSERT_NE(events, nullptr);
+  bool saw_reject = false;
+  for (size_t j = 0; j < json_size(events); j++) {
+    json_value_t* rec = json_at(events, j);
+    json_value_t* t_v = json_get(rec, "type");
+    if (t_v == NULL || strcmp(json_as_string(t_v), "ask.reply") != 0) continue;
+    json_value_t* p = json_get(rec, "payload");
+    json_value_t* id_v = (p != NULL) ? json_get(p, "askId") : NULL;
+    json_value_t* d_v = (p != NULL) ? json_get(p, "decision") : NULL;
+    if (id_v == NULL || d_v == NULL ||
+        strcmp(json_as_string(id_v), ask_id.c_str()) != 0 ||
+        strcmp(json_as_string(d_v), "reject") != 0) {
+      continue;
+    }
+    saw_reject = true;
+    json_value_t* val_v = json_get(p, "value");
+    ASSERT_NE(val_v, nullptr) << "the empty reject renders value null";
+    EXPECT_EQ(json_type(val_v), JSON_NULL);
+    EXPECT_EQ(json_as_string(val_v), nullptr)
+        << "json_as_string on a null value answers NULL (the standing shape)";
+    /* the SAME batch's user-side append rides next (ask.reply, then
+       msg.append — the two-record reject shape; the plan gate's standing
+       default wording on an empty refusal) */
+    json_value_t* append = json_at(events, j + 1);
+    ASSERT_NE(append, nullptr);
+    json_value_t* at_v = json_get(append, "type");
+    ASSERT_NE(at_v, nullptr);
+    ASSERT_STREQ(json_as_string(at_v), "msg.append");
+    json_value_t* ap = json_get(append, "payload");
+    json_value_t* role = (ap != NULL) ? json_get(ap, "role") : NULL;
+    json_value_t* content = (ap != NULL) ? json_get(ap, "content") : NULL;
+    ASSERT_NE(role, nullptr);
+    EXPECT_STREQ(json_as_string(role), "user");
+    ASSERT_NE(content, nullptr);
+    EXPECT_STREQ(json_as_string(content), "Plan rejected: revise and re-propose")
+        << "the ladder's standing default wording (no objection text)";
+    break;
+  }
+  ASSERT_TRUE(saw_reject) << "the reject record landed";
+  /* no approval control record on a reject (the ladder revisits plan) */
+  for (size_t j = 0; j < json_size(events); j++) {
+    json_value_t* rec = json_at(events, j);
+    json_value_t* t_v = json_get(rec, "type");
+    if (t_v == NULL || strcmp(json_as_string(t_v), "control") != 0) continue;
+    json_value_t* p = json_get(rec, "payload");
+    json_value_t* k = (p != NULL) ? json_get(p, "kind") : NULL;
+    EXPECT_TRUE(k == NULL ||
+                strcmp(json_as_string(k), "plan-approved") != 0)
+        << "no plan-approved control record on a reject";
+  }
+  json_value_destroy(events);
+}
+
+/* Polls fixture_ask_reject_recorded until the consume lands. */
+static bool fixture_wait_reject_consumed(fixture_t* fx, const std::string& sid,
+                                         const std::string& ask_id,
+                                         int rounds) {
+  for (int i = 0; i < rounds; i++) {
+    if (fixture_ask_reject_recorded(fx, sid, ask_id)) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
 /* --- the tests (unix) -------------------------------------------------------- */
 
 TEST(TestSaClient, TestPromptRoundTripAndSessionsListing) {
@@ -1377,6 +1489,74 @@ TEST(TestSaClient, TestAskReplyDeliveredFalseFailsTheCallback) {
     std::lock_guard<std::mutex> g(rec.m);
     EXPECT_EQ(rec.askreply_status.back(), 0u);
   }
+
+  sa_client_destroy(cl);
+  fixture_teardown(&fx);
+}
+
+TEST(TestSaClient, TestAskReplyRejectNullValueRides) {
+  /* THE REJECT'S NULL VALUE through sa_client (the reject-path coverage):
+     a legal reject {decision 1, value NULL — the header's documented shape}
+     must RIDE — the alloc check may only refuse a dup failure for a
+     NON-NULL source. Before the fix the NULL value was misrouted into
+     _error_local(ALLOC): no callback, no wire send, the park starved. The
+     honest shape: cb(0) (the ack reported delivered — a reject posts), the
+     error channel stays silent, and the engine consumes durably: the
+     ask.reply record {decision "reject", value null} + the plan gate's
+     default-wording user append, NO plan-approved control record. */
+  std::vector<std::string> replies = {
+      sa_content_body("Plan: the only plan"),
+      sa_content_body("the replan ran quiet")};
+  sa_scripted_t sm;
+  memset(&sm, 0, sizeof(sm));
+  sm.base.complete = sa_scripted_complete;
+  sm.replies = &replies;
+
+  fixture_t fx;
+  ASSERT_EQ(fixture_setup_escalated(&fx, &sm.base), 0);
+  rec_t rec;
+  sa_client_config_t cfg = client_config(&fx);
+  cfg.error_ctx = &rec;
+  sa_client_t* cl = sa_client_connect(&cfg);
+  ASSERT_NE(cl, nullptr);
+  rec.client = cl;
+
+  /* the create: the frame parks at the plan gate */
+  ASSERT_EQ(sa_client_prompt(cl, NULL, "plan the rejection", rec_prompt, &rec),
+            0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.prompt_sid.empty();
+  }));
+  std::string sid;
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.prompt_status.back(), 0u);
+    sid = rec.prompt_sid.back();
+  }
+  std::string ask_id = fixture_parked_ask_id(&fx, sid);
+  ASSERT_EQ(ask_id.size(), 8u) << "the gate ask parked";
+
+  /* THE REJECT: decision 1, value NULL — the NULL value rides the wire
+     (the encode renders it "", the daemon's decode absorbs it absent),
+     the post succeeds → cb(0). */
+  ASSERT_EQ(sa_client_ask_reply(cl, sid.c_str(), ask_id.c_str(), 1, NULL,
+                                rec_askreply, &rec), 0);
+  ASSERT_TRUE(wait_for([&] {
+    std::lock_guard<std::mutex> g(rec.m);
+    return !rec.askreply_status.empty();
+  }));
+  {
+    std::lock_guard<std::mutex> g(rec.m);
+    ASSERT_EQ(rec.askreply_status.size(), 1u);
+    EXPECT_EQ(rec.askreply_status.back(), 0u)
+        << "the reject posted — cb(0), never the false OOM reroute";
+    EXPECT_EQ(rec.err_status.size(), 0u)
+        << "a legal NULL value never rode the error channel";
+  }
+  ASSERT_TRUE(fixture_wait_reject_consumed(&fx, sid, ask_id, 800))
+      << "the engine consumed the reject durably";
+  fixture_check_reject_consumed(&fx, sid, ask_id);
 
   sa_client_destroy(cl);
   fixture_teardown(&fx);

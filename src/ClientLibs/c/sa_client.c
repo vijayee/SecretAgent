@@ -949,7 +949,8 @@ int sa_client_ask_reply(sa_client_t* client, const char* sid,
   /* a NULL value rides (the reject's empty shape; the wire's encode renders
      it "" and the daemon's decode sends it back NULL) */
   req->value = _dup_string(value);
-  if (req->sid == NULL || req->ask_id == NULL || req->value == NULL) {
+  if (req->sid == NULL || req->ask_id == NULL ||
+      (value != NULL && req->value == NULL)) {
     _error_local(client, 0, SA_CLIENT_STATUS_ALLOC,
                  "out of memory building the ask reply");
     ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);

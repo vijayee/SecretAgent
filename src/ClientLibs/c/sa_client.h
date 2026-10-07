@@ -238,8 +238,12 @@ int sa_client_interrupt(sa_client_t* client, const char* sid,
  * events-callback re-entry rule covers this op: NEVER reply from inside
  * an events callback — the caller's own thread.
  * The callback's status: 0 = the ack reported delivered (the reply entered
- * the frame's mailbox); 1 = NOT delivered (unbound/no mailbox/empty answer)
- * or the transport failed. NEVER the daemon's stale-ask outcome: the wire's
+ * the frame's mailbox); 1 = the ack reported delivered=false (unbound/no
+ * mailbox/empty answer). Transport and local failures ride their OWN
+ * statuses, never 1: SA_CLIENT_STATUS_TIMEOUT, SA_CLIENT_STATUS_DISCONNECTED,
+ * SA_CLIENT_STATUS_BUSY, SA_CLIENT_STATUS_LOCAL. (An alloc failure fires
+ * the ERROR channel only; the events-callback re-entry refusal is -1 with
+ * no callback at all.) NEVER the daemon's stale-ask outcome: the wire's
  * ack contract reflects ONLY the bind/post — a stale ask_id still acks
  * delivered (the engine drops it asynchronously; the events stream carries
  * the refusal). Same blocking + return contract as the interrupt (including
