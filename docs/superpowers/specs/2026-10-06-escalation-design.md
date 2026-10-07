@@ -157,6 +157,12 @@ transition records ARE the phase's state machine):
   plan text, budget-capped>}` + `turn.end{blocked}` + park.
   - The model can still call `agent.ask` DURING plan (a clarifying question): parks the same
     turn identically; after the reply the frame is STILL in plan (the gate hasn't fired).
+    THE CARVE-OUT (post-review pinned): a plan turn's tools-null request means the standing
+    reply path refuses EVERY tool call loud — the clarification is carried by a narrow
+    exemption that recognizes the ask verb's call in the cell code (any OTHER tool call in a
+    plan turn stays the loud refusal; a spelling that evades the recognition refuses loud —
+    the safe direction). The carve-out's recognize-the-code rule is mechanical
+    (`_loop_plan_cell_is_the_model_ask`), deliberately conservative.
 - **ACT phase (on approval)**: the `approve` answer lands as §1.4's reply, and the resume batch
   ALSO writes the phase transition as a durable control record
   `{kind:"plan-approved", auto:false}`. Act turns run the ordinary free loop — execute free.
