@@ -57,7 +57,15 @@
                              GET; any present field makes it a SET)
    CA_CONFIG_RESPONSE   15: [15, req_id, status, base_url, api_key, model]
                              — the GET's answer ("" = absent) and the SET's
-                             status-0 echo of the post-set template */
+                             status-0 echo of the post-set template
+   CA_ASK_REPLY_REQUEST 16: [16, req_id, sid, ask_id, decision, value] —
+                             the parked ask's resolution ride (decision 0 =
+                             answer, 1 = reject; value = the answer text,
+                             "" = absent)
+   CA_ASK_REPLY_RESPONSE 17: [17, req_id, delivered] — 1 = the reply
+                             entered the frame's mailbox (bind/post ONLY —
+                             the engine's stale drop is events-stream
+                             truth, the ack contract §3.1) */
 #define CA_PROMPT_REQUEST     1
 #define CA_PROMPT_RESPONSE    2
 #define CA_EVENTS_REQUEST     3
@@ -71,6 +79,8 @@
 #define CA_AUTH_RESPONSE      13
 #define CA_CONFIG_REQUEST     14
 #define CA_CONFIG_RESPONSE    15
+#define CA_ASK_REPLY_REQUEST  16
+#define CA_ASK_REPLY_RESPONSE 17
 
 #if defined(__cplusplus)
 #define CA_STATIC_ASSERT static_assert
@@ -98,6 +108,12 @@ CA_STATIC_ASSERT(CA_CONFIG_REQUEST == CA_AUTH_RESPONSE + 1,
                  "config request joins the vocabulary's adjacency — a "
                  "renumber that collides with the ERROR 11 / AUTH 12-13 "
                  "numbers fails here at compile time");
+CA_STATIC_ASSERT(CA_ASK_REPLY_RESPONSE == CA_ASK_REPLY_REQUEST + 1,
+                 "ask-reply response must be ask-reply request + 1");
+CA_STATIC_ASSERT(CA_ASK_REPLY_REQUEST == CA_CONFIG_RESPONSE + 1,
+                 "ask-reply request joins the vocabulary's adjacency — a "
+                 "renumber that collides with the CONFIG 14-15 numbers "
+                 "fails here at compile time");
 
 /* The wire's field bounds (each decoder refuses over-bound strings loud —
    the caller answers CA_ERROR):
@@ -116,6 +132,8 @@ CA_STATIC_ASSERT(CA_CONFIG_REQUEST == CA_AUTH_RESPONSE + 1,
                                   CONFIG pair's api_key reuses this bound */
 #define CA_WIRE_CONFIG_TEXT_MAX 512u   /* a CONFIG set's base_url */
 #define CA_WIRE_CONFIG_TAG_MAX 128u    /* a CONFIG set's model tag */
+#define CA_WIRE_ASK_ID_MAX 40u         /* an ask's minted id (the 8-hex
+                                          shape ×5 headroom) */
 #define CA_WIRE_REQ_ID_MAX UINT64_MAX
 
 /* --- the payload types (plain C structs; the destroy frees their heap
@@ -234,6 +252,27 @@ typedef struct ca_config_response_t {
   size_t key_len;   /* the key's DECODED byte length (the scrub count) */
   char* model;      /* heap or NULL */
 } ca_config_response_t;
+
+/* The ASK_REPLY pair (the escalation slice's reply verb): the owner's
+   resolution of a parked ask. The encoder is the trusted side — a decision
+   > 1 encodes permissively and the DECODE refuses it loud (the same
+   encode-permissive/decode-refusing split every bounded field runs). The
+   response's delivered flag reflects ONLY the bind/post — the engine's
+   stale-ask drop is events-stream truth (the spec §3.1's pinned ack
+   contract). */
+typedef struct ca_ask_reply_request_t {
+  uint64_t req_id;
+  char* sid;        /* heap; required */
+  char* ask_id;     /* heap; required, <= 40 chars */
+  uint8_t decision; /* 0 = answer, 1 = reject */
+  char* value;      /* heap; may be empty → NULL by the "" rule */
+} ca_ask_reply_request_t;
+typedef struct ca_ask_reply_response_t {
+  uint64_t req_id;
+  uint8_t delivered; /* 1 = the reply entered the frame's mailbox (bind/post
+                        ONLY — the engine's stale drop is events-stream
+                        truth) */
+} ca_ask_reply_response_t;
 
 /* Encode one frame's payload into fresh CBOR bytes (cbor_serialize_alloc's
    buffer — free() it). The encoder is the TRUSTED side: field content is

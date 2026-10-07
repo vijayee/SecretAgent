@@ -691,3 +691,196 @@ TEST(TestClientApiWire, TestAuthPairRoundTrip) {
   EXPECT_EQ(payload, nullptr);
   free(raw);
 }
+
+/* The ASK_REPLY pair (the escalation slice's reply verb): [16, req_id, sid,
+   ask_id, decision, value] and its [17, req_id, delivered] response.
+   decision 0 = answer / 1 = reject; the value's "" sentinel decodes absent
+   (the reject-with-no-text shape); the ack's delivered flag carries the
+   bind/post truth ONLY — the engine's stale-ask drop is events-stream truth
+   (the spec §3.1's pinned ack contract). */
+TEST(TestClientApiWire, TestAskReplyRoundTrip) {
+  uint8_t* raw = NULL;
+  size_t raw_len = 0;
+  uint64_t type = 0;
+  void* payload = NULL;
+  uint64_t req_id = 0;
+  uint8_t status = 0;
+
+  /* the answer: every element round-trips */
+  ca_ask_reply_request_t req = {0};
+  char sid_buf[] = "sessions/abc123";
+  req.req_id = 31;
+  req.sid = sid_buf;
+  req.ask_id = (char*)"a1b2c3d4";
+  req.decision = 0;
+  req.value = (char*)"approve option 2";
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_REQUEST, &req, &raw, &raw_len), 0);
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_ASK_REPLY_REQUEST);
+  EXPECT_EQ(req_id, 31u);
+  EXPECT_EQ(status, 0u) << "a request decodes with status 0";
+  ASSERT_NE(payload, nullptr);
+  {
+    ca_ask_reply_request_t* back = (ca_ask_reply_request_t*)payload;
+    EXPECT_STREQ(back->sid, "sessions/abc123");
+    EXPECT_STREQ(back->ask_id, "a1b2c3d4");
+    EXPECT_EQ(back->decision, 0u);
+    EXPECT_STREQ(back->value, "approve option 2");
+    ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, back);
+  }
+  payload = NULL;
+  free(raw);
+
+  /* the reject with no value: value NULL rides the "" sentinel and decodes
+     back absent */
+  ca_ask_reply_request_t reject = {0};
+  reject.req_id = 32;
+  reject.sid = (char*)"sessions/abc123";
+  reject.ask_id = (char*)"e5f6a7b8";
+  reject.decision = 1;
+  reject.value = NULL;   /* the encoder writes the "" sentinel */
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_REQUEST, &reject, &raw, &raw_len), 0);
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  ASSERT_NE(payload, nullptr);
+  EXPECT_EQ(((ca_ask_reply_request_t*)payload)->decision, 1u);
+  EXPECT_EQ(((ca_ask_reply_request_t*)payload)->value, nullptr)
+      << "the empty value decodes absent";
+  ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, payload);
+  payload = NULL;
+  free(raw);
+
+  /* the bounds: an over-bound ask_id refuses (the minted ids are the 8-hex
+     shape; 40 chars is 5x that headroom) */
+  std::string big_ask(CA_WIRE_ASK_ID_MAX + 1, 'a');
+  ca_ask_reply_request_t over_ask = {0};
+  over_ask.req_id = 33;
+  over_ask.sid = (char*)"sessions/abc123";
+  over_ask.ask_id = &big_ask[0];   /* C++17: data() is a mutable char* */
+  over_ask.decision = 0;
+  over_ask.value = (char*)"x";
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_REQUEST, &over_ask, &raw, &raw_len), 0);
+  status = 0;
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  /* the bounds: a decision > 1 refuses at DECODE (the encoder is the
+     trusted side — the out-of-range decision encodes permissively and the
+     decode refuses it loud, the same encode→decode-refusal shape every
+     bounded field runs) */
+  ca_ask_reply_request_t bad_decision = {0};
+  bad_decision.req_id = 34;
+  bad_decision.sid = (char*)"sessions/abc123";
+  bad_decision.ask_id = (char*)"a1b2c3d4";
+  bad_decision.decision = 2;
+  bad_decision.value = (char*)"x";
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_REQUEST, &bad_decision, &raw,
+                           &raw_len), 0);
+  payload = NULL;
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  /* the bounds: a value over the wire's text cap refuses at decode — the
+     ask's fields refuse oversized INPUT, never silently truncate */
+  std::string big_value(CA_WIRE_TEXT_MAX + 1, 'v');
+  ca_ask_reply_request_t over_value = {0};
+  over_value.req_id = 35;
+  over_value.sid = (char*)"sessions/abc123";
+  over_value.ask_id = (char*)"a1b2c3d4";
+  over_value.decision = 0;
+  over_value.value = &big_value[0];
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_REQUEST, &over_value, &raw, &raw_len),
+            0);
+  payload = NULL;
+  EXPECT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw);
+
+  /* the response: [17, req_id, delivered] round-trips the delivered bool
+     (1 = the reply entered the frame's mailbox) and the flag rides the
+     decode's status out */
+  ca_ask_reply_response_t res = {0};
+  res.req_id = 31;
+  res.delivered = 1;
+  raw = NULL;
+  raw_len = 0;
+  payload = NULL;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_RESPONSE, &res, &raw, &raw_len), 0);
+  status = 0;
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_ASK_REPLY_RESPONSE)
+      << "the response = request + 1";
+  EXPECT_EQ(req_id, 31u);
+  EXPECT_EQ(status, 1u) << "the delivered flag rides the status out";
+  ASSERT_NE(payload, nullptr);
+  EXPECT_EQ(((ca_ask_reply_response_t*)payload)->delivered, 1u);
+  ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, payload);
+  payload = NULL;
+  free(raw);
+
+  res.req_id = 40;
+  res.delivered = 0;   /* the bind/post refused — §3.1's ack contract */
+  raw = NULL;
+  raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_RESPONSE, &res, &raw, &raw_len), 0);
+  status = 0;
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(status, 0u);
+  ASSERT_NE(payload, nullptr);
+  EXPECT_EQ(((ca_ask_reply_response_t*)payload)->delivered, 0u);
+  ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, payload);
+  payload = NULL;
+  free(raw);
+
+  /* the response-side refusal: a malformed element count refuses loud */
+  uint8_t* raw2 = NULL;
+  size_t raw2_len = 0;
+  payload = NULL;
+  _hand_frame(CA_ASK_REPLY_RESPONSE, 3, {"extra"}, &raw2, &raw2_len);
+  EXPECT_EQ(ca_wire_decode_bytes(raw2, raw2_len, &type, &payload, &req_id,
+                                 &status), -1);
+  EXPECT_EQ(payload, nullptr);
+  free(raw2);
+}
+
+TEST(TestClientApiWire, TestAskReplyPairAssertsExtend) {
+  /* the pairing asserts are COMPILE-TIME (the CA_STATIC_ASSERT chain):
+     16 = 15 + 1 extends the vocabulary's adjacency and 17 = 16 + 1 pairs
+     the response — a renumber that breaks either fails the build. This
+     runtime face exercises the pair so the numbers stay honest in the
+     binary too. */
+  ca_ask_reply_response_t res = {0};
+  res.req_id = 3;
+  res.delivered = 1;
+  uint8_t* raw = NULL;
+  size_t raw_len = 0;
+  ASSERT_EQ(ca_wire_encode(CA_ASK_REPLY_RESPONSE, &res, &raw, &raw_len), 0);
+  uint64_t type = 0;
+  void* payload = NULL;
+  uint64_t req_id = 0;
+  uint8_t status = 0;
+  ASSERT_EQ(ca_wire_decode_bytes(raw, raw_len, &type, &payload, &req_id,
+                                 &status), 0);
+  EXPECT_EQ(type, (uint64_t)CA_ASK_REPLY_RESPONSE) << "the response = request + 1";
+  EXPECT_EQ(req_id, 3u);
+  EXPECT_EQ(status, 1u);
+  ASSERT_NE(payload, nullptr);
+  ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, payload);
+  free(raw);
+}

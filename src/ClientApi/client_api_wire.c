@@ -255,6 +255,35 @@ static cbor_item_t* _encode_config_response(const ca_config_response_t* res) {
   return array;
 }
 
+/* [16, req_id, sid, ask_id, decision, value] — the parked ask's resolution;
+   value NULL rides the "" sentinel (the decoder maps it back to NULL). The
+   encoder trusts its caller: a decision > 1 encodes permissively here and
+   the DECODE refuses it loud (the house encode-permissive/decode-refusing
+   discipline). */
+static cbor_item_t* _encode_ask_reply_request(
+    const ca_ask_reply_request_t* req) {
+  cbor_item_t* array = cbor_new_definite_array(6);
+
+  _push_u8(array, CA_ASK_REPLY_REQUEST);
+  _push_u64(array, req->req_id);
+  _push_string(array, req->sid);
+  _push_string(array, req->ask_id);
+  _push_u8(array, req->decision);
+  _push_string(array, req->value);
+  return array;
+}
+
+/* [17, req_id, delivered] */
+static cbor_item_t* _encode_ask_reply_response(
+    const ca_ask_reply_response_t* res) {
+  cbor_item_t* array = cbor_new_definite_array(3);
+
+  _push_u8(array, CA_ASK_REPLY_RESPONSE);
+  _push_u64(array, res->req_id);
+  _push_u8(array, res->delivered);
+  return array;
+}
+
 /* ---- per-type decoders: total-or-refusal — on ANY refusal the
    partially-built payload is destroyed here (never a partial payload, never
    a leak); *payload fills on success only ---- */
@@ -714,6 +743,64 @@ static int _decode_config_response(cbor_item_t* frame, uint64_t req_id,
   return 0;
 }
 
+/* [16, req_id, sid, ask_id, decision, value] — sid and ask_id are required
+   (the "" sentinel refuses on both: a reply without a frame or an ask id
+   cannot bind); the value's "" sentinel decodes absent (the reject with no
+   refusal text); a decision > 1 refuses loud. */
+static int _decode_ask_reply_request(cbor_item_t* frame, uint64_t req_id,
+                                     void** payload) {
+  ca_ask_reply_request_t* req;
+  cbor_item_t* item;
+  int rc;
+
+  if (cbor_array_size(frame) != 6) return -1;
+  req = get_clear_memory(sizeof(*req));
+  req->req_id = req_id;
+  rc = _decode_sid_element(frame, 2, CA_WIRE_SID_MAX, &req->sid, 1);
+  if (rc == 0) {
+    rc = _decode_sid_element(frame, 3, CA_WIRE_ASK_ID_MAX, &req->ask_id, 1);
+  }
+  if (rc != 0) {
+    ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);
+    return -1;
+  }
+  item = cbor_array_get(frame, 4);
+  rc = item == NULL ? -1 : _decode_u8(item, &req->decision);
+  cbor_decref(&item);
+  if (rc != 0 || req->decision > 1) {
+    ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);
+    return -1;
+  }
+  rc = _decode_sid_element(frame, 5, CA_WIRE_TEXT_MAX, &req->value, 0);
+  if (rc != 0) {
+    ca_wire_payload_destroy(CA_ASK_REPLY_REQUEST, req);
+    return -1;
+  }
+  *payload = req;
+  return 0;
+}
+
+/* [17, req_id, delivered] */
+static int _decode_ask_reply_response(cbor_item_t* frame, uint64_t req_id,
+                                      void** payload) {
+  ca_ask_reply_response_t* res;
+  cbor_item_t* item;
+  int rc;
+
+  if (cbor_array_size(frame) != 3) return -1;
+  res = get_clear_memory(sizeof(*res));
+  res->req_id = req_id;
+  item = cbor_array_get(frame, 2);
+  rc = item == NULL ? -1 : _decode_u8(item, &res->delivered);
+  cbor_decref(&item);
+  if (rc != 0) {
+    ca_wire_payload_destroy(CA_ASK_REPLY_RESPONSE, res);
+    return -1;
+  }
+  *payload = res;
+  return 0;
+}
+
 static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
                          uint64_t* req_id, uint8_t* status) {
   cbor_item_t* item;
@@ -785,6 +872,14 @@ static int _decode_frame(cbor_item_t* frame, uint64_t* type, void** payload,
       rc = _decode_config_response(frame, *req_id, payload);
       if (rc == 0) *status = ((ca_config_response_t*)*payload)->status;
       break;
+    case CA_ASK_REPLY_REQUEST:
+      rc = _decode_ask_reply_request(frame, *req_id, payload);
+      if (rc == 0) *status = 0;
+      break;
+    case CA_ASK_REPLY_RESPONSE:
+      rc = _decode_ask_reply_response(frame, *req_id, payload);
+      if (rc == 0) *status = ((ca_ask_reply_response_t*)*payload)->delivered;
+      break;
     default:
       return -1;   /* the closed vocabulary: an unknown type refuses loud */
   }
@@ -845,6 +940,14 @@ int ca_wire_encode(uint64_t type, void* payload, uint8_t** out,
       break;
     case CA_CONFIG_RESPONSE:
       frame = _encode_config_response((const ca_config_response_t*)payload);
+      break;
+    case CA_ASK_REPLY_REQUEST:
+      frame =
+          _encode_ask_reply_request((const ca_ask_reply_request_t*)payload);
+      break;
+    case CA_ASK_REPLY_RESPONSE:
+      frame =
+          _encode_ask_reply_response((const ca_ask_reply_response_t*)payload);
       break;
     default:
       return -1;   /* the closed vocabulary: an unknown type refuses loud */
@@ -994,6 +1097,20 @@ void ca_wire_payload_destroy(uint64_t type, void* payload) {
       }
       free(res->model);
       free(res);
+      break;
+    }
+    case CA_ASK_REPLY_REQUEST: {
+      /* three heap strings (the prompt-request multi-string shape) — each
+         field free'd independently, the NULL fields free-safe */
+      ca_ask_reply_request_t* req = (ca_ask_reply_request_t*)payload;
+      free(req->sid);
+      free(req->ask_id);
+      free(req->value);
+      free(req);
+      break;
+    }
+    case CA_ASK_REPLY_RESPONSE: {
+      free(payload);
       break;
     }
     default:
