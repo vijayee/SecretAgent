@@ -47,18 +47,37 @@
 // print the response's sid + status, subscribe the session's event channel,
 // and stream every committed store record VERBATIM (one JSON line per
 // record, the seq prefixed; the client never re-parses a record) until
-// CTRL-C tears the client down.
+// CTRL-C (or the console's "quit") tears the client down.
+//
+// ESCALATION (the escalation slice): `serve --escalation plan-ask-act`
+// (or `bypass`; free is the default) sets the frames' ladder — every
+// api-created frame inherits it from the serve's template (the whole-struct
+// template copy carries the field; frame_create's copy sites landed the
+// inheritance). The client's stream tail ALSO reads the console: an "ask"
+// record renders as a dialog (the question + the numbered options + the
+// plan as an indented block), the `answer [sid ask_id] <pick|reject> [text]`
+// command rides sa_client_ask_reply (a pick = an option's label or its
+// 1-based index, or free text; the bare token "reject" refuses, its
+// optional text becomes the value), and "quit" tears the client down (the
+// session and its records stay in the daemon's store). THE DIRECT MODE's
+// run-loop rc 2 (a LIVE yield) is NOT a failure: on the ask park the
+// frame's own dialog renders and the answer rides frame_ask_reply from the
+// SAME console (an abandoned wait leaves the frame parked — its ask record
+// stays in the events log; a resume re-presents it); a live-children yield
+// is pumped again.
 
 #include "../../src/Frame/frame.h"
 #include "../../src/Frame/loop.h"
 #include "../../src/Frame/refine.h"
 #include "../../src/Platform/platform.h"
 #include "../../src/Scheduler/scheduler.h"
+#include "../../src/Util/allocator.h"
 #include "../../src/Util/json.h"
 #include "../../src/Util/log.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -108,6 +127,12 @@ static const char SA_DEMO_USAGE[] =
     "http://127.0.0.1:11434)\n"
     "  --model     model tag, required (e.g. llama3)\n"
     "  --goal      goal text for the top frame, required for a loop run\n"
+    "  --escalation   the escalation ladder: free (execute free; default) | "
+    "plan-ask-act (plan\n"
+    "                   turns gate on ONE owner approval — the parked ask "
+    "is answered from\n"
+    "                   this console) | bypass (DANGEROUS: plan turns "
+    "auto-approve)\n"
     "  --refine       after the frame run, review this run's trajectory and "
     "apply evidence-backed supplemental lessons (the /refine "
     "command; prints the summary; a no-op prints loudly too)\n"
@@ -131,6 +156,12 @@ static const char SA_DEMO_SERVE_USAGE[] =
     "http://127.0.0.1:11434)\n"
     "  --model        model tag, required (e.g. llama3)\n"
     "  --socket-path  the daemon's AF_UNIX listen socket, required\n"
+    "  --escalation   the frames' escalation ladder: free (default; execute "
+    "free) |\n"
+    "                 plan-ask-act (plan turns park ONE ask; the clients' "
+    "answers\n"
+    "                 resume them) | bypass (DANGEROUS: plan turns "
+    "auto-approve)\n"
     "  --tcp-port     ALSO listen on 127.0.0.1:<port> — REQUIRES --api-key\n"
     "  --api-key      the TCP listeners' api key (bcrypt-hashed here; the "
     "client passes\n"
@@ -149,7 +180,19 @@ static const char SA_DEMO_CLIENT_USAGE[] =
     "  --goal         goal text, required — posted as a NEW session\n"
     "Prints the session's sid + the streamed store records (one JSON line "
     "per record,\n"
-    "the seq prefixed) live, until CTRL-C tears the client down.\n";
+    "the seq prefixed) live, until CTRL-C (or the console's quit) tears the "
+    "client down.\n"
+    "While the stream tails, the console reads ONE command per line:\n"
+    "  answer [<sid> <ask_id>] <pick|reject> [text]  reply to a parked ask\n"
+    "                 (the sid/ask_id prefix is OPTIONAL — the last ask "
+    "this client saw\n"
+    "                 rides; a pick is an option's index or its label, or "
+    "free text; the\n"
+    "                 bare token reject refuses — its optional text becomes "
+    "the value)\n"
+    "  quit           tear the client down (the session and its records "
+    "stay in the\n"
+    "                 daemon's store — a later resume re-presents it)\n";
 
 /* Log-hook formatter: one line per event ("<level> <message>"), flushed so
    the stream is live even with stdout piped. */
@@ -353,6 +396,430 @@ static int _demo_refine_sid_path(const char* refine_sid, const char** path_out,
   return 0;
 }
 
+/* --- THE ESCALATION SURFACE (shared: the DIRECT mode's parked-ask console
+ *     AND the CLIENT mode's answer command) ---------------------------------- */
+
+/* The ladder's argv word → the frame_escalation_mode_e value; -1 = unknown
+   (the caller prints its own usage). Absent = free at every call site. */
+static int _demo_parse_escalation(const char* text, unsigned* out) {
+  if (strcmp(text, "free") == 0) {
+    *out = FRAME_ESCALATION_FREE;
+    return 0;
+  }
+  if (strcmp(text, "plan-ask-act") == 0) {
+    *out = FRAME_ESCALATION_PLAN_ASK_ACT;
+    return 0;
+  }
+  if (strcmp(text, "bypass") == 0) {
+    *out = FRAME_ESCALATION_BYPASS;
+    return 0;
+  }
+  return -1;
+}
+
+static const char* _demo_escalation_name(unsigned mode) {
+  switch (mode) {
+    case FRAME_ESCALATION_PLAN_ASK_ACT:
+      return "plan-ask-act";
+    case FRAME_ESCALATION_BYPASS:
+      return "bypass";
+    default:
+      return "free";
+  }
+}
+
+/* The project allocator's strdup (the style law's wrappers; the demo keeps
+   its raw-free on the SAME pointers — no mixed-class free exists here). */
+static char* _demo_dup(const char* text) {
+  size_t len = strlen(text) + 1;
+  char* out = (char*)get_memory(len);
+  memcpy(out, text, len);
+  return out;
+}
+
+/* One parked ask, as the demo's console sees it: strings COPIED off an
+   "ask" record's payload (the record's own tree is freed right after the
+   line renders; a slot outlives it — the client's registry, the direct
+   mode's parked scan). sid is the registry's key (NULL in the direct
+   mode's scan — the render takes the sid as the call's argument instead). */
+typedef struct {
+  char* sid;
+  char* ask_id;
+  char* question;
+  char** options;   /* the labels; owned */
+  size_t noptions;
+  char* plan;       /* NULL = the record's null plan */
+} demo_ask_slot_t;
+
+static void _demo_ask_slot_clear(demo_ask_slot_t* ask) {
+  if (ask == NULL) return;
+  free(ask->sid);
+  free(ask->ask_id);
+  free(ask->question);
+  if (ask->options != NULL) {
+    for (size_t i = 0; i < ask->noptions; i++) free(ask->options[i]);
+    free(ask->options);
+  }
+  free(ask->plan);
+  memset(ask, 0, sizeof(*ask));
+}
+
+/* A DEEP copy (the registry's read hands a local the caller frees without
+   racing the registry's slot). */
+static void _demo_ask_slot_copy(const demo_ask_slot_t* src,
+                                demo_ask_slot_t* dst) {
+  memset(dst, 0, sizeof(*dst));
+  if (src == NULL || src->ask_id == NULL) return;
+  dst->sid = (src->sid != NULL) ? _demo_dup(src->sid) : NULL;
+  dst->ask_id = _demo_dup(src->ask_id);
+  dst->question = (src->question != NULL) ? _demo_dup(src->question) : NULL;
+  dst->noptions = src->noptions;
+  if (src->noptions > 0 && src->options != NULL) {
+    dst->options = (char**)get_clear_memory(src->noptions * sizeof(char*));
+    for (size_t i = 0; i < src->noptions; i++) {
+      dst->options[i] = _demo_dup((src->options[i] != NULL)
+                                      ? src->options[i] : "");
+    }
+  }
+  dst->plan = (src->plan != NULL) ? _demo_dup(src->plan) : NULL;
+}
+
+/* Fills the slot from an "ask" record's payload ({kind, askId, question,
+   options[], plan} — frame.c's ONE composer's shape). 0 = filled; -1 = not
+   the shape (the caller prints the raw record line instead). */
+static int _demo_ask_slot_fill(demo_ask_slot_t* ask,
+                               const json_value_t* payload) {
+  const char* ask_id = json_as_string(json_get(payload, "askId"));
+  const char* question = json_as_string(json_get(payload, "question"));
+  json_value_t* options = json_get(payload, "options");
+  if (ask_id == NULL || question == NULL ||
+      (options != NULL && json_type(options) != JSON_ARRAY)) {
+    return -1;
+  }
+  size_t noptions = (options != NULL) ? json_size(options) : 0;
+  char** labels = NULL;
+  if (noptions > 0) {
+    labels = (char**)get_clear_memory(noptions * sizeof(char*));
+    for (size_t i = 0; i < noptions; i++) {
+      const char* label = json_as_string(json_at(options, i));
+      labels[i] = _demo_dup((label != NULL) ? label : "");
+    }
+  }
+  const char* plan = json_as_string(json_get(payload, "plan"));
+  ask->ask_id = _demo_dup(ask_id);
+  ask->question = _demo_dup(question);
+  ask->options = labels;
+  ask->noptions = noptions;
+  ask->plan = (plan != NULL) ? _demo_dup(plan) : NULL;
+  return 0;
+}
+
+/* The ask's DIALOG render (the spec §3.4's shape): the header, the
+   question, the plan as an indented block, the numbered options, the
+   console's hint line. */
+static void _demo_ask_render(const demo_ask_slot_t* ask, const char* sid,
+                             const char* hint) {
+  printf("== ASK %s %s ==\n", (sid != NULL) ? sid : "?", ask->ask_id);
+  printf("  %s\n", ask->question);
+  if (ask->plan != NULL) {
+    printf("  ");
+    for (const char* p = ask->plan; *p != '\0'; p++) {
+      if (*p == '\n') {
+        if (p[1] == '\0') break;   /* the trailing newline rides unprinted */
+        putchar('\n');
+        printf("  ");
+      } else {
+        putchar(*p);
+      }
+    }
+    putchar('\n');
+  }
+  for (size_t i = 0; i < ask->noptions; i++) {
+    printf("   %zu. %s\n", i + 1, ask->options[i]);
+  }
+  printf("   (%s)\n", hint);
+}
+
+/* --- THE CONSOLE'S ANSWER GRAMMAR --------------------------------------------
+ * `answer [<sid> <ask_id>] <pick|reject> [text]`
+ *   The LONG form names the session and the ask outright. The SHORT form
+ *   rides the LAST UNPARKED ASK the mode remembers (the client: the events
+ *   registry; the direct mode: the parked scan — its run owns exactly ONE
+ *   frame). The long form is honest there too: its sid/ask_id prefix is
+ *   documentation, never a filter (the frame owns its ask).
+ *   `reject` as the first value token makes the reply a REFUSAL (its
+ *   optional rest is the refusal's value, verbatim). Otherwise the rest is
+ *   the VALUE: an exact option label rides as the label, a decimal index
+ *   maps to its label, anything else is free text. */
+
+typedef struct {
+  char* sid;      /* the long form's; NULL = the short form */
+  char* ask_id;   /* the long form's; NULL = the short form */
+  uint8_t reject; /* 1 = the bare reject token */
+  char* value;    /* heap: the joined rest (unresolved); NULL = absent */
+} demo_answer_line_t;
+
+static void _demo_answer_line_clear(demo_answer_line_t* parts) {
+  free(parts->sid);
+  free(parts->ask_id);
+  free(parts->value);
+  memset(parts, 0, sizeof(*parts));
+}
+
+/* Returns 1 = an answer line (parts filled — clear them); 0 = NOT an
+   answer line (the caller's other commands); -1 = malformed (the usage
+   one-liner). */
+static int _demo_answer_line_parse(const char* line,
+                                   demo_answer_line_t* parts) {
+  memset(parts, 0, sizeof(*parts));
+  size_t len = strlen(line);
+  char* work = (char*)get_memory(len + 1);
+  memcpy(work, line, len + 1);
+  char* save = NULL;
+  const char* delims = " \t";
+  char* cmd = strtok_r(work, delims, &save);
+  if (cmd == NULL || strcmp(cmd, "answer") != 0) {
+    free(work);
+    return 0;   /* whitespace only, or another command */
+  }
+  char* tok = strtok_r(NULL, delims, &save);
+  if (tok == NULL) {
+    free(work);
+    return -1;   /* a bare "answer" */
+  }
+  if (strchr(tok, '/') != NULL) {
+    /* THE LONG FORM: the sid path carries the '/' (the free text never
+       does); the ask_id is its next token — required. */
+    parts->sid = _demo_dup(tok);
+    tok = strtok_r(NULL, delims, &save);
+    if (tok == NULL) {
+      _demo_answer_line_clear(parts);
+      free(work);
+      return -1;
+    }
+    parts->ask_id = _demo_dup(tok);
+    tok = strtok_r(NULL, delims, &save);
+  }
+  if (tok == NULL) {
+    _demo_answer_line_clear(parts);
+    free(work);
+    return -1;
+  }
+  if (strcmp(tok, "reject") == 0) {
+    parts->reject = 1;
+    tok = strtok_r(NULL, delims, &save);
+  }   /* else the value rides, tok first */
+  /* The rest's join (single spaces; the free text never needs the original
+     spacing in a console demo). */
+  while (tok != NULL) {
+    size_t tlen = strlen(tok);
+    size_t vlen = (parts->value != NULL) ? strlen(parts->value) : 0;
+    char* grown = (parts->value != NULL)
+                      ? (char*)get_memory(vlen + tlen + 2)
+                      : (char*)get_memory(tlen + 1);
+    if (parts->value != NULL) {
+      memcpy(grown, parts->value, vlen);
+      grown[vlen] = ' ';
+      free(parts->value);
+    }
+    memcpy(grown + vlen + (parts->value != NULL ? 1 : 0), tok, tlen + 1);
+    parts->value = grown;
+    tok = strtok_r(NULL, delims, &save);
+  }
+  free(work);
+  return 1;
+}
+
+/* Resolves *value_ptr against the ask's options: the exact label wins, a
+   1..noptions decimal index maps to its label, anything else rides free
+   text. Frees and replaces the incoming buffer when the resolution mapped. */
+static void _demo_answer_resolve_value(const demo_ask_slot_t* ask,
+                                       char** value_ptr) {
+  if (*value_ptr == NULL || ask == NULL) return;
+  for (size_t i = 0; i < ask->noptions; i++) {
+    if (strcmp(*value_ptr, ask->options[i]) == 0) return;   /* the exact
+                                                               label */
+  }
+  size_t len = strlen(*value_ptr);
+  size_t digits = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (isdigit((unsigned char)(*value_ptr)[i]) == 0) break;
+    digits++;
+  }
+  if (digits == len && len > 0) {
+    errno = 0;
+    unsigned long idx = strtoul(*value_ptr, NULL, 10);
+    if (errno == 0 && idx >= 1 && idx <= ask->noptions) {
+      free(*value_ptr);
+      *value_ptr = _demo_dup(ask->options[idx - 1]);
+    }
+    return;   /* a number past the options rides free text */
+  }
+}
+
+/* The DIRECT mode's parked-ask scan: the public surface holds no
+   pending-ask accessor, so the demo reads the events log's truth — the
+   LAST "ask" record with NO matching "ask.reply" after it (the engine
+   keeps ONE park at a time, so that IS the parked one). Fills the
+   caller's slot (cleared by the CALLER); 1 = parked, 0 = not. */
+static int _demo_parked_ask_scan(frame_t* f, demo_ask_slot_t* slot) {
+  memset(slot, 0, sizeof(*slot));
+  char* json = frame_debug_events(f);
+  if (json == NULL) return 0;
+  char* err = NULL;
+  json_value_t* events = json_parse(json, strlen(json), &err);
+  if (err != NULL) free(err);
+  free(json);
+  if (events == NULL) return 0;
+  int parked = 0;
+  for (size_t i = 0; i < json_size(events); i++) {
+    json_value_t* rec = json_at(events, i);
+    const char* type = json_as_string(json_get(rec, "type"));
+    if (type == NULL) continue;
+    if (strcmp(type, "ask") == 0) {
+      _demo_ask_slot_clear(slot);
+      /* a refill's shape refusal clears the running park too — the slot
+         the caller renders is only EVER a filled one */
+      parked = (_demo_ask_slot_fill(slot, json_get(rec, "payload")) == 0)
+                   ? 1 : 0;
+    } else if (strcmp(type, "ask.reply") == 0) {
+      const char* reply_id =
+          json_as_string(json_get(json_get(rec, "payload"), "askId"));
+      if (reply_id != NULL && slot->ask_id != NULL &&
+          strcmp(reply_id, slot->ask_id) == 0) {
+        _demo_ask_slot_clear(slot);
+        parked = 0;
+      }
+    }
+  }
+  json_value_destroy(events);
+  if (parked == 0) _demo_ask_slot_clear(slot);
+  return parked;
+}
+
+/* --- THE CONSOLE'S STDIN PUMP -------------------------------------------------
+ * poll(2) on fd 0 — the demo's OWN standing raw-POSIX idiom (the SIGINT
+ * handler's write(2), the unistd includes; the platform layer has no
+ * fd-poll surface — its poll-dancer watchers are socket watchers), so the
+ * demo keeps the honest minimal tool. A partial line waits in the buffer;
+ * bytes past a buffer's cap drop with a note (the demo never grows
+ * unbounded); EOF after a partial line flushes the rest as the line. */
+typedef struct {
+  char pending[1024];
+  size_t len;
+  int eof;
+} demo_stdin_buf_t;
+
+/* Returns 1 = a full line at `line` ('\n' stripped, NUL-terminated),
+   0 = nothing yet (a no-data timeout, an EINTR — the caller's wait state
+   re-checks its own flag), -1 = EOF. timeout_ms < 0 blocks. */
+static int _demo_stdin_line(demo_stdin_buf_t* b, int timeout_ms, char* line,
+                            size_t cap) {
+  if (b->eof != 0) return -1;
+  char chunk[256];
+  for (;;) {
+    /* the pending tail's first full line (or none) */
+    size_t nl = 0;
+    while (nl < b->len && b->pending[nl] != '\n') nl++;
+    if (nl < b->len) {
+      size_t take = (nl < cap - 1) ? nl : cap - 1;
+      memcpy(line, b->pending, take);
+      line[take] = '\0';
+      if (nl >= cap - 1) {
+        fprintf(stderr, "frame-demo: a console line longer than %zu bytes "
+                "was truncated\n", cap - 1);
+      }
+      memmove(b->pending, b->pending + nl + 1, b->len - nl - 1);
+      b->len -= nl + 1;
+      return 1;
+    }
+    struct pollfd pfd;
+    pfd.fd = STDIN_FILENO;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, timeout_ms);
+    if (pr <= 0) return 0;
+    ssize_t got = read(STDIN_FILENO, chunk, sizeof(chunk));
+    if (got < 0) return 0;   /* EINTR (or a transient error) — the caller
+                                re-checks its own wait state */
+    if (got == 0) {
+      b->eof = 1;
+      if (b->len == 0) return -1;
+      size_t take = (b->len < cap - 1) ? b->len : cap - 1;
+      memcpy(line, b->pending, take);
+      line[take] = '\0';
+      b->len = 0;
+      return 1;   /* the file's trailing partial rides as its last line;
+                     the NEXT call returns the EOF */
+    }
+    for (ssize_t i = 0; i < got; i++) {
+      if (b->len >= sizeof(b->pending)) {
+        fprintf(stderr, "frame-demo: a console line overflowed the %zu byte "
+                "buffer — its head rides, its tail was dropped\n",
+                sizeof(b->pending) - 1);
+        break;
+      }
+      b->pending[b->len++] = chunk[i];
+    }
+  }
+}
+
+/* The console's command one-liner (parse refusals print it). */
+static const char SA_DEMO_ANSWER_USAGE_LINE[] =
+    "commands: answer [<sid> <ask_id>] <pick|reject> [text] | quit";
+
+/* The DIRECT mode's parked-ask console: the dialog renders, then lines read
+   (BLOCKING — this thread owns stdin while the parked engine idles) until
+   a parseable reply rides frame_ask_reply (returns 1 → the outer loop
+   re-pumps the run — the reply's records land through the frame's own
+   dispatch), or the wait is ABANDONED ('quit', stdin's EOF, an interrupt
+   flag — returns 0; the frame stays parked and the demo exits: the ask
+   record stays in the events log, a later resume re-presents it). */
+static int _demo_direct_parked_wait(frame_t* f, const demo_ask_slot_t* ask,
+                                    demo_stdin_buf_t* in) {
+  char hint[128];
+  snprintf(hint, sizeof(hint),
+           "answer <pick|reject> [text] — 'quit' leaves the frame parked");
+  _demo_ask_render(ask, frame_sid(f), hint);
+  fflush(stdout);
+  for (;;) {
+    if (g_demo_sigint != 0) return 0;
+    printf("frame-demo: answer? ");
+    fflush(stdout);
+    char line[1024];
+    int have = _demo_stdin_line(in, -1, line, sizeof(line));
+    if (have < 0) return 0;    /* stdin closed — an honest abandon */
+    if (have == 0) continue;   /* EINTR: the flag drive re-checked above */
+    if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) return 0;
+    demo_answer_line_t parts;
+    int parsed = _demo_answer_line_parse(line, &parts);
+    if (parsed <= 0) {
+      printf("frame-demo: %s\n", SA_DEMO_ANSWER_USAGE_LINE);
+      fflush(stdout);
+      continue;
+    }
+    _demo_answer_resolve_value(ask, &parts.value);
+    if (parts.reject == 0 &&
+        (parts.value == NULL || parts.value[0] == '\0')) {
+      fprintf(stderr, "frame-demo: an answer carries its value (an option's "
+              "label or index, or free text — 'reject' refuses)\n");
+      _demo_answer_line_clear(&parts);
+      continue;
+    }
+    int posted = frame_ask_reply(f, ask->ask_id, parts.reject, parts.value);
+    _demo_answer_line_clear(&parts);
+    if (posted != 0) {
+      fprintf(stderr, "frame-demo: the reply was refused (the frame layer's "
+              "log carries the reason)\n");
+      continue;
+    }
+    printf("frame-demo: the reply was posted — the frame resumes (the "
+           "reply's records ride the events log)\n");
+    fflush(stdout);
+    return 1;
+  }
+}
+
 #if SA_DEMO_HAS_CLIENT_API
 
 /* --- SERVE: the daemon (the client-api slice) ------------------------------- */
@@ -364,6 +831,9 @@ typedef struct {
   const char* location;
   const char* base_url;
   const char* model;
+  unsigned escalation;    /* frame_escalation_mode_e; free when the flag is
+                             absent — every api-created frame inherits it
+                             from the server's template */
 } demo_serve_args_t;
 
 /* Parses a uint16 port text (digits only, no ranges, ERANGE caught). */
@@ -399,6 +869,14 @@ static int _demo_parse_serve(int argc, char** argv, demo_serve_args_t* a,
       a->tcp_key = argv[++i];
     } else if (strcmp(argv[i], "--tcp-port") == 0 && i + 1 < argc) {
       a->tcp_port = argv[++i];
+    } else if (strcmp(argv[i], "--escalation") == 0 && i + 1 < argc) {
+      if (_demo_parse_escalation(argv[i + 1], &a->escalation) != 0) {
+        fprintf(stderr, "frame-demo serve: --escalation needs free, "
+                "plan-ask-act, or bypass (got '%s')\n%s", argv[i + 1],
+                SA_DEMO_SERVE_USAGE);
+        return 1;
+      }
+      i++;
     } else {
       fprintf(stderr, "frame-demo: unknown or incomplete argument '%s'\n%s",
               argv[i], SA_DEMO_SERVE_USAGE);
@@ -521,6 +999,12 @@ static int _demo_serve_run(int argc, char** argv) {
   cfg.model_base_url = a.base_url;
   cfg.model_name = a.model;
   cfg.max_depth = 4;
+  cfg.escalation_mode = a.escalation;   /* the ladder rides the WHOLE-struct
+                                           template copy (ca_session_
+                                           server_create's server->cfg =
+                                           *frame_cfg) into EVERY
+                                           api-created frame — frames'
+                                           children inherit it too */
   server = ca_session_server_create(db, pool, loop, &cfg, NULL);
   if (server == NULL) {
     fprintf(stderr, "frame-demo serve: cannot create the session server\n");
@@ -536,8 +1020,9 @@ static int _demo_serve_run(int argc, char** argv) {
   }
   unix_transport_start(unix_transport);
   printf("frame-demo serve: serving sessions over unix at %s\n"
-         "                model %s at %s, store %s\n",
-         a.socket_path, a.model, a.base_url, a.location);
+         "                model %s at %s, store %s, escalation %s\n",
+         a.socket_path, a.model, a.base_url, a.location,
+         _demo_escalation_name(a.escalation));
   if (a.tcp_port != NULL) {
     /* The api key's BCRYPT HASH rides the transport (the wire auth's
        presented key verify = bcrypt_check against it — the same machinery
@@ -661,6 +1146,14 @@ typedef struct {
   char sid[CA_WIRE_SID_MAX + 1];
   int called;
   sa_client_t* client;   /* release_payload's target */
+  /* THE PARKED-ASK REGISTRY (the escalation slice; the LAST unmarched ask
+     per seen sid — the asks clear when their ask.reply record lands): the
+     events callback (the reader thread) writes it, the console dispatcher
+     (the main thread) reads it — one platform mutex orders the two. A NULL
+     lock runs the registry degraded (the long-form answer still rides —
+     only the short form and the label/index resolution need it). */
+  platform_mutex_t* asks_lock;
+  demo_ask_slot_t asks[4];
 } demo_prompt_result_t;
 
 static void _demo_prompt_cb(void* ctx, uint8_t status, const char* sid) {
@@ -674,21 +1167,207 @@ static void _demo_prompt_cb(void* ctx, uint8_t status, const char* sid) {
   }
 }
 
+/* --- the parked-ask registry (the events callback's thread vs the console
+   dispatcher's thread — the lock orders them) ----------------------------- */
+
+/* STEALS the slot's strings on EVERY path (the caller's slot is left
+   empty): the sid's slot REPLACES (the LAST ask per sid stands — a
+   superseded ask's entry dies here). */
+static void _demo_asks_set(demo_prompt_result_t* r, const char* sid,
+                           demo_ask_slot_t* ask) {
+  if (ask->ask_id == NULL) {
+    _demo_ask_slot_clear(ask);
+    return;
+  }
+  if (r->asks_lock == NULL || sid == NULL) {
+    _demo_ask_slot_clear(ask);
+    return;
+  }
+  platform_mutex_lock(r->asks_lock);
+  size_t matched = 4;
+  size_t free_slot = 4;
+  for (size_t i = 0; i < 4; i++) {
+    if (r->asks[i].sid != NULL && strcmp(r->asks[i].sid, sid) == 0) {
+      matched = i;
+      break;
+    }
+    if (free_slot == 4 && r->asks[i].ask_id == NULL) free_slot = i;
+  }
+  demo_ask_slot_t* target = (matched < 4)
+                                ? &r->asks[matched]
+                                : ((free_slot < 4) ? &r->asks[free_slot]
+                                                   : &r->asks[0]);
+  _demo_ask_slot_clear(target);
+  *target = *ask;          /* the strings transfer */
+  target->sid = _demo_dup(sid);
+  memset(ask, 0, sizeof(*ask));
+  platform_mutex_unlock(r->asks_lock);
+}
+
+/* An ask.reply's record lands: its ask's entry clears (the registry holds
+   only UNPARKED asks). */
+static void _demo_asks_clear_reply(demo_prompt_result_t* r,
+                                   const char* ask_id) {
+  if (r->asks_lock == NULL || ask_id == NULL) return;
+  platform_mutex_lock(r->asks_lock);
+  for (size_t i = 0; i < 4; i++) {
+    if (r->asks[i].ask_id != NULL &&
+        strcmp(r->asks[i].ask_id, ask_id) == 0) {
+      _demo_ask_slot_clear(&r->asks[i]);
+    }
+  }
+  platform_mutex_unlock(r->asks_lock);
+}
+
+static void _demo_asks_teardown(demo_prompt_result_t* r) {
+  for (size_t i = 0; i < 4; i++) _demo_ask_slot_clear(&r->asks[i]);
+  if (r->asks_lock != NULL) {
+    platform_mutex_destroy(r->asks_lock);
+    r->asks_lock = NULL;
+  }
+}
+
+/* The registry's READ (the main thread, before a dispatch): a DEEP copy
+   into *out (an empty slot when untracked, the lock absent, or the sid
+   unknown). */
+static void _demo_asks_find(demo_prompt_result_t* r, const char* sid,
+                            demo_ask_slot_t* out) {
+  memset(out, 0, sizeof(*out));
+  if (r->asks_lock == NULL || sid == NULL) return;
+  platform_mutex_lock(r->asks_lock);
+  for (size_t i = 0; i < 4; i++) {
+    if (r->asks[i].ask_id != NULL && r->asks[i].sid != NULL &&
+        strcmp(r->asks[i].sid, sid) == 0) {
+      _demo_ask_slot_copy(&r->asks[i], out);
+      break;
+    }
+  }
+  platform_mutex_unlock(r->asks_lock);
+}
+
+/* The ask-reply's console outcome: the callback sees the ACK's status only
+   (sa_client_ask_reply's contract carries the delivered meanings). */
+static void _demo_answer_cb(void* ctx, uint8_t status) {
+  demo_prompt_result_t* r = (demo_prompt_result_t*)ctx;
+  (void)r;
+  if (status == 0) {
+    printf("frame-demo: the answer was delivered (the reply's records ride "
+           "the events stream)\n");
+  } else if (status == 1) {
+    fprintf(stderr, "frame-demo: the answer was NOT delivered (the daemon "
+            "refused: an unknown sid, a done frame, an empty answer — the "
+            "events stream keeps the truth)\n");
+  } else {
+    fprintf(stderr, "frame-demo: the answer's ride failed (status %u)\n",
+            (unsigned)status);
+  }
+  fflush(stdout);
+  fflush(stderr);
+}
+
+/* One console line, the main thread: 1 = keep looping; 0 = quit (the read
+   loop breaks and tears the client down). */
+static int _demo_client_dispatch_line(demo_prompt_result_t* r,
+                                      const char* line) {
+  if (line[0] == '\0') return 1;
+  if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) return 0;
+  demo_answer_line_t parts;
+  int parsed = _demo_answer_line_parse(line, &parts);
+  if (parsed <= 0) {   /* another command's word — the usage one-liner */
+    printf("frame-demo: %s\n", SA_DEMO_ANSWER_USAGE_LINE);
+    fflush(stdout);
+    return 1;
+  }
+  const char* sid = (parts.sid != NULL) ? parts.sid : r->sid;
+  demo_ask_slot_t ask;
+  _demo_asks_find(r, sid, &ask);   /* the short form's last unparked ask (a
+                                      deep copy — the registry keeps its
+                                      own) */
+  const char* ask_id = (parts.ask_id != NULL) ? parts.ask_id : ask.ask_id;
+  if (ask_id == NULL) {
+    fprintf(stderr, "frame-demo: no ask is being tracked on %s — the events "
+            "stream publishes the ask records; name the ask outright\n", sid);
+    _demo_answer_line_clear(&parts);
+    _demo_ask_slot_clear(&ask);
+    return 1;
+  }
+  if (parts.reject == 0) {
+    if (ask.ask_id != NULL && (parts.ask_id == NULL ||
+                               strcmp(parts.ask_id, ask.ask_id) == 0)) {
+      _demo_answer_resolve_value(&ask, &parts.value);
+    }
+    if (parts.value == NULL || parts.value[0] == '\0') {
+      fprintf(stderr, "frame-demo: an answer carries its value (an option's "
+              "label or index, or free text — the bare token reject "
+              "refuses)\n");
+      _demo_answer_line_clear(&parts);
+      _demo_ask_slot_clear(&ask);
+      return 1;
+    }
+  }
+  int rc = sa_client_ask_reply(r->client, sid, ask_id, parts.reject,
+                               (parts.value != NULL) ? parts.value : "",
+                               _demo_answer_cb, r);
+  _demo_answer_line_clear(&parts);
+  _demo_ask_slot_clear(&ask);
+  if (rc != 0) {
+    fprintf(stderr, "frame-demo: the answer was refused outright (rc %d)\n",
+            rc);
+  }
+  return 1;
+}
+
 /* The event stream: ONE record per stdout line — the seq prefixed, the
    record's store JSON VERBATIM (the client never re-parses a record; this
-   is the plain surface the daemon's events ride). A marker line (seq 0, no
-   record) names the transition. Payloads release immediately after the
-   line (the stream is unbounded; destroy only catches the races). */
+   is the plain surface the daemon's events ride) — with the escalation
+   slice's TWO renders: an "ask" record renders as a DIALOG (the question +
+   the numbered options + the plan as an indented block) and its entry
+   fills the parked-ask registry; an "ask.reply" record renders one line
+   and clears the registry's entry. A marker line (seq 0, no record) names
+   the transition. Payloads release immediately after the line (the stream
+   is unbounded; destroy only catches the races). */
 static void _demo_events_cb(void* ctx, const char* sid, uint64_t seq,
                             uint8_t op, const char* record_json) {
   demo_prompt_result_t* r = (demo_prompt_result_t*)ctx;
-  (void)sid;
-  if (record_json != NULL) {
-    printf("%llu: %s\n", (unsigned long long)seq, record_json);
-  } else {
+  if (record_json == NULL) {
     printf("[live] the replay closed (op %u) — tailing live\n", (unsigned)op);
+    fflush(stdout);
+  } else {
+    json_value_t* rec = json_parse(record_json, strlen(record_json), NULL);
+    const char* type = (rec != NULL) ? json_as_string(json_get(rec, "type"))
+                                     : NULL;
+    json_value_t* payload = (rec != NULL) ? json_get(rec, "payload") : NULL;
+    int handled = 0;
+    if (type != NULL && payload != NULL) {
+      if (strcmp(type, "ask") == 0) {
+        demo_ask_slot_t ask;
+        memset(&ask, 0, sizeof(ask));
+        if (_demo_ask_slot_fill(&ask, payload) == 0) {
+          _demo_ask_render(&ask, sid, "answer <sid> <ask_id> <pick|reject> "
+                           "[text]");
+          _demo_asks_set(r, sid, &ask);   /* STEALS the slot's strings */
+          handled = 1;
+        } else {
+          _demo_ask_slot_clear(&ask);
+        }
+      } else if (strcmp(type, "ask.reply") == 0) {
+        const char* decision = json_as_string(json_get(payload, "decision"));
+        const char* value = json_as_string(json_get(payload, "value"));
+        printf("%llu: %s: %s\n", (unsigned long long)seq,
+               (decision != NULL && strcmp(decision, "reject") == 0)
+                   ? "rejected" : "answered",
+               (value != NULL && value[0] != '\0') ? value : "(no value)");
+        fflush(stdout);
+        _demo_asks_clear_reply(r, json_as_string(json_get(payload, "askId")));
+        handled = 1;
+      }
+    }
+    if (handled == 0) {
+      printf("%llu: %s\n", (unsigned long long)seq, record_json);
+    }
+    fflush(stdout);
+    json_value_destroy(rec);
   }
-  fflush(stdout);
   sa_client_release_payload(r->client, (void*)sid);
   if (record_json != NULL) {
     sa_client_release_payload(r->client, (void*)record_json);
@@ -736,17 +1415,26 @@ static int _demo_client_run(int argc, char** argv) {
   demo_prompt_result_t pr;
   memset(&pr, 0, sizeof(pr));
   pr.client = client;
+  pr.asks_lock = platform_mutex_create();
+  if (pr.asks_lock == NULL) {
+    fprintf(stderr, "frame-demo client: the ask registry's lock is not "
+            "created — the console runs degraded (the long-form answer "
+            "still rides; only the short form and the label/index "
+            "resolution need the registry)\n");
+  }
   int prompt_rc = sa_client_prompt(client, NULL, a.goal, _demo_prompt_cb, &pr);
   if (prompt_rc != 0 || !pr.called) {
     fprintf(stderr, "frame-demo client: the prompt was refused outright "
             "(rc %d)\n", prompt_rc);
     sa_client_destroy(client);
+    _demo_asks_teardown(&pr);
     return 1;
   }
   if (pr.status != 0 || pr.sid[0] == '\0') {
     fprintf(stderr, "frame-demo client: the daemon refused or the session "
             "carried no sid (status %u)\n", (unsigned)pr.status);
     sa_client_destroy(client);
+    _demo_asks_teardown(&pr);
     return 1;
   }
   printf("frame-demo client: session %s started (status 0) — streaming the "
@@ -760,14 +1448,37 @@ static int _demo_client_run(int argc, char** argv) {
     fprintf(stderr, "frame-demo client: cannot subscribe the events (the "
             "error channel carries the reason)\n");
     sa_client_destroy(client);
+    _demo_asks_teardown(&pr);
     return 1;
   }
-  fprintf(stderr, "frame-demo client: live — Ctrl-C tears the client down\n");
+  fprintf(stderr, "frame-demo client: live — the console: %s (Ctrl-C also "
+          "tears the client down)\n", SA_DEMO_ANSWER_USAGE_LINE);
 
-  while (!g_demo_sigint) usleep(50000);
+  /* The READ LOOP (the escalation slice): the events callback (the reader
+     thread) streams the records AND fills the parked-ask registry; this
+     thread splits its wait between the stream and the console — the stdin
+     pump's poll rides the 20 ms cadence's top (the standing usleeper with
+     the console window added around it). */
+  demo_stdin_buf_t in;
+  memset(&in, 0, sizeof(in));
+  char line[1024];
+  while (!g_demo_sigint) {
+    int have = _demo_stdin_line(&in, 50, line, sizeof(line));
+    if (have < 0) {
+      fprintf(stderr, "frame-demo client: stdin closed — tearing down (the "
+              "session runs on in the daemon's store)\n");
+      break;
+    }
+    if (have == 1) {
+      if (_demo_client_dispatch_line(&pr, line) == 0) break;   /* quit */
+      continue;
+    }
+    usleep(20000);
+  }
   fprintf(stderr, "frame-demo client: tearing down (records stay committed "
           "in the daemon's store)\n");
   sa_client_destroy(client);
+  _demo_asks_teardown(&pr);
   return 0;
 }
 
@@ -808,6 +1519,7 @@ int main(int argc, char** argv) {
   const char* base_url = "http://127.0.0.1:11434";
   const char* model = NULL;
   const char* goal = NULL;
+  unsigned escalation = FRAME_ESCALATION_FREE;   /* --escalation */
   int want_refine = 0;          /* --refine */
   uint8_t refine_global = 0;    /* --refine-global (the SHARED harness root) */
   const char* refine_sid = NULL;  /* --refine-sid: the past session's subtree */
@@ -823,6 +1535,14 @@ int main(int argc, char** argv) {
       model = argv[++i];
     } else if (strcmp(argv[i], "--goal") == 0 && i + 1 < argc) {
       goal = argv[++i];
+    } else if (strcmp(argv[i], "--escalation") == 0 && i + 1 < argc) {
+      if (_demo_parse_escalation(argv[i + 1], &escalation) != 0) {
+        fprintf(stderr, "frame-demo: --escalation needs free, "
+                "plan-ask-act, or bypass (got '%s')\n%s", argv[i + 1],
+                SA_DEMO_USAGE);
+        return 2;
+      }
+      i++;
     } else if (strcmp(argv[i], "--refine") == 0) {
       want_refine = 1;
     } else if (strcmp(argv[i], "--refine-global") == 0) {
@@ -911,6 +1631,8 @@ int main(int argc, char** argv) {
   cfg.model_base_url = base_url;  /* api key — none for Ollama */
   cfg.model_name = model;
   cfg.max_depth = 4;
+  cfg.escalation_mode = escalation;   /* the direct mode's console answers
+                                         the ladder's parked asks */
 
   /* The refine session: a --refine-sid resume (framed to the subtree path),
      or a fresh top frame (goal may be NULL). */
@@ -976,8 +1698,9 @@ int main(int argc, char** argv) {
 
   /* The turn loop is ONE blocking call on this thread; SIGINT reaches it
      through the interrupt watcher below (the handler only sets the flag and
-     cannot post/allocate — see _demo_on_sigint). Armed HERE, around the
-     single frame_run_loop call; refine/rollback above stay on the
+     cannot post/allocate — see _demo_on_sigint). Armed per RUN (the parked
+     ask's console wait disarms it — the flag-only handler holds there, the
+     console loop polls the flag); refine/rollback above stay on the
      unwatched-path handler contract. */
   g_demo_sigint_watched = 1;
   g_demo_watch_frame = f;
@@ -991,7 +1714,37 @@ int main(int argc, char** argv) {
     fprintf(stderr, "frame-demo: cannot arm the interrupt watcher — SIGINT "
             "exits instead\n");
   }
-  int loop_rc = frame_run_loop(f);
+
+  /* THE LIVE YIELDS are NOT failures: run_loop returns 2 on the ask park
+     (the console answers, the run re-pumps — the process STAYS ALIVE on
+     the park) and on a live-children yield (pumped again). One stdin
+     buffer feeds every console wait this run takes. */
+  demo_stdin_buf_t in;
+  memset(&in, 0, sizeof(in));
+  demo_ask_slot_t ask;
+  memset(&ask, 0, sizeof(ask));
+  int loop_rc = 0;
+  for (;;) {
+    loop_rc = frame_run_loop(f);
+    if (loop_rc != 2) break;   /* 0 clean / 1 failed loud */
+    if (frame_is_done(f) == 1) break;   /* belt: a done frame runs nothing */
+    if (_demo_parked_ask_scan(f, &ask) == 1) {
+      /* THE ASK PARK: the demo's console takes the reply. */
+      _demo_watchdog_disarm(&watchdog);   /* the console owns Ctrl-C here */
+      int answered = _demo_direct_parked_wait(f, &ask, &in);
+      _demo_ask_slot_clear(&ask);
+      if (answered == 0) break;   /* the park stands; the demo ends here */
+      watchdog = platform_thread_create(_demo_interrupt_watchdog, NULL);
+      if (watchdog == NULL) {
+        fprintf(stderr, "frame-demo: cannot re-arm the interrupt watcher — "
+                "the resume run rides unwatched (the flag is polled at the "
+                "next console wait)\n");
+      }
+    } else {
+      printf("frame-demo: the frame yielded to live children — pumping\n");
+      fflush(stdout);
+    }
+  }
 
   int outcome_rc = _demo_print_outcome(f);
   int rc = (loop_rc == 0 && outcome_rc == 0) ? 0 : 1;
