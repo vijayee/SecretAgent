@@ -3882,6 +3882,21 @@ static const char TEST_LOOP_INSTRUCTION[] =
     "Finish the frame by calling actor.report inside your last cell (a\n"
     "completion declaration), or simply by answering WITHOUT a tool call.\n";
 
+/* The standing reminder block's bytes, pinned here byte-for-byte (the
+   mirror of loop.c's SA_LOOP_REMINDER_BLOCK — "the reminder ends the
+   stable prefix" ordering proof). */
+static const char TEST_LOOP_REMINDER_BLOCK[] =
+    "<system-reminder>\n"
+    "These tags are added by the system, never the user. Behave in accordance\n"
+    "with relevance and continue normally otherwise.\n"
+    "</system-reminder>\n"
+    "<system-reminder>\n"
+    "Address every part of the goal explicitly; values, names, and steps the\n"
+    "frame's context carries ride verbatim rather than summarized away. When\n"
+    "the context does not contain what is needed, say so directly rather than\n"
+    "answering with adjacent information.\n"
+    "</system-reminder>\n";
+
 /* ONE direct store put through the store actor (the test's boot idiom —
    the same fire-and-post batch shape persona_records_install's install
    takes, pumped to quiescence): key/value as raw utf8 texts. */
@@ -3960,8 +3975,19 @@ TEST(TestLoop, TestNoPersonaIsByteIdentical) {
   ASSERT_EQ(rm.captured.size(), 1u);
   std::string content = test_system_content(rm.captured[0]);
 
-  std::string expected = std::string(TEST_LOOP_INSTRUCTION) + "Goal: pin the shape\n";
+  std::string expected =
+      std::string(TEST_LOOP_INSTRUCTION) + TEST_LOOP_REMINDER_BLOCK +
+      "Goal: pin the shape\n";
   EXPECT_EQ(content, expected) << "the persona-less system block moved";
+
+  size_t instr_pos = content.find("You drive one frame");
+  size_t reminder_pos = content.find("<system-reminder>");
+  size_t goal_pos = content.find("Goal: pin the shape\n");
+  ASSERT_NE(instr_pos, std::string::npos);
+  ASSERT_NE(reminder_pos, std::string::npos);
+  ASSERT_NE(goal_pos, std::string::npos);
+  EXPECT_LT(instr_pos, reminder_pos) << "instruction then reminder";
+  EXPECT_LT(reminder_pos, goal_pos) << "the reminder ends the stable prefix";
   EXPECT_EQ(content.find("PERSONA SPEC"), std::string::npos);
 
   frame_destroy(f);
@@ -4036,7 +4062,8 @@ TEST(TestLoop, TestPersonaMissingRecordFallsBackLoud) {
   std::string content = test_system_content(rm.captured[0]);
 
   std::string expected =
-      std::string(TEST_LOOP_INSTRUCTION) + "Goal: fallback turns\n";
+      std::string(TEST_LOOP_INSTRUCTION) + TEST_LOOP_REMINDER_BLOCK +
+      "Goal: fallback turns\n";
   EXPECT_EQ(content, expected)
       << "the fallback is the built-in base alone — the byte-identical shape";
   EXPECT_EQ(content.find("PERSONA SPEC"), std::string::npos)
@@ -4080,7 +4107,8 @@ TEST(TestLoop, TestPersonaPlaceholderCatalogResolvesLive) {
      context record's render (the "name: Victor" block), then the base. */
   std::string expected =
       "Hello Victor, dear , keep {WHATEVER} visible.\n\nname: Victor\n\n" +
-      std::string(TEST_LOOP_INSTRUCTION) + "Goal: greet me\n";
+      std::string(TEST_LOOP_INSTRUCTION) + TEST_LOOP_REMINDER_BLOCK +
+      "Goal: greet me\n";
   EXPECT_EQ(content, expected);
 
   frame_destroy(f);
@@ -4180,7 +4208,8 @@ TEST(TestLoop, TestPersonaBelowPlacementRidesAfterTheBase) {
   char* composed = persona_compose(rec, BELOW_CONTEXT, tools, 1,
                                    TEST_LOOP_INSTRUCTION);
   ASSERT_NE(composed, nullptr);
-  std::string expected = std::string(composed) + "Goal: below rides\n";
+  std::string expected =
+      std::string(composed) + TEST_LOOP_REMINDER_BLOCK + "Goal: below rides\n";
   free(composed);
   persona_record_destroy(rec);
   EXPECT_EQ(content, expected) << "the below assembly moved";

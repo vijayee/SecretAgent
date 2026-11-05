@@ -233,6 +233,24 @@ static const char SA_LOOP_PLAN_INSTRUCTION[] =
     "plan of steps for the goal instead; your reply IS the plan, and the "
     "owner approves or rejects it before any cell can run.\n";
 
+/* The standing reminder block (defaults spec §2): machinery text for every
+   frame's derive — the NEVER-CHANGING reminder belongs in the stable
+   prefix, not a per-turn message (a future CHANGEABLE reminder gets the
+   per-turn back-slot, NOT this constant). The placement is ONE rule
+   (settled 2026-11-05): appended after the composed prefix — the persona
+   group AND its instruction — before the goal line, in every frame. */
+static const char SA_LOOP_REMINDER_BLOCK[] =
+    "<system-reminder>\n"
+    "These tags are added by the system, never the user. Behave in accordance\n"
+    "with relevance and continue normally otherwise.\n"
+    "</system-reminder>\n"
+    "<system-reminder>\n"
+    "Address every part of the goal explicitly; values, names, and steps the\n"
+    "frame's context carries ride verbatim rather than summarized away. When\n"
+    "the context does not contain what is needed, say so directly rather than\n"
+    "answering with adjacent information.\n"
+    "</system-reminder>\n";
+
 /* The frame's tool-id surface, as persona_compose (persona spec §2 item 4)
    reads it: the tool-conditional guidance entries attach on these ids.
    Today's surface is the model layer's ONE canned `execute` tool (loop.c's
@@ -427,6 +445,9 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
     }
     _loop_sb_puts(&sb, SA_LOOP_INSTRUCTION);   /* today's bytes, untouched */
   }
+  _loop_sb_puts(&sb, SA_LOOP_REMINDER_BLOCK);   /* the standing reminder ends
+                                                   the stable prefix — the
+                                                   placement's ONE rule */
 
   const char* goal = _frame_goal(f);
   if (goal != NULL) {
