@@ -443,7 +443,8 @@ static char* _loop_system_content(frame_t* f, const loop_snap_t* snaps, size_t n
          BEFORE the base instruction (escalation Task 5). */
       _loop_sb_puts(&sb, plan_block);
     }
-    _loop_sb_puts(&sb, SA_LOOP_INSTRUCTION);   /* today's bytes, untouched */
+    _loop_sb_puts(&sb, SA_LOOP_INSTRUCTION);   /* the base instruction rides
+                                                   verbatim */
   }
   _loop_sb_puts(&sb, SA_LOOP_REMINDER_BLOCK);   /* the standing reminder ends
                                                    the stable prefix — the

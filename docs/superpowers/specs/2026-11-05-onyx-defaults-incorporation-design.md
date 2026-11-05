@@ -17,9 +17,10 @@ SecretAgent's DEFAULT frame (persona-less, free-mode) speaks in machinery: SA_LO
 think; its verb list omits `agent.ask`/`actor.keys`/`actor.emit` entirely (the model discovers them
 only by probing); no reminder channel exists; budget cuts say the cut's facts but never the honest
 uncertainty. The Onyx study shows what a mature harness carries in those seams — and the budget
-survey (six harnesses) settles the stopping doctrine: the loop defaults UNBOUNDED; a limit, when
-the owner sets one, trips into an ASK. The loop (L3) stays amoral throughout: everything below is
-constants + one config field + the trip's ask machinery (which the escalation slice landed).
+survey (six harnesses) settles the stopping doctrine: the loop defaults UNBOUNDED — the count-cap
+explored and dropped (the status line; the loop-budget note keeps the verdict). The loop (L3)
+stays amoral throughout: everything below is constants + the trip's ask machinery (which the
+escalation slice landed).
 
 ## Decisions carried in (settled with the owner, 2026-11-05)
 
