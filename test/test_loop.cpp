@@ -3859,14 +3859,27 @@ TEST(TestLoop, TestRestartRepairsTheCutBeforeTheCellAudit) {
    so a prefix match pins the whole injection's shape. */
 
 /* The turn instruction's bytes, pinned here byte-for-byte (loop.c's
-   SA_LOOP_INSTRUCTION — the no-persona pin below is that text's proof). */
+   SA_LOOP_INSTRUCTION — the defaults slice's shape. The no-persona pin
+   below is that text's proof; the presence test names each finding). */
 static const char TEST_LOOP_INSTRUCTION[] =
     "You drive one frame of an agent session. Your only tool is `execute`: "
-    "its `code` argument is ONE python cell run in this frame's interpreter "
-    "(one shared namespace per frame). Inside cells the injected `actor` "
-    "module provides the verbs: actor.remember(key, value), "
-    "actor.recall(key), actor.spawn(goal, context=None), actor.report(value).\n"
-    "Finish the frame by calling actor.report inside your last cell (a "
+    "its\n"
+    "`code` argument is ONE python cell run in this frame's interpreter (one\n"
+    "shared namespace per frame). Inside cells the injected `actor` module\n"
+    "provides the verbs: actor.remember(key, value), actor.recall(key),\n"
+    "actor.keys(scope), actor.emit(text), actor.spawn(goal, context=None),\n"
+    "actor.report(value), and actor.ask(question, options=[]).\n"
+    "Ask the user only when ambiguity is real or a decision is the owner's:\n"
+    "one sharp open question, or five options at most, and say what the\n"
+    "answer unblocks.\n"
+    "Child reports face you as the parent agent — dense and unformatted.\n"
+    "Your own replies to the user stay conversational and direct.\n"
+    "Deeply understand the user's intent before answering; think step-by-step;\n"
+    "offer the follow-up the user will need next.\n"
+    "Content cut at \"[budget: truncated at <n> bytes]\" is not guessable:\n"
+    "reconstruct it from the frame's state (actor.recall/actor.keys) or ask —\n"
+    "never invent the middle.\n"
+    "Finish the frame by calling actor.report inside your last cell (a\n"
     "completion declaration), or simply by answering WITHOUT a tool call.\n";
 
 /* ONE direct store put through the store actor (the test's boot idiom —
@@ -3950,6 +3963,52 @@ TEST(TestLoop, TestNoPersonaIsByteIdentical) {
   std::string expected = std::string(TEST_LOOP_INSTRUCTION) + "Goal: pin the shape\n";
   EXPECT_EQ(content, expected) << "the persona-less system block moved";
   EXPECT_EQ(content.find("PERSONA SPEC"), std::string::npos);
+
+  frame_destroy(f);
+  wave_db_close(db);
+}
+
+TEST(TestLoop, TestInstructionCarriesTheStudyFive) {
+  /* The defaults slice's five findings ride the LIVE prompt: the byte pins
+     cover the exact composition; this names each finding so a regression
+     answers WHICH one moved. */
+  frame_config_t cfg = test_config();
+  wave_database_root_t* db = wave_db_open(NULL);
+  ASSERT_NE(db, nullptr);
+  frame_t* f = frame_create(db, NULL, "find each", &cfg);
+  ASSERT_NE(f, nullptr);
+
+  recording_model_t rm = {};
+  rm.base.complete = recording_complete;
+  rm.replies.push_back(
+      R"json({"choices":[{"message":{"role":"assistant","content":"found"}}]})json");
+  frame_set_model_backend(f, &rm.base);
+
+  EXPECT_EQ(frame_run_loop(f), 0);
+  ASSERT_EQ(rm.captured.size(), 1u);
+  std::string content = test_system_content(rm.captured[0]);
+
+  /* The completed verb list (the ask/keys/emit entries join). */
+  EXPECT_NE(content.find("actor.keys(scope)"), std::string::npos)
+      << "the verb list's keys entry";
+  EXPECT_NE(content.find("actor.emit(text)"), std::string::npos)
+      << "the verb list's emit entry";
+  EXPECT_NE(content.find("actor.ask(question, options=[])"), std::string::npos)
+      << "the verb list's ask entry";
+  /* The ask craft (study §1.5). */
+  EXPECT_NE(content.find("one sharp open question, or five options at most"),
+            std::string::npos) << "the ask craft's cap";
+  /* The two registers (study §2.4). */
+  EXPECT_NE(content.find("Child reports face you as the parent agent"),
+            std::string::npos) << "the child register";
+  EXPECT_NE(content.find("Your own replies to the user stay conversational"),
+            std::string::npos) << "the user register";
+  /* The voice floor. */
+  EXPECT_NE(content.find("Deeply understand the user's intent before answering"),
+            std::string::npos) << "the voice floor";
+  /* The truncation honesty (the forgotten-files doctrine). */
+  EXPECT_NE(content.find("never invent the middle"), std::string::npos)
+      << "the honesty line";
 
   frame_destroy(f);
   wave_db_close(db);

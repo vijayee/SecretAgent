@@ -197,14 +197,29 @@
 #define SA_LOOP_CELL_WAIT_MS 60000
 #endif
 
-/* The one turn instruction (kept SHORT — it rides every turn). */
+/* The one turn instruction (byte-stable per inputs — the cache-stable
+   prefix's rule; it rides every turn). Carries the defaults slice's five
+   study findings (spec §1.1's pin): the seven-verb list, the ask craft,
+   the two registers, the voice floor, the truncation honesty. */
 static const char SA_LOOP_INSTRUCTION[] =
     "You drive one frame of an agent session. Your only tool is `execute`: "
-    "its `code` argument is ONE python cell run in this frame's interpreter "
-    "(one shared namespace per frame). Inside cells the injected `actor` "
-    "module provides the verbs: actor.remember(key, value), "
-    "actor.recall(key), actor.spawn(goal, context=None), actor.report(value).\n"
-    "Finish the frame by calling actor.report inside your last cell (a "
+    "its\n"
+    "`code` argument is ONE python cell run in this frame's interpreter (one\n"
+    "shared namespace per frame). Inside cells the injected `actor` module\n"
+    "provides the verbs: actor.remember(key, value), actor.recall(key),\n"
+    "actor.keys(scope), actor.emit(text), actor.spawn(goal, context=None),\n"
+    "actor.report(value), and actor.ask(question, options=[]).\n"
+    "Ask the user only when ambiguity is real or a decision is the owner's:\n"
+    "one sharp open question, or five options at most, and say what the\n"
+    "answer unblocks.\n"
+    "Child reports face you as the parent agent — dense and unformatted.\n"
+    "Your own replies to the user stay conversational and direct.\n"
+    "Deeply understand the user's intent before answering; think step-by-step;\n"
+    "offer the follow-up the user will need next.\n"
+    "Content cut at \"[budget: truncated at <n> bytes]\" is not guessable:\n"
+    "reconstruct it from the frame's state (actor.recall/actor.keys) or ask —\n"
+    "never invent the middle.\n"
+    "Finish the frame by calling actor.report inside your last cell (a\n"
     "completion declaration), or simply by answering WITHOUT a tool call.\n";
 
 /* The PLAN turn's instruction (escalation spec §2.2; Task 5): ONE bounded
