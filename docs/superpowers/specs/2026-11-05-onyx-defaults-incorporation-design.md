@@ -75,8 +75,10 @@ ENTRIES join the list; the craft + the registers + the floor + the honesty ride 
 ## 2. The reminder block
 
 A SECOND stable constant (`SA_LOOP_REMINDER_BLOCK` — the same section, beside the instruction) in
-the derive's system prompt, AFTER the instruction block (the stable prefix keeps one composition,
-one order — the exact placement pinned at §2.1):
+the derive's system prompt: the block ENDS the stable prefix in EVERY frame — after the persona
+group AND its instruction, before the goal line. ONE composition rule, ONE order — settled
+2026-11-05 from the study's placement law (§2.2): the rider governs the goal and the context, so
+it rides closest to them. The exact bytes pinned at §2.1.
 
 ### 2.1 THE BYTE PIN
 
@@ -115,13 +117,13 @@ reminder gets the per-turn back-slot then, not this slice.)
 - **`test/test_loop.cpp`**: the instruction's + the block's composed bytes (the byte pins); the
   verb-list entries present; ask-craft/registers/floor/honesty lines present (byte pins — the
   prompt capture).
-- **`test/test_lifecycle.cpp`**: the turn-limit reason's composer + the repair rule (a
-  control{turn-limit}-only tail with no turn.end = OPEN — repair closers compose with... the trip
-  tail ends turn.end{blocked} so the balance holds; pin the blocked balance again over the limit
-  ask's shape).
+- **Standing pins that do NOT churn**: the fail-loud turn cap's control pins (test_loop.cpp:785-899)
+  stay byte-identical — the stopping doctrine stands as designed (the knob is dropped); NO
+  max_turns config, NO limit trip, NO `turn-limit` writer beyond the existing fail-loud one.
+  test_frame.cpp/test_lifecycle.cpp pin no derive bytes (substring finds and model-authored text).
 - **`test/test_persona.cpp`**: the hammer's compose untouched (the standing byte pins green) — the
-  reminder block rides AFTER the persona group (below the persona, before the instruction's base
-  text — the one ORDER pinned).
+  reminder block rides AFTER the persona group: the block ends the stable prefix in every frame
+  (the §2 ONE rule; the below placement reads [instruction][persona][reminder]).
 - Gates: `setarch -R ctest` ON+ASan + OFF + off-verify + valgrind (the standing bar).
 
 ## 6. Non-goals (recorded)
